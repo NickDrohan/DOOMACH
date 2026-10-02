@@ -1,0 +1,268 @@
+# the WAD archive: a header, lump data, and a directory of named lumps
+#
+# Covers the reading half of w_wad.c for a single file. The whole file is held
+# in memory and lumps are views into it, so nothing here copies lump data and
+# every offset is checked once, when the directory is parsed.
+
+use std.allocator;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.path.Path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+val HEADER_SIZE: usize = 12;
+val ENTRY_SIZE:  usize = 16;
+val NAME_LEN:    usize = 8;
+
+# why a file was not accepted as a WAD
+pub tag WadError: u8 {
+    unreadable;
+    truncated;
+    magic;
+    directory;
+    lump: u32;
+}
+
+# a WAD held in memory
+pub rec Wad {
+    data:  *u8;
+    len:   usize;
+    count: u32;
+    dir:   usize;
+    iwad:  bool;
+}
+
+# one directory entry, with its name null-terminated
+pub rec Lump {
+    name:   [9]u8;
+    offset: u32;
+    size:   u32;
+}
+
+fun le32(p: *u8, at: usize) u32 {
+    ret p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24);
+}
+
+fun upper(c: u8) u8 {
+    if (c >= 'a' && c <= 'z') { ret c - 32; }
+    ret c;
+}
+
+# accept a byte buffer as a WAD, checking the header and every directory entry
+# ---
+# data: the file's bytes, which must outlive the Wad
+# len:  byte count
+# ret:  the archive, or the first thing wrong with it
+pub fun parse(data: *u8, len: usize) res[Wad, WadError] {
+    if (len < HEADER_SIZE) { ret res[Wad, WadError].err{WadError.truncated{}}; }
+
+    var w: Wad;
+    if (data[1] != 'W' || data[2] != 'A' || data[3] != 'D') {
+        ret res[Wad, WadError].err{WadError.magic{}};
+    }
+    if (data[0] == 'I') {
+        w.iwad = true;
+    }
+    or (data[0] == 'P') {
+        w.iwad = false;
+    }
+    or {
+        ret res[Wad, WadError].err{WadError.magic{}};
+    }
+
+    w.data  = data;
+    w.len   = len;
+    w.count = le32(data, 4);
+    w.dir   = le32(data, 8)::usize;
+
+    # both fields are signed in the file format; a negative one is nonsense
+    if (w.count >= 0x80000000 || w.dir >= 0x80000000) {
+        ret res[Wad, WadError].err{WadError.directory{}};
+    }
+    if (w.dir + w.count::usize * ENTRY_SIZE > len) {
+        ret res[Wad, WadError].err{WadError.directory{}};
+    }
+
+    var i: u32 = 0;
+    for (i < w.count) {
+        val at:     usize = w.dir + i::usize * ENTRY_SIZE;
+        val offset: usize = le32(data, at)::usize;
+        val size:   usize = le32(data, at + 4)::usize;
+        # an empty lump (a marker) may carry any offset, as the real IWADs do
+        if (size != 0 && offset + size > len) {
+            ret res[Wad, WadError].err{WadError.lump{i}};
+        }
+        i = i + 1;
+    }
+    ret res[Wad, WadError].ok{w};
+}
+
+# read a file and accept it as a WAD; the bytes live as long as the allocator
+# ---
+# a:   allocator that will own the file's bytes
+# p:   path of the WAD
+# ret: the archive, or why it was refused
+pub fun load(a: *allocator.Allocator, p: Path) res[Wad, WadError] {
+    val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, p);
+    if (sel bytes.err) { ret res[Wad, WadError].err{WadError.unreadable{}}; }
+    ret parse(bytes.ok.data, bytes.ok.len);
+}
+
+# fetch a directory entry
+# ---
+# w:   the archive
+# i:   lump number, below w.count
+# ret: the entry, with its name upper-cased as the engine compares them
+pub fun lump(w: *Wad, i: u32) Lump {
+    val at: usize = w.dir + i::usize * ENTRY_SIZE;
+    var l:  Lump;
+    l.offset = le32(w.data, at);
+    l.size   = le32(w.data, at + 4);
+    var k: usize = 0;
+    for (k < NAME_LEN && w.data[at + 8 + k] != 0) {
+        l.name[k] = upper(w.data[at + 8 + k]);
+        k         = k + 1;
+    }
+    ret l;
+}
+
+# point at a lump's bytes
+# ---
+# w:   the archive
+# i:   lump number, below w.count
+# ret: the first byte of the lump; its length is lump(w, i).size
+pub fun bytes(w: *Wad, i: u32) *u8 {
+    ret ?w.data[le32(w.data, w.dir + i::usize * ENTRY_SIZE)::usize];
+}
+
+# test a lump's name, ignoring case
+# ---
+# w:    the archive
+# i:    lump number, below w.count
+# name: up to eight characters
+# ret:  whether the lump carries exactly that name
+pub fun named(w: *Wad, i: u32, name: str) bool {
+    val at: usize = w.dir + i::usize * ENTRY_SIZE + 8;
+    var k:  usize = 0;
+    for (k < NAME_LEN) {
+        val want: u8 = upper(name[k]);
+        if (upper(w.data[at + k]) != want) { ret false; }
+        if (want == 0)                     { ret true; }
+        k = k + 1;
+    }
+    # eight characters matched; the name must end here too
+    ret name[NAME_LEN] == 0;
+}
+
+# find a lump by name, ignoring case
+#
+# searches from the end, so a later lump overrides an earlier one of the same
+# name, which is how patch WADs replace things.
+# ---
+# w:    the archive
+# name: up to eight characters
+# ret:  the lump's number, or none
+pub fun find(w: *Wad, name: str) opt[u32] {
+    var i: u32 = w.count;
+    for (i > 0) {
+        i = i - 1;
+        if (named(w, i, name)) { ret opt[u32].some{i}; }
+    }
+    ret opt[u32].none{};
+}
+
+# find a lump by name among those after a given lump, ignoring case
+#
+# a map's lumps (THINGS, LINEDEFS, ...) share their names with every other
+# map's, so they are found by position after the map's marker.
+# ---
+# w:     the archive
+# after: lump number to start after
+# name:  up to eight characters
+# ret:   the lump's number, or none
+pub fun find_after(w: *Wad, after: u32, name: str) opt[u32] {
+    var i: u32 = after + 1;
+    for (i < w.count) {
+        if (named(w, i, name)) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun accepted(data: *u8, len: usize) bool {
+    val r: res[Wad, WadError] = parse(data, len);
+    ret sel r.ok;
+}
+
+fun found(o: opt[u32]) bool {
+    ret sel o.some;
+}
+
+# a two-lump PWAD: "AB" holding 3 bytes, then "LONGNAME" holding 1
+val TINY: [48]u8 = [48]u8{
+    'P', 'W', 'A', 'D', 2, 0, 0, 0, 16, 0, 0, 0,
+    7, 8, 9, 5,
+    12, 0, 0, 0, 3, 0, 0, 0, 'a', 'b', 0, 0, 0, 0, 0, 0,
+    15, 0, 0, 0, 1, 0, 0, 0, 'L', 'O', 'N', 'G', 'N', 'A', 'M', 'E'
+};
+
+test parse__reads_a_small_wad {
+    var raw: [48]u8             = TINY;
+    val r:   res[Wad, WadError] = parse(?raw[0], 48);
+    if (sel r.err) { ret 1; }
+    var w: Wad = r.ok;
+    if (w.iwad || w.count != 2) { ret 2; }
+
+    val a: Lump = lump(?w, 0);
+    if (a.name[0] != 'A' || a.name[1] != 'B' || a.name[2] != 0) { ret 3; }
+    if (a.offset != 12 || a.size != 3)                          { ret 4; }
+    if (bytes(?w, 0)[2] != 9 || bytes(?w, 1)[0] != 5)           { ret 5; }
+
+    # an eight-character name has no terminator in the file
+    val b: Lump = lump(?w, 1);
+    if (b.name[7] != 'E' || b.name[8] != 0) { ret 6; }
+    ret 0;
+}
+
+test find__ignores_case_and_matches_whole_names {
+    var raw: [48]u8             = TINY;
+    val r:   res[Wad, WadError] = parse(?raw[0], 48);
+    if (sel r.err) { ret 1; }
+    var w: Wad = r.ok;
+
+    val ab: opt[u32] = find(?w, "Ab");
+    if (!(sel ab.some && ab.some == 0)) { ret 2; }
+    val ln: opt[u32] = find(?w, "longname");
+    if (!(sel ln.some && ln.some == 1))        { ret 3; }
+    if (found(find(?w, "A")))                  { ret 4; }
+    if (found(find(?w, "LONGNAM")))            { ret 5; }
+    if (found(find(?w, "LONGNAMES")))          { ret 6; }
+    if (found(find_after(?w, 0, "ab")))        { ret 7; }
+    if (!found(find_after(?w, 0, "LONGNAME"))) { ret 8; }
+    ret 0;
+}
+
+test parse__refuses_damage {
+    var raw: [48]u8 = TINY;
+    if (accepted(?raw[0], 11)) { ret 1; }
+    # the directory no longer fits
+    if (accepted(?raw[0], 47)) { ret 2; }
+
+    raw[0] = 'X';
+    if (accepted(?raw[0], 48)) { ret 3; }
+    raw[0] = 'P';
+
+    # second lump's size now runs past the end of the file
+    raw[36] = 40;
+    val r: res[Wad, WadError] = parse(?raw[0], 48);
+    if (sel r.ok) { ret 4; }
+    val why: WadError = r.err;
+    if (sel why.lump && why.lump == 1) { ret 0; }
+    ret 5;
+}

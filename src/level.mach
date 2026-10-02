@@ -1,0 +1,613 @@
+# a map, loaded from its ten lumps into the structures the engine runs on
+#
+# Ported from P_SetupLevel and its loaders in p_setup.c, with one deliberate
+# change of shape: where the C structures point at each other, these hold
+# indices. An index means the same thing on a GPU as it does here, which the
+# renderers depend on, and it lets every reference be range-checked once at
+# load time, so a damaged map is refused instead of read out of bounds.
+
+use std.allocator;
+use std.types.bool.bool;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use doom.fixed;
+use doom.fixed.Fixed;
+use doom.wad;
+
+# positions of a map's lumps after its marker
+pub val ML_THINGS:   u32 = 1;
+pub val ML_LINEDEFS: u32 = 2;
+pub val ML_SIDEDEFS: u32 = 3;
+pub val ML_VERTEXES: u32 = 4;
+pub val ML_SEGS:     u32 = 5;
+pub val ML_SSECTORS: u32 = 6;
+pub val ML_NODES:    u32 = 7;
+pub val ML_SECTORS:  u32 = 8;
+pub val ML_REJECT:   u32 = 9;
+pub val ML_BLOCKMAP: u32 = 10;
+
+pub val ML_TWOSIDED: i16 = 4;
+
+# a node child with this bit set is a subsector, not another node
+pub val NF_SUBSECTOR: u16 = 0x8000;
+
+# the order of a bounding box's four numbers
+pub val BOXTOP:    usize = 0;
+pub val BOXBOTTOM: usize = 1;
+pub val BOXLEFT:   usize = 2;
+pub val BOXRIGHT:  usize = 3;
+
+pub val ST_HORIZONTAL: u8 = 0;
+pub val ST_VERTICAL:   u8 = 1;
+pub val ST_POSITIVE:   u8 = 2;
+pub val ST_NEGATIVE:   u8 = 3;
+
+# "no sector" or "no side", where the C code holds a null pointer or -1
+pub val NONE: i32 = -1;
+
+val MAPBLOCKSHIFT: i32   = 23;
+val MAXRADIUS:     Fixed = 32 * 65536;
+val MAXINT:        i32   = 0x7fffffff;
+val MININT:        i32   = -0x7fffffff - 1;
+
+pub rec Vertex {
+    x: Fixed;
+    y: Fixed;
+}
+
+pub rec Sector {
+    floorheight:   Fixed;
+    ceilingheight: Fixed;
+    floorpic:      [9]u8;
+    ceilingpic:    [9]u8;
+    # the same two as flat numbers, filled in by rdata.bind
+    floorflat:   i32;
+    ceilingflat: i32;
+    lightlevel:  i16;
+    special:     i16;
+    tagnum:      i16;
+    # this sector's lines are sector_lines[firstline .. firstline + linecount]
+    linecount: i32;
+    firstline: i32;
+    # the lines' bounding box in blockmap cells, widened by the largest thing
+    blockbox:   [4]i32;
+    soundorg_x: Fixed;
+    soundorg_y: Fixed;
+
+    # what the simulation keeps per sector. the pointers are to records this
+    # module cannot name (a map object, a mover), so they are untyped here
+    # 0 untraversed, 1 or 2 for the sound flood
+    soundtraversed: i32;
+    # the thing that made a sound here
+    soundtarget: ptr;
+    # if this equals the game's validcount, already checked
+    validcount: i32;
+    # the things in the sector
+    thinglist: ptr;
+    # the mover acting on the sector, if any
+    specialdata: ptr;
+}
+
+pub rec Side {
+    textureoffset: Fixed;
+    rowoffset:     Fixed;
+    toptexture:    [9]u8;
+    bottomtexture: [9]u8;
+    midtexture:    [9]u8;
+    # the same three as texture numbers, filled in by rdata.bind
+    toptex:    i32;
+    bottomtex: i32;
+    midtex:    i32;
+    sector:    i32;
+}
+
+pub rec Line {
+    v1:          i32;
+    v2:          i32;
+    dx:          Fixed;
+    dy:          Fixed;
+    flags:       i16;
+    special:     i16;
+    tagnum:      i16;
+    sidenum:     [2]i32;
+    bbox:        [4]Fixed;
+    slopetype:   u8;
+    frontsector: i32;
+    backsector:  i32;
+    # if this equals the game's validcount, already checked
+    validcount: i32;
+}
+
+pub rec Subsector {
+    sector:    i32;
+    numlines:  i32;
+    firstline: i32;
+}
+
+pub rec Seg {
+    v1:          i32;
+    v2:          i32;
+    offset:      Fixed;
+    angle:       u32;
+    sidedef:     i32;
+    linedef:     i32;
+    frontsector: i32;
+    backsector:  i32;
+}
+
+pub rec Node {
+    x:  Fixed;
+    y:  Fixed;
+    dx: Fixed;
+    dy: Fixed;
+    # the right child's box, then the left child's
+    bbox:     [8]Fixed;
+    children: [2]u16;
+}
+
+pub rec Thing {
+    x:       i16;
+    y:       i16;
+    angle:   i16;
+    kind:    i16;
+    options: i16;
+}
+
+pub rec Level {
+    numvertexes:   i32;
+    vertexes:      *Vertex;
+    numsectors:    i32;
+    sectors:       *Sector;
+    numsides:      i32;
+    sides:         *Side;
+    numlines:      i32;
+    lines:         *Line;
+    numsubsectors: i32;
+    subsectors:    *Subsector;
+    numsegs:       i32;
+    segs:          *Seg;
+    numnodes:      i32;
+    nodes:         *Node;
+    numthings:     i32;
+    things:        *Thing;
+
+    # line numbers grouped by sector; each Sector names its run
+    sector_lines:   *i32;
+    numsectorlines: i32;
+
+    # the blockmap lump, little-endian 16-bit words, read in place
+    blockmaplump: *u8;
+    blockwords:   i32;
+    bmaporgx:     Fixed;
+    bmaporgy:     Fixed;
+    bmapwidth:    i32;
+    bmapheight:   i32;
+
+    # the reject lump, a sector-by-sector bit matrix, read in place
+    rejectmatrix: *u8;
+    rejectsize:   i32;
+}
+
+# why a map was not loaded
+pub tag LevelError: u8 {
+    # no lump carries the map's name
+    marker;
+    # the lump at this position after the marker is absent, misnamed or a
+    # ragged size
+    lump: u32;
+    # the lump at this position holds an index that points outside the map
+    reference: u32;
+    memory;
+}
+
+# a word of the blockmap lump
+# ---
+# lv: the map
+# i:  word number
+pub fun blockword(lv: *Level, i: i32) i32 {
+    ret le16(lv.blockmaplump, i::usize * 2);
+}
+
+fun le16(p: *u8, at: usize) i32 {
+    ret ((p[at]::u16 | (p[at + 1]::u16 << 8)):~i16)::i32;
+}
+
+fun le16u(p: *u8, at: usize) i32 {
+    ret (p[at]::u16 | (p[at + 1]::u16 << 8))::i32;
+}
+
+fun copy_name(dst: *u8, p: *u8, at: usize) {
+    var k: usize = 0;
+    for (k < 8 && p[at + k] != 0) {
+        var c: u8 = p[at + k];
+        if (c >= 'a' && c <= 'z') { c = c - 32; }
+        dst[k] = c;
+        k      = k + 1;
+    }
+}
+
+fun fail(e: LevelError) res[Level, LevelError] {
+    ret res[Level, LevelError].err{e};
+}
+
+# one of the map's lumps, checked for its name and a whole number of records
+rec Table {
+    data:  *u8;
+    count: i32;
+    ok:    bool;
+}
+
+fun table(w: *wad.Wad, marker: u32, which: u32, name: str, record: u32) Table {
+    var t: Table;
+    val i: u32 = marker + which;
+    if (i >= w.count || !wad.named(w, i, name)) { ret t; }
+    val l: wad.Lump = wad.lump(w, i);
+    if (l.size % record != 0) { ret t; }
+    t.data  = wad.bytes(w, i);
+    t.count = (l.size / record)::i32;
+    t.ok    = 1;
+    ret t;
+}
+
+fun grab[T](a: *allocator.Allocator, count: i32, out: **T) bool {
+    if (count == 0) { ret 1; }
+    val r: res[*T, allocator.Error] = allocator.zallocate[T](a, count::usize);
+    if (sel r.err) { ret 0; }
+    @out = r.ok;
+    ret 1;
+}
+
+fun add_to_box(box: *Fixed, x: Fixed, y: Fixed) {
+    if (x < box[BOXLEFT]) {
+        box[BOXLEFT] = x;
+    }
+    or (x > box[BOXRIGHT]) {
+        box[BOXRIGHT] = x;
+    }
+    if (y < box[BOXBOTTOM]) {
+        box[BOXBOTTOM] = y;
+    }
+    or (y > box[BOXTOP]) {
+        box[BOXTOP] = y;
+    }
+}
+
+# load a map
+#
+# the order follows P_SetupLevel, because later lumps refer to earlier ones.
+# things are read but not spawned: that belongs to the simulation.
+# ---
+# a:    allocator for the map's structures
+# w:    the archive
+# name: the map's marker lump, such as "E1M1"
+# ret:  the map, or why it was refused
+pub fun load(a: *allocator.Allocator, w: *wad.Wad, name: str) res[Level, LevelError] {
+    val found: opt[u32] = wad.find(w, name);
+    if (sel found.none) { ret fail(LevelError.marker{}); }
+    val marker: u32 = found.some;
+
+    var lv: Level;
+    var i:  i32 = 0;
+
+    # blockmap
+    val bm: Table = table(w, marker, ML_BLOCKMAP, "BLOCKMAP", 2);
+    if (!bm.ok || bm.count < 4) { ret fail(LevelError.lump{ML_BLOCKMAP}); }
+    lv.blockmaplump = bm.data;
+    lv.blockwords   = bm.count;
+    lv.bmaporgx     = le16(bm.data, 0) << 16;
+    lv.bmaporgy     = le16(bm.data, 2) << 16;
+    lv.bmapwidth    = le16(bm.data, 4);
+    lv.bmapheight   = le16(bm.data, 6);
+
+    # vertexes
+    val vt: Table = table(w, marker, ML_VERTEXES, "VERTEXES", 4);
+    if (!vt.ok) { ret fail(LevelError.lump{ML_VERTEXES}); }
+    lv.numvertexes = vt.count;
+    if (!grab[Vertex](a, vt.count, ?lv.vertexes)) { ret fail(LevelError.memory{}); }
+    i = 0;
+    for (i < vt.count) {
+        val at: usize = i::usize * 4;
+        lv.vertexes[i].x = le16(vt.data, at) << 16;
+        lv.vertexes[i].y = le16(vt.data, at + 2) << 16;
+        i                = i + 1;
+    }
+
+    # sectors
+    val sc: Table = table(w, marker, ML_SECTORS, "SECTORS", 26);
+    if (!sc.ok) { ret fail(LevelError.lump{ML_SECTORS}); }
+    lv.numsectors = sc.count;
+    if (!grab[Sector](a, sc.count, ?lv.sectors)) { ret fail(LevelError.memory{}); }
+    i = 0;
+    for (i < sc.count) {
+        val at: usize   = i::usize * 26;
+        val s:  *Sector = ?lv.sectors[i];
+        s.floorheight   = le16(sc.data, at) << 16;
+        s.ceilingheight = le16(sc.data, at + 2) << 16;
+        copy_name(?s.floorpic[0], sc.data, at + 4);
+        copy_name(?s.ceilingpic[0], sc.data, at + 12);
+        s.lightlevel = le16(sc.data, at + 20)::i16;
+        s.special    = le16(sc.data, at + 22)::i16;
+        s.tagnum     = le16(sc.data, at + 24)::i16;
+        i            = i + 1;
+    }
+
+    # sidedefs
+    val sd: Table = table(w, marker, ML_SIDEDEFS, "SIDEDEFS", 30);
+    if (!sd.ok) { ret fail(LevelError.lump{ML_SIDEDEFS}); }
+    lv.numsides = sd.count;
+    if (!grab[Side](a, sd.count, ?lv.sides)) { ret fail(LevelError.memory{}); }
+    i = 0;
+    for (i < sd.count) {
+        val at: usize = i::usize * 30;
+        val s:  *Side = ?lv.sides[i];
+        s.textureoffset = le16(sd.data, at) << 16;
+        s.rowoffset     = le16(sd.data, at + 2) << 16;
+        copy_name(?s.toptexture[0], sd.data, at + 4);
+        copy_name(?s.bottomtexture[0], sd.data, at + 12);
+        copy_name(?s.midtexture[0], sd.data, at + 20);
+        s.sector = le16u(sd.data, at + 28);
+        if (s.sector >= lv.numsectors) { ret fail(LevelError.reference{ML_SIDEDEFS}); }
+        i = i + 1;
+    }
+
+    # linedefs
+    val ln: Table = table(w, marker, ML_LINEDEFS, "LINEDEFS", 14);
+    if (!ln.ok) { ret fail(LevelError.lump{ML_LINEDEFS}); }
+    lv.numlines = ln.count;
+    if (!grab[Line](a, ln.count, ?lv.lines)) { ret fail(LevelError.memory{}); }
+    i = 0;
+    for (i < ln.count) {
+        val at: usize = i::usize * 14;
+        val ld: *Line = ?lv.lines[i];
+        ld.v1      = le16u(ln.data, at);
+        ld.v2      = le16u(ln.data, at + 2);
+        ld.flags   = le16(ln.data, at + 4)::i16;
+        ld.special = le16(ln.data, at + 6)::i16;
+        ld.tagnum  = le16(ln.data, at + 8)::i16;
+        if (ld.v1 >= lv.numvertexes || ld.v2 >= lv.numvertexes) {
+            ret fail(LevelError.reference{ML_LINEDEFS});
+        }
+        val v1: Vertex = lv.vertexes[ld.v1];
+        val v2: Vertex = lv.vertexes[ld.v2];
+        ld.dx = v2.x - v1.x;
+        ld.dy = v2.y - v1.y;
+
+        if (ld.dx == 0) {
+            ld.slopetype = ST_VERTICAL;
+        }
+        or (ld.dy == 0) {
+            ld.slopetype = ST_HORIZONTAL;
+        }
+        or (fixed.div(ld.dy, ld.dx) > 0) {
+            ld.slopetype = ST_POSITIVE;
+        }
+        or {
+            ld.slopetype = ST_NEGATIVE;
+        }
+
+        if (v1.x < v2.x) {
+            ld.bbox[BOXLEFT]  = v1.x;
+            ld.bbox[BOXRIGHT] = v2.x;
+        }
+        or {
+            ld.bbox[BOXLEFT]  = v2.x;
+            ld.bbox[BOXRIGHT] = v1.x;
+        }
+        if (v1.y < v2.y) {
+            ld.bbox[BOXBOTTOM] = v1.y;
+            ld.bbox[BOXTOP]    = v2.y;
+        }
+        or {
+            ld.bbox[BOXBOTTOM] = v2.y;
+            ld.bbox[BOXTOP]    = v1.y;
+        }
+
+        # a side number of -1 means the line has no such side
+        ld.sidenum[0]  = le16(ln.data, at + 10);
+        ld.sidenum[1]  = le16(ln.data, at + 12);
+        ld.frontsector = NONE;
+        ld.backsector  = NONE;
+        if (ld.sidenum[0] != NONE) {
+            ld.sidenum[0] = le16u(ln.data, at + 10);
+            if (ld.sidenum[0] >= lv.numsides) { ret fail(LevelError.reference{ML_LINEDEFS}); }
+            ld.frontsector = lv.sides[ld.sidenum[0]].sector;
+        }
+        if (ld.sidenum[1] != NONE) {
+            ld.sidenum[1] = le16u(ln.data, at + 12);
+            if (ld.sidenum[1] >= lv.numsides) { ret fail(LevelError.reference{ML_LINEDEFS}); }
+            ld.backsector = lv.sides[ld.sidenum[1]].sector;
+        }
+        # P_GroupLines dereferences every line's front sector
+        if (ld.frontsector == NONE) { ret fail(LevelError.reference{ML_LINEDEFS}); }
+        i = i + 1;
+    }
+
+    # subsectors
+    val ss: Table = table(w, marker, ML_SSECTORS, "SSECTORS", 4);
+    if (!ss.ok) { ret fail(LevelError.lump{ML_SSECTORS}); }
+    lv.numsubsectors = ss.count;
+    if (!grab[Subsector](a, ss.count, ?lv.subsectors)) { ret fail(LevelError.memory{}); }
+    i = 0;
+    for (i < ss.count) {
+        val at: usize = i::usize * 4;
+        lv.subsectors[i].numlines  = le16u(ss.data, at);
+        lv.subsectors[i].firstline = le16u(ss.data, at + 2);
+        i                          = i + 1;
+    }
+
+    # nodes
+    val nd: Table = table(w, marker, ML_NODES, "NODES", 28);
+    if (!nd.ok) { ret fail(LevelError.lump{ML_NODES}); }
+    lv.numnodes = nd.count;
+    if (!grab[Node](a, nd.count, ?lv.nodes)) { ret fail(LevelError.memory{}); }
+    i = 0;
+    for (i < nd.count) {
+        val at: usize = i::usize * 28;
+        val no: *Node = ?lv.nodes[i];
+        no.x  = le16(nd.data, at) << 16;
+        no.y  = le16(nd.data, at + 2) << 16;
+        no.dx = le16(nd.data, at + 4) << 16;
+        no.dy = le16(nd.data, at + 6) << 16;
+        var k: usize = 0;
+        for (k < 8) {
+            no.bbox[k] = le16(nd.data, at + 8 + k * 2) << 16;
+            k          = k + 1;
+        }
+        k = 0;
+        for (k < 2) {
+            val child: i32 = le16u(nd.data, at + 24 + k * 2);
+            if ((child & 0x8000) != 0) {
+                if ((child & 0x7fff) >= lv.numsubsectors) { ret fail(LevelError.reference{ML_NODES}); }
+            }
+            or (child >= lv.numnodes) {
+                ret fail(LevelError.reference{ML_NODES});
+            }
+            no.children[k] = child::u16;
+            k              = k + 1;
+        }
+        i = i + 1;
+    }
+
+    # segs
+    val sg: Table = table(w, marker, ML_SEGS, "SEGS", 12);
+    if (!sg.ok) { ret fail(LevelError.lump{ML_SEGS}); }
+    lv.numsegs = sg.count;
+    if (!grab[Seg](a, sg.count, ?lv.segs)) { ret fail(LevelError.memory{}); }
+    i = 0;
+    for (i < sg.count) {
+        val at: usize = i::usize * 12;
+        val li: *Seg  = ?lv.segs[i];
+        li.v1      = le16u(sg.data, at);
+        li.v2      = le16u(sg.data, at + 2);
+        li.angle   = (le16(sg.data, at + 4) << 16):~u32;
+        li.linedef = le16u(sg.data, at + 6);
+        val side: i32 = le16u(sg.data, at + 8);
+        li.offset = le16(sg.data, at + 10) << 16;
+        if (li.v1 >= lv.numvertexes || li.v2 >= lv.numvertexes) {
+            ret fail(LevelError.reference{ML_SEGS});
+        }
+        if (li.linedef >= lv.numlines || side > 1) { ret fail(LevelError.reference{ML_SEGS}); }
+
+        val ldef: *Line = ?lv.lines[li.linedef];
+        li.sidedef = ldef.sidenum[side];
+        if (li.sidedef == NONE) { ret fail(LevelError.reference{ML_SEGS}); }
+        li.frontsector = lv.sides[li.sidedef].sector;
+        li.backsector  = NONE;
+        if ((ldef.flags & ML_TWOSIDED) != 0 && ldef.sidenum[side ^ 1] != NONE) {
+            li.backsector = lv.sides[ldef.sidenum[side ^ 1]].sector;
+        }
+        i = i + 1;
+    }
+
+    # reject
+    val rj: Table = table(w, marker, ML_REJECT, "REJECT", 1);
+    if (!rj.ok) { ret fail(LevelError.lump{ML_REJECT}); }
+    lv.rejectmatrix = rj.data;
+    lv.rejectsize   = rj.count;
+
+    # things
+    val th: Table = table(w, marker, ML_THINGS, "THINGS", 10);
+    if (!th.ok) { ret fail(LevelError.lump{ML_THINGS}); }
+    lv.numthings = th.count;
+    if (!grab[Thing](a, th.count, ?lv.things)) { ret fail(LevelError.memory{}); }
+    i = 0;
+    for (i < th.count) {
+        val at: usize  = i::usize * 10;
+        val mt: *Thing = ?lv.things[i];
+        mt.x       = le16(th.data, at)::i16;
+        mt.y       = le16(th.data, at + 2)::i16;
+        mt.angle   = le16(th.data, at + 4)::i16;
+        mt.kind    = le16(th.data, at + 6)::i16;
+        mt.options = le16(th.data, at + 8)::i16;
+        i          = i + 1;
+    }
+
+    # P_GroupLines: a sector for each subsector
+    i = 0;
+    for (i < lv.numsubsectors) {
+        val sub: *Subsector = ?lv.subsectors[i];
+        if (sub.firstline >= lv.numsegs || sub.firstline + sub.numlines > lv.numsegs) {
+            ret fail(LevelError.reference{ML_SSECTORS});
+        }
+        sub.sector = lv.segs[sub.firstline].frontsector;
+        i          = i + 1;
+    }
+
+    # count the lines of each sector
+    var total: i32 = 0;
+    i = 0;
+    for (i < lv.numlines) {
+        val ld: *Line = ?lv.lines[i];
+        total                                = total + 1;
+        lv.sectors[ld.frontsector].linecount = lv.sectors[ld.frontsector].linecount + 1;
+        if (ld.backsector != NONE && ld.backsector != ld.frontsector) {
+            lv.sectors[ld.backsector].linecount = lv.sectors[ld.backsector].linecount + 1;
+            total                               = total + 1;
+        }
+        i = i + 1;
+    }
+
+    # the line table, bounding box, sound origin and block box of each sector
+    lv.numsectorlines = total;
+    if (!grab[i32](a, total, ?lv.sector_lines)) { ret fail(LevelError.memory{}); }
+    var next: i32 = 0;
+    i = 0;
+    for (i < lv.numsectors) {
+        val s:   *Sector  = ?lv.sectors[i];
+        var box: [4]Fixed = [4]Fixed{MININT, MAXINT, MAXINT, MININT};
+        s.firstline = next;
+        var j: i32 = 0;
+        for (j < lv.numlines) {
+            val ld: *Line = ?lv.lines[j];
+            if (ld.frontsector == i || ld.backsector == i) {
+                lv.sector_lines[next] = j;
+                next                  = next + 1;
+                add_to_box(?box[0], lv.vertexes[ld.v1].x, lv.vertexes[ld.v1].y);
+                add_to_box(?box[0], lv.vertexes[ld.v2].x, lv.vertexes[ld.v2].y);
+            }
+            j = j + 1;
+        }
+
+        s.soundorg_x = (box[BOXRIGHT] + box[BOXLEFT]) / 2;
+        s.soundorg_y = (box[BOXTOP] + box[BOXBOTTOM]) / 2;
+
+        var block: i32 = (box[BOXTOP] - lv.bmaporgy + MAXRADIUS) >> MAPBLOCKSHIFT;
+        if (block >= lv.bmapheight) { block = lv.bmapheight - 1; }
+        s.blockbox[BOXTOP] = block;
+
+        block = (box[BOXBOTTOM] - lv.bmaporgy - MAXRADIUS) >> MAPBLOCKSHIFT;
+        if (block < 0) { block = 0; }
+        s.blockbox[BOXBOTTOM] = block;
+
+        block = (box[BOXRIGHT] - lv.bmaporgx + MAXRADIUS) >> MAPBLOCKSHIFT;
+        if (block >= lv.bmapwidth) { block = lv.bmapwidth - 1; }
+        s.blockbox[BOXRIGHT] = block;
+
+        block = (box[BOXLEFT] - lv.bmaporgx - MAXRADIUS) >> MAPBLOCKSHIFT;
+        if (block < 0) { block = 0; }
+        s.blockbox[BOXLEFT] = block;
+
+        i = i + 1;
+    }
+
+    ret res[Level, LevelError].ok{lv};
+}
+
+test add_to_box__moves_one_bound_per_axis {
+    # M_AddToBox tests the low bound first and the high bound only otherwise,
+    # so a point that lowers a bound never raises the other. No shareware map
+    # shows the difference, because every sector's outline revisits its
+    # vertexes; this pins the behaviour for the maps that would.
+    var box: [4]Fixed = [4]Fixed{MININT, MAXINT, MAXINT, MININT};
+    add_to_box(?box[0], 100, 100);
+    if (box[BOXLEFT] != 100 || box[BOXRIGHT] != MININT) { ret 1; }
+    if (box[BOXBOTTOM] != 100 || box[BOXTOP] != MININT) { ret 2; }
+    add_to_box(?box[0], 50, 50);
+    if (box[BOXLEFT] != 50 || box[BOXRIGHT] != MININT) { ret 3; }
+    add_to_box(?box[0], 70, 70);
+    if (box[BOXRIGHT] != 70 || box[BOXTOP] != 70) { ret 4; }
+    ret 0;
+}

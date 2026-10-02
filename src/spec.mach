@@ -1,0 +1,1049 @@
+# what lines and sectors do when something happens to them: walking over a
+# trigger, pressing a switch, shooting a target, standing in slime
+#
+# Ported from p_spec.c, p_switch.c and p_telept.c. This module is where a
+# line's special number turns into a door, a floor or an exit; world.mach
+# reaches it through the line_special hook, because it sits above everything
+# it sets in motion.
+
+use std.types.bool.bool;
+use std.types.string.str;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.defs.Mobj;
+use doom.defs.Player;
+use doom.defs.Thinker;
+use doom.info;
+use doom.level;
+use doom.movers;
+use doom.rdata;
+use t: doom.tables;
+use doom.world;
+
+val BUTTONTIME: i32 = 35;
+val MAXBUTTONS: i32 = 16;
+
+val WHERE_TOP:    i32 = 0;
+val WHERE_MIDDLE: i32 = 1;
+val WHERE_BOTTOM: i32 = 2;
+
+# flats, then wall textures, that animate: last frame, first frame
+val FLAT_ANIMS: [18]str = [18]str{
+    "NUKAGE3", "NUKAGE1",
+    "FWATER4", "FWATER1",
+    "SWATER4", "SWATER1",
+    "LAVA4", "LAVA1",
+    "BLOOD3", "BLOOD1",
+    "RROCK08", "RROCK05",
+    "SLIME04", "SLIME01",
+    "SLIME08", "SLIME05",
+    "SLIME12", "SLIME09"
+};
+
+val TEXTURE_ANIMS: [26]str = [26]str{
+    "BLODGR4", "BLODGR1",
+    "SLADRIP3", "SLADRIP1",
+    "BLODRIP4", "BLODRIP1",
+    "FIREWALL", "FIREWALA",
+    "GSTFONT3", "GSTFONT1",
+    "FIRELAVA", "FIRELAV3",
+    "FIREMAG3", "FIREMAG1",
+    "FIREBLU2", "FIREBLU1",
+    "ROCKRED3", "ROCKRED1",
+    "BFALL4", "BFALL1",
+    "SFALL4", "SFALL1",
+    "WFALL4", "WFALL1",
+    "DBRAIN4", "DBRAIN1"
+};
+
+# the first episode's switches: the texture for off, then for on
+val SWITCHES: [38]str = [38]str{
+    "SW1BRCOM", "SW2BRCOM",
+    "SW1BRN1", "SW2BRN1",
+    "SW1BRN2", "SW2BRN2",
+    "SW1BRNGN", "SW2BRNGN",
+    "SW1BROWN", "SW2BROWN",
+    "SW1COMM", "SW2COMM",
+    "SW1COMP", "SW2COMP",
+    "SW1DIRT", "SW2DIRT",
+    "SW1EXIT", "SW2EXIT",
+    "SW1GRAY", "SW2GRAY",
+    "SW1GRAY1", "SW2GRAY1",
+    "SW1METAL", "SW2METAL",
+    "SW1PIPE", "SW2PIPE",
+    "SW1SLAD", "SW2SLAD",
+    "SW1STARG", "SW2STARG",
+    "SW1STON1", "SW2STON1",
+    "SW1STON2", "SW2STON2",
+    "SW1STONE", "SW2STONE",
+    "SW1STRTN", "SW2STRTN"
+};
+
+fun tag_of(g: *Game, linenum: i32) i32 {
+    ret g.lv.lines[linenum].tagnum::i32;
+}
+
+# P_InitPicAnims
+pub fun init_pic_anims(g: *Game) {
+    g.numanims = 0;
+
+    var i: i32 = 0;
+    for (i < 13) {
+        val first: i32 = rdata.texture_num(g.d, TEXTURE_ANIMS[i * 2 + 1]);
+        val last:  i32 = rdata.texture_num(g.d, TEXTURE_ANIMS[i * 2]);
+        i = i + 1;
+        # different episode?
+        if (first < 0 || last < 0 || last - first + 1 < 2) { cnt; }
+        val a: *defs.Anim = ?g.anims[g.numanims];
+        a.istexture = 1;
+        a.picnum    = last;
+        a.basepic   = first;
+        a.numpics   = last - first + 1;
+        a.speed     = 8;
+        g.numanims  = g.numanims + 1;
+    }
+
+    i = 0;
+    for (i < 9) {
+        val first: i32 = rdata.flat_num(g.d, FLAT_ANIMS[i * 2 + 1]);
+        val last:  i32 = rdata.flat_num(g.d, FLAT_ANIMS[i * 2]);
+        i = i + 1;
+        if (first < 0 || last < 0 || last - first + 1 < 2 || last >= g.d.numflats) { cnt; }
+        val a: *defs.Anim = ?g.anims[g.numanims];
+        a.istexture = 0;
+        a.picnum    = last;
+        a.basepic   = first;
+        a.numpics   = last - first + 1;
+        a.speed     = 8;
+        g.numanims  = g.numanims + 1;
+    }
+}
+
+# P_InitSwitchList: only called at game initialization
+pub fun init_switch_list(g: *Game) {
+    var index: i32 = 0;
+    var i:     i32 = 0;
+    for (i < 19) {
+        val off: i32 = rdata.texture_num(g.d, SWITCHES[i * 2]);
+        val on:  i32 = rdata.texture_num(g.d, SWITCHES[i * 2 + 1]);
+        i = i + 1;
+        # the original stops with an error on a switch the WAD lacks
+        if (off < 0 || on < 0) { cnt; }
+        g.switchlist[index]     = off;
+        g.switchlist[index + 1] = on;
+        index                   = index + 2;
+    }
+    g.numswitches = index / 2;
+}
+
+# P_StartButton: start a button counting down till it turns off
+fun start_button(g: *Game, linenum: i32, w: i32, texture: i32, time: i32) {
+    # see if button is already pressed
+    var i: i32 = 0;
+    for (i < MAXBUTTONS) {
+        if (g.buttonlist[i].btimer != 0 && g.buttonlist[i].line == linenum) { ret; }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < MAXBUTTONS) {
+        if (g.buttonlist[i].btimer == 0) {
+            g.buttonlist[i].line     = linenum;
+            g.buttonlist[i].where    = w;
+            g.buttonlist[i].btexture = texture;
+            g.buttonlist[i].btimer   = time;
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# P_ChangeSwitchTexture: tell it if switch is ok to use again (1 = yes, it's
+# a button)
+fun change_switch_texture(g: *Game, linenum: i32, use_again: bool) {
+    val line: *level.Line = ?g.lv.lines[linenum];
+    if (!use_again) { line.special = 0; }
+
+    val side: *level.Side = ?g.lv.sides[line.sidenum[0]];
+
+    var sound: i32 = info.SFX_SWTCHN;
+    # EXIT SWITCH?
+    if (line.special == 11) { sound = info.SFX_SWTCHX; }
+
+    var i: i32 = 0;
+    for (i < g.numswitches * 2) {
+        if (g.switchlist[i] == side.toptex) {
+            defs.sound(g, nil, sound);
+            side.toptex = g.switchlist[i ^ 1];
+            if (use_again) { start_button(g, linenum, WHERE_TOP, g.switchlist[i], BUTTONTIME); }
+            ret;
+        }
+        if (g.switchlist[i] == side.midtex) {
+            defs.sound(g, nil, sound);
+            side.midtex = g.switchlist[i ^ 1];
+            if (use_again) { start_button(g, linenum, WHERE_MIDDLE, g.switchlist[i], BUTTONTIME); }
+            ret;
+        }
+        if (g.switchlist[i] == side.bottomtex) {
+            defs.sound(g, nil, sound);
+            side.bottomtex = g.switchlist[i ^ 1];
+            if (use_again) { start_button(g, linenum, WHERE_BOTTOM, g.switchlist[i], BUTTONTIME); }
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# EV_Teleport
+fun teleport(g: *Game, linenum: i32, side: i32, thing: *Mobj) bool {
+    # don't teleport missiles
+    if ((thing.flags & defs.MF_MISSILE) != 0) { ret 0; }
+
+    # don't teleport if hit back of line, so you can get out of teleporter
+    if (side == 1) { ret 0; }
+
+    val tag: i32 = tag_of(g, linenum);
+    var i:   i32 = 0;
+    for (i < g.lv.numsectors) {
+        if (g.lv.sectors[i].tagnum::i32 == tag) {
+            var thinker: *Thinker = g.thinkercap.next;
+            for (thinker != ?g.thinkercap) {
+                val m: *Mobj = thinker:~*Mobj;
+                thinker = thinker.next;
+
+                # not a mobj
+                if (m.thinker.kind != defs.TH_MOBJ) { cnt; }
+                # not a teleportman
+                if (m.kind != info.MT_TELEPORTMAN) { cnt; }
+                # wrong sector
+                if (g.lv.subsectors[m.subsector].sector != i) { cnt; }
+
+                val oldx: i32 = thing.x;
+                val oldy: i32 = thing.y;
+                val oldz: i32 = thing.z;
+
+                if (!world.teleport_move(g, thing, m.x, m.y)) { ret 0; }
+
+                thing.z = thing.floorz;
+                if (thing.player != nil) { thing.player.viewz = thing.z + thing.player.viewheight; }
+
+                # spawn teleport fog at source and destination
+                var fog: *Mobj = world.spawn_mobj(g, oldx, oldy, oldz, info.MT_TFOG);
+                defs.sound(g, fog, info.SFX_TELEPT);
+                val an: u32 = m.angle >> t.ANGLETOFINESHIFT;
+                fog = world.spawn_mobj(g, m.x + 20 * t.FINESINE[an + 2048], m.y + 20 * t.FINESINE[an], thing.z, info.MT_TFOG);
+
+                # emit sound, where?
+                defs.sound(g, fog, info.SFX_TELEPT);
+
+                # don't move for a bit
+                if (thing.player != nil) { thing.reactiontime = 18; }
+
+                thing.angle = m.angle;
+                thing.momx  = 0;
+                thing.momy  = 0;
+                thing.momz  = 0;
+                ret 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# P_CrossSpecialLine - TRIGGER: called every time a thing origin is about to
+# cross a line with a non 0 special
+fun cross_special_line(g: *Game, linenum: i32, side: i32, thing: *Mobj) {
+    val line: *level.Line = ?g.lv.lines[linenum];
+    val s:    i32         = line.special::i32;
+    val tag:  i32         = line.tagnum::i32;
+
+    # triggers that other things can activate
+    if (thing.player == nil) {
+        # things that should NOT trigger specials...
+        val k: i32 = thing.kind;
+        if (k == info.MT_ROCKET || k == info.MT_PLASMA || k == info.MT_BFG || k == info.MT_TROOPSHOT ||
+            k == info.MT_HEADSHOT || k == info.MT_BRUISERSHOT) {
+            ret;
+        }
+
+        # 39 teleport trigger, 97 teleport retrigger, 125 and 126 teleport
+        # monsteronly, 4 raise door, 10 plat down-wait-up-stay trigger, 88
+        # plat down-wait-up-stay retrigger
+        if (s != 39 && s != 97 && s != 125 && s != 126 && s != 4 && s != 10 && s != 88) { ret; }
+    }
+
+    # note: could use some const's here
+    var once: bool = 1;
+
+    # triggers: all from here to the retriggers clear the special
+    if (s == 2) {
+        # open door
+        movers.do_door(g, tag, movers.OPEN);
+    }
+    or (s == 3) {
+        # close door
+        movers.do_door(g, tag, movers.CLOSE);
+    }
+    or (s == 4) {
+        # raise door
+        movers.do_door(g, tag, movers.NORMAL);
+    }
+    or (s == 5) {
+        # raise floor
+        movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR);
+    }
+    or (s == 6) {
+        # fast ceiling crush & raise
+        movers.do_ceiling(g, tag, movers.FAST_CRUSH_AND_RAISE);
+    }
+    or (s == 8) {
+        # build stairs
+        movers.build_stairs(g, tag, movers.BUILD_8);
+    }
+    or (s == 10) {
+        # platform down, wait, up and stay
+        movers.do_plat(g, linenum, movers.DOWN_WAIT_UP_STAY, 0);
+    }
+    or (s == 12) {
+        # light turn on - brightest near
+        movers.light_turn_on(g, tag, 0);
+    }
+    or (s == 13) {
+        # light turn on 255
+        movers.light_turn_on(g, tag, 255);
+    }
+    or (s == 16) {
+        # close door 30
+        movers.do_door(g, tag, movers.CLOSE_30_THEN_OPEN);
+    }
+    or (s == 17) {
+        # start light strobing
+        movers.start_light_strobing(g, tag);
+    }
+    or (s == 19) {
+        # lower floor
+        movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR);
+    }
+    or (s == 22) {
+        # raise floor to nearest height and change texture
+        movers.do_plat(g, linenum, movers.RAISE_TO_NEAREST_AND_CHANGE, 0);
+    }
+    or (s == 25) {
+        # ceiling crush and raise
+        movers.do_ceiling(g, tag, movers.CRUSH_AND_RAISE);
+    }
+    or (s == 30) {
+        # raise floor to shortest texture height on either side of lines
+        movers.do_floor(g, tag, linenum, movers.RAISE_TO_TEXTURE);
+    }
+    or (s == 35) {
+        # lights very dark
+        movers.light_turn_on(g, tag, 35);
+    }
+    or (s == 36) {
+        # lower floor (turbo)
+        movers.do_floor(g, tag, linenum, movers.TURBO_LOWER);
+    }
+    or (s == 37) {
+        # lower and change
+        movers.do_floor(g, tag, linenum, movers.LOWER_AND_CHANGE);
+    }
+    or (s == 38) {
+        # lower floor to lowest
+        movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR_TO_LOWEST);
+    }
+    or (s == 39) {
+        # teleport!
+        teleport(g, linenum, side, thing);
+    }
+    or (s == 40) {
+        # raise ceiling, lower floor
+        movers.do_ceiling(g, tag, movers.RAISE_TO_HIGHEST);
+        movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR_TO_LOWEST);
+    }
+    or (s == 44) {
+        # ceiling crush
+        movers.do_ceiling(g, tag, movers.LOWER_AND_CRUSH);
+    }
+    or (s == 52) {
+        # exit!
+        g.exited = 1;
+        once     = 0;
+    }
+    or (s == 53) {
+        # perpetual platform raise
+        movers.do_plat(g, linenum, movers.PERPETUAL_RAISE, 0);
+    }
+    or (s == 54) {
+        # platform stop
+        movers.stop_plat(g, tag);
+    }
+    or (s == 56) {
+        # raise floor crush
+        movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_CRUSH);
+    }
+    or (s == 57) {
+        # ceiling crush stop
+        movers.ceiling_crush_stop(g, tag);
+    }
+    or (s == 58) {
+        # raise floor 24
+        movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_24);
+    }
+    or (s == 59) {
+        # raise floor 24 and change
+        movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_24_AND_CHANGE);
+    }
+    or (s == 104) {
+        # turn lights off in sector(tag)
+        movers.turn_tag_lights_off(g, tag);
+    }
+    or (s == 108) {
+        # blazing door raise (faster than turbo!)
+        movers.do_door(g, tag, movers.BLAZE_RAISE);
+    }
+    or (s == 109) {
+        # blazing door open (faster than turbo!)
+        movers.do_door(g, tag, movers.BLAZE_OPEN);
+    }
+    or (s == 100) {
+        # build stairs turbo 16
+        movers.build_stairs(g, tag, movers.TURBO_16);
+    }
+    or (s == 110) {
+        # blazing door close (faster than turbo!)
+        movers.do_door(g, tag, movers.BLAZE_CLOSE);
+    }
+    or (s == 119) {
+        # raise floor to nearest surrounding floor
+        movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_TO_NEAREST);
+    }
+    or (s == 121) {
+        # blazing platdownwaitupstay
+        movers.do_plat(g, linenum, movers.BLAZE_DWUS, 0);
+    }
+    or (s == 124) {
+        # secret exit
+        g.exited = 2;
+        once     = 0;
+    }
+    or (s == 125) {
+        # teleport monsteronly
+        once = 0;
+        if (thing.player == nil) {
+            teleport(g, linenum, side, thing);
+            once = 1;
+        }
+    }
+    or (s == 130) {
+        # raise floor turbo
+        movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_TURBO);
+    }
+    or (s == 141) {
+        # silent ceiling crush & raise
+        movers.do_ceiling(g, tag, movers.SILENT_CRUSH_AND_RAISE);
+    }
+    or {
+        # re-triggerable from here down
+        once = 0;
+        if (s == 72) {
+            # ceiling crush
+            movers.do_ceiling(g, tag, movers.LOWER_AND_CRUSH);
+        }
+        or (s == 73) {
+            # ceiling crush and raise
+            movers.do_ceiling(g, tag, movers.CRUSH_AND_RAISE);
+        }
+        or (s == 74) {
+            # ceiling crush stop
+            movers.ceiling_crush_stop(g, tag);
+        }
+        or (s == 75) {
+            # close door
+            movers.do_door(g, tag, movers.CLOSE);
+        }
+        or (s == 76) {
+            # close door 30
+            movers.do_door(g, tag, movers.CLOSE_30_THEN_OPEN);
+        }
+        or (s == 77) {
+            # fast ceiling crush & raise
+            movers.do_ceiling(g, tag, movers.FAST_CRUSH_AND_RAISE);
+        }
+        or (s == 79) {
+            # lights very dark
+            movers.light_turn_on(g, tag, 35);
+        }
+        or (s == 80) {
+            # light turn on - brightest near
+            movers.light_turn_on(g, tag, 0);
+        }
+        or (s == 81) {
+            # light turn on 255
+            movers.light_turn_on(g, tag, 255);
+        }
+        or (s == 82) {
+            # lower floor to lowest
+            movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR_TO_LOWEST);
+        }
+        or (s == 83) {
+            # lower floor
+            movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR);
+        }
+        or (s == 84) {
+            # lower and change
+            movers.do_floor(g, tag, linenum, movers.LOWER_AND_CHANGE);
+        }
+        or (s == 86) {
+            # open door
+            movers.do_door(g, tag, movers.OPEN);
+        }
+        or (s == 87) {
+            # perpetual platform raise
+            movers.do_plat(g, linenum, movers.PERPETUAL_RAISE, 0);
+        }
+        or (s == 88) {
+            # plat down-wait-up-stay
+            movers.do_plat(g, linenum, movers.DOWN_WAIT_UP_STAY, 0);
+        }
+        or (s == 89) {
+            # platform stop
+            movers.stop_plat(g, tag);
+        }
+        or (s == 90) {
+            # raise door
+            movers.do_door(g, tag, movers.NORMAL);
+        }
+        or (s == 91) {
+            # raise floor
+            movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR);
+        }
+        or (s == 92) {
+            # raise floor 24
+            movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_24);
+        }
+        or (s == 93) {
+            # raise floor 24 and change
+            movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_24_AND_CHANGE);
+        }
+        or (s == 94) {
+            # raise floor crush
+            movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_CRUSH);
+        }
+        or (s == 95) {
+            # raise floor to nearest height and change texture
+            movers.do_plat(g, linenum, movers.RAISE_TO_NEAREST_AND_CHANGE, 0);
+        }
+        or (s == 96) {
+            # raise floor to shortest texture height on either side of lines
+            movers.do_floor(g, tag, linenum, movers.RAISE_TO_TEXTURE);
+        }
+        or (s == 97) {
+            # teleport!
+            teleport(g, linenum, side, thing);
+        }
+        or (s == 98) {
+            # lower floor (turbo)
+            movers.do_floor(g, tag, linenum, movers.TURBO_LOWER);
+        }
+        or (s == 105) {
+            # blazing door raise (faster than turbo!)
+            movers.do_door(g, tag, movers.BLAZE_RAISE);
+        }
+        or (s == 106) {
+            # blazing door open (faster than turbo!)
+            movers.do_door(g, tag, movers.BLAZE_OPEN);
+        }
+        or (s == 107) {
+            # blazing door close (faster than turbo!)
+            movers.do_door(g, tag, movers.BLAZE_CLOSE);
+        }
+        or (s == 120) {
+            # blazing platdownwaitupstay
+            movers.do_plat(g, linenum, movers.BLAZE_DWUS, 0);
+        }
+        or (s == 126) {
+            # teleport monsteronly
+            if (thing.player == nil) { teleport(g, linenum, side, thing); }
+        }
+        or (s == 128) {
+            # raise to nearest floor
+            movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_TO_NEAREST);
+        }
+        or (s == 129) {
+            # raise floor turbo
+            movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_TURBO);
+        }
+    }
+
+    if (once) { line.special = 0; }
+}
+
+# P_ShootSpecialLine - IMPACT SPECIALS: called when a thing shoots a special
+# line
+fun shoot_special_line(g: *Game, thing: *Mobj, linenum: i32) {
+    val s:   i32 = g.lv.lines[linenum].special::i32;
+    val tag: i32 = tag_of(g, linenum);
+
+    # impacts that other things can activate
+    if (thing.player == nil && s != 46) { ret; }
+
+    if (s == 24) {
+        # raise floor
+        movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR);
+        change_switch_texture(g, linenum, 0);
+    }
+    or (s == 46) {
+        # open door
+        movers.do_door(g, tag, movers.OPEN);
+        change_switch_texture(g, linenum, 1);
+    }
+    or (s == 47) {
+        # raise floor near and change
+        movers.do_plat(g, linenum, movers.RAISE_TO_NEAREST_AND_CHANGE, 0);
+        change_switch_texture(g, linenum, 0);
+    }
+}
+
+# press a switch: change its texture if the effect started
+fun pressed(g: *Game, linenum: i32, started: bool, use_again: bool) {
+    if (started) { change_switch_texture(g, linenum, use_again); }
+}
+
+# P_UseSpecialLine: called when a thing uses a special line. only the front
+# sides of lines are usable.
+fun use_special_line(g: *Game, thing: *Mobj, linenum: i32, side: i32) bool {
+    val line: *level.Line = ?g.lv.lines[linenum];
+    val s:    i32         = line.special::i32;
+    val tag:  i32         = line.tagnum::i32;
+
+    # err... use the back sides of VERY SPECIAL lines...
+    if (side != 0) {
+        # sliding door open&close; unused
+        if (s != 124) { ret 0; }
+    }
+
+    # switches that other things can activate
+    if (thing.player == nil) {
+        # never open secret doors
+        if ((line.flags::i32 & defs.ML_SECRET) != 0) { ret 0; }
+
+        # manual door raise, manual blue, manual red, manual yellow
+        if (s != 1 && s != 32 && s != 33 && s != 34) { ret 0; }
+    }
+
+    # do something
+    if (s == 1 || s == 26 || s == 27 || s == 28 || s == 31 || s == 32 || s == 33 || s == 34 || s == 117 || s == 118) {
+        # manuals: vertical door, blue door/locked, yellow door/locked, red
+        # door/locked, manual door open, blue/red/yellow locked door open,
+        # blazing door raise, blazing door open
+        movers.vertical_door(g, linenum, thing);
+    }
+    # switches
+    or (s == 7) {
+        # build stairs
+        pressed(g, linenum, movers.build_stairs(g, tag, movers.BUILD_8), 0);
+    }
+    or (s == 9) {
+        # change donut
+        pressed(g, linenum, movers.do_donut(g, tag), 0);
+    }
+    or (s == 11) {
+        # exit level
+        change_switch_texture(g, linenum, 0);
+        g.exited = 1;
+    }
+    or (s == 14) {
+        # raise floor 32 and change texture
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.RAISE_AND_CHANGE, 32), 0);
+    }
+    or (s == 15) {
+        # raise floor 24 and change texture
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.RAISE_AND_CHANGE, 24), 0);
+    }
+    or (s == 18) {
+        # raise floor to next highest floor
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_TO_NEAREST), 0);
+    }
+    or (s == 20) {
+        # raise plat next highest floor and change texture
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.RAISE_TO_NEAREST_AND_CHANGE, 0), 0);
+    }
+    or (s == 21) {
+        # platdownwaitupstay
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.DOWN_WAIT_UP_STAY, 0), 0);
+    }
+    or (s == 23) {
+        # lower floor to lowest
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR_TO_LOWEST), 0);
+    }
+    or (s == 29) {
+        # raise door
+        pressed(g, linenum, movers.do_door(g, tag, movers.NORMAL), 0);
+    }
+    or (s == 41) {
+        # lower ceiling to floor
+        pressed(g, linenum, movers.do_ceiling(g, tag, movers.LOWER_TO_FLOOR), 0);
+    }
+    or (s == 71) {
+        # turbo lower floor
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.TURBO_LOWER), 0);
+    }
+    or (s == 49) {
+        # ceiling crush and raise
+        pressed(g, linenum, movers.do_ceiling(g, tag, movers.CRUSH_AND_RAISE), 0);
+    }
+    or (s == 50) {
+        # close door
+        pressed(g, linenum, movers.do_door(g, tag, movers.CLOSE), 0);
+    }
+    or (s == 51) {
+        # secret exit
+        change_switch_texture(g, linenum, 0);
+        g.exited = 2;
+    }
+    or (s == 55) {
+        # raise floor crush
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_CRUSH), 0);
+    }
+    or (s == 101) {
+        # raise floor
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR), 0);
+    }
+    or (s == 102) {
+        # lower floor to surrounding floor height
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR), 0);
+    }
+    or (s == 103) {
+        # open door
+        pressed(g, linenum, movers.do_door(g, tag, movers.OPEN), 0);
+    }
+    or (s == 111) {
+        # blazing door raise (faster than turbo!)
+        pressed(g, linenum, movers.do_door(g, tag, movers.BLAZE_RAISE), 0);
+    }
+    or (s == 112) {
+        # blazing door open (faster than turbo!)
+        pressed(g, linenum, movers.do_door(g, tag, movers.BLAZE_OPEN), 0);
+    }
+    or (s == 113) {
+        # blazing door close (faster than turbo!)
+        pressed(g, linenum, movers.do_door(g, tag, movers.BLAZE_CLOSE), 0);
+    }
+    or (s == 122) {
+        # blazing platdownwaitupstay
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.BLAZE_DWUS, 0), 0);
+    }
+    or (s == 127) {
+        # build stairs turbo 16
+        pressed(g, linenum, movers.build_stairs(g, tag, movers.TURBO_16), 0);
+    }
+    or (s == 131) {
+        # raise floor turbo
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_TURBO), 0);
+    }
+    or (s == 133 || s == 135 || s == 137) {
+        # blzopendoor blue, red, yellow
+        pressed(g, linenum, movers.do_locked_door(g, linenum, movers.BLAZE_OPEN, thing), 0);
+    }
+    or (s == 140) {
+        # raise floor 512
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_512), 0);
+    }
+    # buttons
+    or (s == 42) {
+        # close door
+        pressed(g, linenum, movers.do_door(g, tag, movers.CLOSE), 1);
+    }
+    or (s == 43) {
+        # lower ceiling to floor
+        pressed(g, linenum, movers.do_ceiling(g, tag, movers.LOWER_TO_FLOOR), 1);
+    }
+    or (s == 45) {
+        # lower floor to surrounding floor height
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR), 1);
+    }
+    or (s == 60) {
+        # lower floor to lowest
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.LOWER_FLOOR_TO_LOWEST), 1);
+    }
+    or (s == 61) {
+        # open door
+        pressed(g, linenum, movers.do_door(g, tag, movers.OPEN), 1);
+    }
+    or (s == 62) {
+        # platdownwaitupstay
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.DOWN_WAIT_UP_STAY, 1), 1);
+    }
+    or (s == 63) {
+        # raise door
+        pressed(g, linenum, movers.do_door(g, tag, movers.NORMAL), 1);
+    }
+    or (s == 64) {
+        # raise floor to ceiling
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR), 1);
+    }
+    or (s == 66) {
+        # raise floor 24 and change texture
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.RAISE_AND_CHANGE, 24), 1);
+    }
+    or (s == 67) {
+        # raise floor 32 and change texture
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.RAISE_AND_CHANGE, 32), 1);
+    }
+    or (s == 65) {
+        # raise floor crush
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_CRUSH), 1);
+    }
+    or (s == 68) {
+        # raise plat to next highest floor and change texture
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.RAISE_TO_NEAREST_AND_CHANGE, 0), 1);
+    }
+    or (s == 69) {
+        # raise floor to next highest floor
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_TO_NEAREST), 1);
+    }
+    or (s == 70) {
+        # turbo lower floor
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.TURBO_LOWER), 1);
+    }
+    or (s == 114) {
+        # blazing door raise (faster than turbo!)
+        pressed(g, linenum, movers.do_door(g, tag, movers.BLAZE_RAISE), 1);
+    }
+    or (s == 115) {
+        # blazing door open (faster than turbo!)
+        pressed(g, linenum, movers.do_door(g, tag, movers.BLAZE_OPEN), 1);
+    }
+    or (s == 116) {
+        # blazing door close (faster than turbo!)
+        pressed(g, linenum, movers.do_door(g, tag, movers.BLAZE_CLOSE), 1);
+    }
+    or (s == 123) {
+        # blazing platdownwaitupstay
+        pressed(g, linenum, movers.do_plat(g, linenum, movers.BLAZE_DWUS, 0), 1);
+    }
+    or (s == 132) {
+        # raise floor turbo
+        pressed(g, linenum, movers.do_floor(g, tag, linenum, movers.RAISE_FLOOR_TURBO), 1);
+    }
+    or (s == 99 || s == 134 || s == 136) {
+        # blzopendoor blue, red, yellow
+        pressed(g, linenum, movers.do_locked_door(g, linenum, movers.BLAZE_OPEN, thing), 1);
+    }
+    or (s == 138) {
+        # light turn on
+        movers.light_turn_on(g, tag, 255);
+        change_switch_texture(g, linenum, 1);
+    }
+    or (s == 139) {
+        # light turn off
+        movers.light_turn_on(g, tag, 35);
+        change_switch_texture(g, linenum, 1);
+    }
+
+    ret 1;
+}
+
+# the line_special hook: a line was crossed, used or shot
+# ---
+# how:     TRIGGER_CROSS, TRIGGER_USE or TRIGGER_SHOOT
+# linenum: the line
+# side:    the side it was crossed or used from
+# thing:   who did it
+# ret:     for a use, whether the line could be used at all
+pub fun line_special(g: *Game, how: i32, linenum: i32, side: i32, thing: *Mobj) bool {
+    if (how == defs.TRIGGER_CROSS) {
+        cross_special_line(g, linenum, side, thing);
+        ret 1;
+    }
+    if (how == defs.TRIGGER_SHOOT) {
+        shoot_special_line(g, thing, linenum);
+        ret 1;
+    }
+    ret use_special_line(g, thing, linenum, side);
+}
+
+# P_PlayerInSpecialSector: called every tic frame that the player origin is
+# in a special sector
+pub fun player_in_special_sector(g: *Game, player: *Player) {
+    val sector: *level.Sector = defs.sector_of(g, player.mo);
+
+    # falling, not all the way down yet?
+    if (player.mo.z != sector.floorheight) { ret; }
+
+    # has hitten ground
+    val special: i32 = sector.special::i32;
+    if (special == 5) {
+        # hellslime damage
+        if (player.powers[defs.PW_IRONFEET] == 0) {
+            if ((g.leveltime & 0x1f) == 0) { world.damage_mobj(g, player.mo, nil, nil, 10); }
+        }
+    }
+    or (special == 7) {
+        # nukage damage
+        if (player.powers[defs.PW_IRONFEET] == 0) {
+            if ((g.leveltime & 0x1f) == 0) { world.damage_mobj(g, player.mo, nil, nil, 5); }
+        }
+    }
+    or (special == 16 || special == 4) {
+        # super hellslime damage; strobe hurt
+        if (player.powers[defs.PW_IRONFEET] == 0 || defs.p_random(g) < 5) {
+            if ((g.leveltime & 0x1f) == 0) { world.damage_mobj(g, player.mo, nil, nil, 20); }
+        }
+    }
+    or (special == 9) {
+        # secret sector
+        player.secretcount = player.secretcount + 1;
+        sector.special     = 0;
+    }
+    or (special == 11) {
+        # exit super damage! (for E1M8 finale)
+        player.cheats = player.cheats & ~defs.CF_GODMODE;
+
+        if ((g.leveltime & 0x1f) == 0) { world.damage_mobj(g, player.mo, nil, nil, 20); }
+
+        if (player.health <= 10) { g.exited = 1; }
+    }
+}
+
+# P_UpdateSpecials: animate planes, scroll walls, etc.
+pub fun update_specials(g: *Game) {
+    # animate flats and textures globally
+    var n: i32 = 0;
+    for (n < g.numanims) {
+        val anim: *defs.Anim = ?g.anims[n];
+        var i:    i32        = anim.basepic;
+        for (i < anim.basepic + anim.numpics) {
+            val pic: i32 = anim.basepic + ((g.leveltime / anim.speed + i) % anim.numpics);
+            if (anim.istexture) {
+                g.d.texturetranslation[i] = pic;
+            }
+            or {
+                g.d.flattranslation[i] = pic;
+            }
+            i = i + 1;
+        }
+        n = n + 1;
+    }
+
+    # animate line specials
+    var i: i32 = 0;
+    for (i < g.numlinespecials) {
+        val line: *level.Line = ?g.lv.lines[g.linespeciallist[i]];
+        if (line.special == 48) {
+            # effect firstcol scroll
+            val side: *level.Side = ?g.lv.sides[line.sidenum[0]];
+            side.textureoffset = side.textureoffset + 65536;
+        }
+        i = i + 1;
+    }
+
+    # do buttons
+    i = 0;
+    for (i < MAXBUTTONS) {
+        val b: *defs.Button = ?g.buttonlist[i];
+        if (b.btimer != 0) {
+            b.btimer = b.btimer - 1;
+            if (b.btimer == 0) {
+                val side: *level.Side = ?g.lv.sides[g.lv.lines[b.line].sidenum[0]];
+                if (b.where == WHERE_TOP) {
+                    side.toptex = b.btexture;
+                }
+                or (b.where == WHERE_MIDDLE) {
+                    side.midtex = b.btexture;
+                }
+                or {
+                    side.bottomtex = b.btexture;
+                }
+                defs.sound(g, nil, info.SFX_SWTCHN);
+                var blank: defs.Button;
+                @b = blank;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# P_SpawnSpecials: after the map has been loaded, scan for specials that
+# spawn thinkers
+pub fun spawn_specials(g: *Game) {
+    # init special sectors
+    var i: i32 = 0;
+    for (i < g.lv.numsectors) {
+        val special: i32 = g.lv.sectors[i].special::i32;
+        if (special == 1) {
+            # flickering lights
+            movers.spawn_light_flash(g, i);
+        }
+        or (special == 2) {
+            # strobe fast
+            movers.spawn_strobe_flash(g, i, movers.FASTDARK, 0);
+        }
+        or (special == 3) {
+            # strobe slow
+            movers.spawn_strobe_flash(g, i, movers.SLOWDARK, 0);
+        }
+        or (special == 4) {
+            # strobe fast / death slime
+            movers.spawn_strobe_flash(g, i, movers.FASTDARK, 0);
+            g.lv.sectors[i].special = 4;
+        }
+        or (special == 8) {
+            # glowing light
+            movers.spawn_glowing_light(g, i);
+        }
+        or (special == 9) {
+            # secret sector
+            g.totalsecret = g.totalsecret + 1;
+        }
+        or (special == 10) {
+            # door close in 30 seconds
+            movers.spawn_door_close_in_30(g, i);
+        }
+        or (special == 12) {
+            # sync strobe slow
+            movers.spawn_strobe_flash(g, i, movers.SLOWDARK, 1);
+        }
+        or (special == 13) {
+            # sync strobe fast
+            movers.spawn_strobe_flash(g, i, movers.FASTDARK, 1);
+        }
+        or (special == 14) {
+            # door raise in 5 minutes
+            movers.spawn_door_raise_in_5_mins(g, i);
+        }
+        or (special == 17) {
+            movers.spawn_fire_flicker(g, i);
+        }
+        i = i + 1;
+    }
+
+    # init line effects
+    g.numlinespecials = 0;
+    i                 = 0;
+    for (i < g.lv.numlines) {
+        if (g.lv.lines[i].special == 48 && g.numlinespecials < 64) {
+            # effect firstcol scroll+
+            g.linespeciallist[g.numlinespecials] = i;
+            g.numlinespecials                    = g.numlinespecials + 1;
+        }
+        i = i + 1;
+    }
+
+    # init other misc stuff
+    i = 0;
+    for (i < 30) {
+        g.activeceilings[i] = nil;
+        g.activeplats[i]    = nil;
+        i                   = i + 1;
+    }
+    i = 0;
+    for (i < MAXBUTTONS) {
+        var blank: defs.Button;
+        g.buttonlist[i] = blank;
+        i               = i + 1;
+    }
+}

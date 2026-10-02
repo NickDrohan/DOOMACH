@@ -1,0 +1,332 @@
+# one tic of the world: each player thinks, then every thinker runs
+#
+# Ported from p_user.c and p_tick.c. This is also where the kind byte of a
+# thinker is turned back into a call, and where the two hooks of defs.mach
+# are given their targets, because this is the lowest module that can see
+# everything they reach.
+
+use doom.defs;
+use doom.defs.Game;
+use doom.defs.Mobj;
+use doom.defs.Player;
+use doom.defs.Pspdef;
+use doom.defs.Thinker;
+use doom.defs.Ticcmd;
+use doom.enemy;
+use doom.fixed;
+use doom.fixed.Fixed;
+use doom.info;
+use doom.movers;
+use doom.pspr;
+use doom.spec;
+use t: doom.tables;
+use doom.world;
+
+# index of the special effects (INVUL inverse) map
+val INVERSECOLORMAP: i32 = 32;
+
+# 16 pixels of bob
+val MAXBOB: Fixed = 0x100000;
+
+val ANG5: u32 = 0x40000000 / 18;
+
+# the run_action hook: a state was entered, so run its action. exactly one of
+# actor and player is given.
+fun run_action(g: *Game, actor: *Mobj, player: *Player, psp: *Pspdef, action: i32) {
+    if (actor != nil) {
+        enemy.run(g, actor, action);
+    }
+    or {
+        pspr.run(g, player, psp, action);
+    }
+}
+
+# give the game its hooks; call once before anything is spawned
+pub fun install_hooks(g: *Game) {
+    g.run_action   = run_action;
+    g.line_special = spec.line_special;
+}
+
+# ----------------------------------------------------------------- p_user.c
+
+# P_Thrust: moves the given origin along a given angle
+fun thrust(player: *Player, angle: u32, move: Fixed) {
+    val fine: u32 = angle >> t.ANGLETOFINESHIFT;
+    player.mo.momx = player.mo.momx + fixed.mul(move, t.FINESINE[fine + 2048]);
+    player.mo.momy = player.mo.momy + fixed.mul(move, t.FINESINE[fine]);
+}
+
+# P_CalcHeight: calculate the walking / running height adjustment
+fun calc_height(g: *Game, player: *Player) {
+    # regular movement bobbing (needs to be calculated for gun swing even if
+    # not on ground). OPTIMIZE: tablify angle. note: a LUT allows for effects
+    # like a ramp with low health.
+    player.bob = fixed.mul(player.mo.momx, player.mo.momx) + fixed.mul(player.mo.momy, player.mo.momy);
+    player.bob = player.bob >> 2;
+
+    if (player.bob > MAXBOB) { player.bob = MAXBOB; }
+
+    if ((player.cheats & defs.CF_NOMOMENTUM) != 0 || !g.onground) {
+        player.viewz = player.mo.z + defs.VIEWHEIGHT;
+
+        if (player.viewz > player.mo.ceilingz - 4 * 65536) { player.viewz = player.mo.ceilingz - 4 * 65536; }
+
+        player.viewz = player.mo.z + player.viewheight;
+        ret;
+    }
+
+    val angle: i32   = (t.FINEANGLES / 20 * g.leveltime) & t.FINEMASK;
+    val bob:   Fixed = fixed.mul(player.bob / 2, t.FINESINE[angle]);
+
+    # move viewheight
+    if (player.playerstate == defs.PST_LIVE) {
+        player.viewheight = player.viewheight + player.deltaviewheight;
+
+        if (player.viewheight > defs.VIEWHEIGHT) {
+            player.viewheight      = defs.VIEWHEIGHT;
+            player.deltaviewheight = 0;
+        }
+
+        if (player.viewheight < defs.VIEWHEIGHT / 2) {
+            player.viewheight = defs.VIEWHEIGHT / 2;
+            if (player.deltaviewheight <= 0) { player.deltaviewheight = 1; }
+        }
+
+        if (player.deltaviewheight != 0) {
+            player.deltaviewheight = player.deltaviewheight + 65536 / 4;
+            if (player.deltaviewheight == 0) { player.deltaviewheight = 1; }
+        }
+    }
+    player.viewz = player.mo.z + player.viewheight + bob;
+
+    if (player.viewz > player.mo.ceilingz - 4 * 65536) { player.viewz = player.mo.ceilingz - 4 * 65536; }
+}
+
+# P_MovePlayer
+fun move_player(g: *Game, player: *Player) {
+    val cmd: *Ticcmd = ?player.cmd;
+
+    player.mo.angle = player.mo.angle + (cmd.angleturn::i32 << 16):~u32;
+
+    # do not let the player control movement if not onground
+    g.onground = player.mo.z <= player.mo.floorz;
+
+    if (cmd.forwardmove != 0 && g.onground) { thrust(player, player.mo.angle, cmd.forwardmove::i32 * 2048); }
+    if (cmd.sidemove != 0 && g.onground)    { thrust(player, player.mo.angle - t.ANG90, cmd.sidemove::i32 * 2048); }
+
+    if ((cmd.forwardmove != 0 || cmd.sidemove != 0) && player.mo.state == info.S_PLAY) {
+        world.set_mobj_state(g, player.mo, info.S_PLAY_RUN1);
+    }
+}
+
+# P_DeathThink: fall on your face when dying; decrease POV height to floor
+# height
+fun death_think(g: *Game, player: *Player) {
+    world.move_psprites(g, player);
+
+    # fall to the ground
+    if (player.viewheight > 6 * 65536) { player.viewheight = player.viewheight - 65536; }
+    if (player.viewheight < 6 * 65536) { player.viewheight = 6 * 65536; }
+
+    player.deltaviewheight = 0;
+    g.onground             = player.mo.z <= player.mo.floorz;
+    calc_height(g, player);
+
+    if (player.attacker != nil && player.attacker != player.mo) {
+        val angle: u32 = world.point_to_angle2(player.mo.x, player.mo.y, player.attacker.x, player.attacker.y);
+        val delta: u32 = angle - player.mo.angle;
+
+        if (delta < ANG5 || delta > 0 - ANG5) {
+            # looking at killer, so fade damage flash down
+            player.mo.angle = angle;
+            if (player.damagecount != 0) { player.damagecount = player.damagecount - 1; }
+        }
+        or (delta < t.ANG180) {
+            player.mo.angle = player.mo.angle + ANG5;
+        }
+        or {
+            player.mo.angle = player.mo.angle - ANG5;
+        }
+    }
+    or (player.damagecount != 0) {
+        player.damagecount = player.damagecount - 1;
+    }
+
+    if ((player.cmd.buttons::i32 & defs.BT_USE) != 0) { player.playerstate = defs.PST_REBORN; }
+}
+
+# P_PlayerThink
+fun player_think(g: *Game, player: *Player) {
+    # fixme: do this in the cheat code
+    if ((player.cheats & defs.CF_NOCLIP) != 0) {
+        player.mo.flags = player.mo.flags | defs.MF_NOCLIP;
+    }
+    or {
+        player.mo.flags = player.mo.flags & ~defs.MF_NOCLIP;
+    }
+
+    # chain saw run forward
+    val cmd: *Ticcmd = ?player.cmd;
+    if ((player.mo.flags & defs.MF_JUSTATTACKED) != 0) {
+        cmd.angleturn   = 0;
+        cmd.forwardmove = 100;
+        cmd.sidemove    = 0;
+        player.mo.flags = player.mo.flags & ~defs.MF_JUSTATTACKED;
+    }
+
+    if (player.playerstate == defs.PST_DEAD) {
+        death_think(g, player);
+        ret;
+    }
+
+    # move around. reactiontime is used to prevent movement for a bit after a
+    # teleport.
+    if (player.mo.reactiontime != 0) {
+        player.mo.reactiontime = player.mo.reactiontime - 1;
+    }
+    or {
+        move_player(g, player);
+    }
+
+    calc_height(g, player);
+
+    if (defs.sector_of(g, player.mo).special != 0) { spec.player_in_special_sector(g, player); }
+
+    # check for weapon change
+
+    # a special event has no other buttons
+    if ((cmd.buttons::i32 & defs.BT_SPECIAL) != 0) { cmd.buttons = 0; }
+
+    if ((cmd.buttons::i32 & defs.BT_CHANGE) != 0) {
+        # the actual changing of the weapon is done when the weapon psprite
+        # can do it (read: not in the middle of an attack)
+        var newweapon: i32 = (cmd.buttons::i32 & defs.BT_WEAPONMASK) >> defs.BT_WEAPONSHIFT;
+
+        if (newweapon == defs.WP_FIST && player.weaponowned[defs.WP_CHAINSAW] &&
+            !(player.readyweapon == defs.WP_CHAINSAW && player.powers[defs.PW_STRENGTH] != 0)) {
+            newweapon = defs.WP_CHAINSAW;
+        }
+
+        if (player.weaponowned[newweapon] && newweapon != player.readyweapon) {
+            # do not go to plasma or BFG in shareware, even if cheated
+            if ((newweapon != defs.WP_PLASMA && newweapon != defs.WP_BFG) || !g.shareware) {
+                player.pendingweapon = newweapon;
+            }
+        }
+    }
+
+    # check for use
+    if ((cmd.buttons::i32 & defs.BT_USE) != 0) {
+        if (player.usedown == 0) {
+            world.use_lines(g, player);
+            player.usedown = 1;
+        }
+    }
+    or {
+        player.usedown = 0;
+    }
+
+    # cycle psprites
+    world.move_psprites(g, player);
+
+    # counters, time dependend power ups
+
+    # strength counts up to diminish fade
+    if (player.powers[defs.PW_STRENGTH] != 0) { player.powers[defs.PW_STRENGTH] = player.powers[defs.PW_STRENGTH] + 1; }
+
+    if (player.powers[defs.PW_INVULNERABILITY] != 0) {
+        player.powers[defs.PW_INVULNERABILITY] = player.powers[defs.PW_INVULNERABILITY] - 1;
+    }
+
+    if (player.powers[defs.PW_INVISIBILITY] != 0) {
+        player.powers[defs.PW_INVISIBILITY] = player.powers[defs.PW_INVISIBILITY] - 1;
+        if (player.powers[defs.PW_INVISIBILITY] == 0) { player.mo.flags = player.mo.flags & ~defs.MF_SHADOW; }
+    }
+
+    if (player.powers[defs.PW_INFRARED] != 0) { player.powers[defs.PW_INFRARED] = player.powers[defs.PW_INFRARED] - 1; }
+    if (player.powers[defs.PW_IRONFEET] != 0) { player.powers[defs.PW_IRONFEET] = player.powers[defs.PW_IRONFEET] - 1; }
+    if (player.damagecount != 0)              { player.damagecount = player.damagecount - 1; }
+    if (player.bonuscount != 0)               { player.bonuscount = player.bonuscount - 1; }
+
+    # handling colormaps
+    if (player.powers[defs.PW_INVULNERABILITY] != 0) {
+        if (player.powers[defs.PW_INVULNERABILITY] > 4 * 32 || (player.powers[defs.PW_INVULNERABILITY] & 8) != 0) {
+            player.fixedcolormap = INVERSECOLORMAP;
+        }
+        or {
+            player.fixedcolormap = 0;
+        }
+    }
+    or (player.powers[defs.PW_INFRARED] != 0) {
+        if (player.powers[defs.PW_INFRARED] > 4 * 32 || (player.powers[defs.PW_INFRARED] & 8) != 0) {
+            # almost full bright
+            player.fixedcolormap = 1;
+        }
+        or {
+            player.fixedcolormap = 0;
+        }
+    }
+    or {
+        player.fixedcolormap = 0;
+    }
+}
+
+# ----------------------------------------------------------------- p_tick.c
+
+# P_RunThinkers
+fun run_thinkers(g: *Game) {
+    var current: *Thinker = g.thinkercap.next;
+    for (current != ?g.thinkercap) {
+        val kind: u8 = current.kind;
+        if (kind == defs.TH_REMOVED) {
+            # time to remove it. its memory stays until the level ends, so a
+            # thing that still points at it reads what it last held, as it
+            # usually did in the original.
+            current.next.prev = current.prev;
+            current.prev.next = current.next;
+        }
+        or (kind == defs.TH_MOBJ) {
+            world.mobj_thinker(g, current:~*Mobj);
+        }
+        or (kind == defs.TH_DOOR) {
+            movers.door_think(g, current:~*movers.Door);
+        }
+        or (kind == defs.TH_FLOOR) {
+            movers.floor_think(g, current:~*movers.FloorMove);
+        }
+        or (kind == defs.TH_CEILING) {
+            movers.ceiling_think(g, current:~*movers.Ceiling);
+        }
+        or (kind == defs.TH_PLAT) {
+            movers.plat_think(g, current:~*movers.Plat);
+        }
+        or (kind == defs.TH_FIREFLICKER) {
+            movers.fire_flicker_think(g, current:~*movers.FireFlicker);
+        }
+        or (kind == defs.TH_LIGHTFLASH) {
+            movers.light_flash_think(g, current:~*movers.LightFlash);
+        }
+        or (kind == defs.TH_STROBE) {
+            movers.strobe_think(g, current:~*movers.Strobe);
+        }
+        or (kind == defs.TH_GLOW) {
+            movers.glow_think(g, current:~*movers.Glow);
+        }
+        current = current.next;
+    }
+}
+
+# P_Ticker
+pub fun ticker(g: *Game) {
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (g.playeringame[i]) { player_think(g, ?g.players[i]); }
+        i = i + 1;
+    }
+
+    run_thinkers(g);
+    spec.update_specials(g);
+
+    # for par times
+    g.leveltime = g.leveltime + 1;
+}

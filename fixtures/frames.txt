@@ -1,0 +1,14 @@
+# viewpoints the renderer is pinned at: name, map, then either "start" for the
+# first player start or x, y and whole degrees
+m1 E1M1 start
+m2 E1M2 start
+m3 E1M3 start
+m4 E1M4 start
+m5 E1M5 start
+m6 E1M6 start
+m7 E1M7 start
+m8 E1M8 start
+m9 E1M9 start
+west E1M1 1056 -3616 180
+south E1M1 1056 -3616 270
+yard E1M1 1900 -3200 135

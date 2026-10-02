@@ -1,0 +1,2386 @@
+# the software renderer: walls, floors, ceilings and sky, drawn into a 320 by
+# 200 buffer of palette indices
+#
+# Ported from r_main.c, r_bsp.c, r_segs.c, r_plane.c and r_draw.c, in that
+# order below. The C renderer keeps its state in some two hundred globals;
+# here it is one record, so a frame is a function of a Renderer and nothing
+# else. Sprites and see-through middle textures (r_things.c) are not here
+# yet: they need the simulation's objects to exist first.
+#
+# The arithmetic is kept bit for bit, including where it is odd. Angles are
+# unsigned and wrap; heights are signed and wrap; several tests compare
+# against stale values on purpose, because the original does.
+
+use std.allocator;
+use std.types.bool.bool;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use doom.defs;
+use doom.fixed;
+use doom.fixed.FRACUNIT;
+use doom.fixed.Fixed;
+use doom.info;
+use doom.level;
+use doom.rdata;
+use t: doom.tables;
+use doom.wad;
+
+pub val SCREENWIDTH:  i32 = 320;
+pub val SCREENHEIGHT: i32 = 200;
+
+# the eye sits this far above the floor
+pub val VIEWHEIGHT: Fixed = 41 * 65536;
+
+val SBARHEIGHT: i32 = 32;
+
+val LIGHTLEVELS:     i32 = 16;
+val LIGHTSEGSHIFT:   i32 = 4;
+val MAXLIGHTSCALE:   i32 = 48;
+val LIGHTSCALESHIFT: i32 = 12;
+val MAXLIGHTZ:       i32 = 128;
+val LIGHTZSHIFT:     i32 = 20;
+val NUMCOLORMAPS:    i32 = 32;
+val DISTMAP:         i32 = 2;
+
+val FIELDOFVIEW:     i32 = 2048;
+val ANGLETOSKYSHIFT: u32 = 22;
+
+val MAXDRAWSEGS:  i32 = 256;
+val MAXVISPLANES: i32 = 128;
+val MAXOPENINGS:  i32 = 20480;
+
+val SIL_BOTTOM: i32 = 1;
+val SIL_TOP:    i32 = 2;
+val SIL_BOTH:   i32 = 3;
+
+val HEIGHTBITS: i32 = 12;
+val HEIGHTUNIT: i32 = 4096;
+
+val MAXINT:   i32 = 0x7fffffff;
+val MININT:   i32 = -0x7fffffff - 1;
+val MAXSHORT: i16 = 0x7fff;
+
+val ML_DONTPEGTOP:    i16 = 8;
+val ML_DONTPEGBOTTOM: i16 = 16;
+val ML_MAPPED:        i16 = 256;
+
+# what a drawseg's sprite clip refers to
+val CLIP_NONE:     u8 = 0;
+val CLIP_SCREEN:   u8 = 1;
+val CLIP_NEGONE:   u8 = 2;
+val CLIP_OPENINGS: u8 = 3;
+
+# a floor or ceiling region: one height, flat and light level, with the top
+# and bottom row it covers in each column. columns are stored one place to
+# the right, so that the column before the first and after the last exist.
+rec Visplane {
+    height:     Fixed;
+    picnum:     i32;
+    lightlevel: i32;
+    minx:       i32;
+    maxx:       i32;
+    top:        [322]u8;
+    bottom:     [322]u8;
+}
+
+# a wall range that was drawn, kept so that sprites can be clipped against it
+rec DrawSeg {
+    curline:    i32;
+    x1:         i32;
+    x2:         i32;
+    scale1:     Fixed;
+    scale2:     Fixed;
+    scalestep:  Fixed;
+    silhouette: i32;
+    bsilheight: Fixed;
+    tsilheight: Fixed;
+    # each clip is a kind, and for CLIP_OPENINGS the index in openings that
+    # column 0 would have
+    sprtopclip:    u8;
+    sprtopbase:    i32;
+    sprbottomclip: u8;
+    sprbottombase: i32;
+    masked:        bool;
+    maskedbase:    i32;
+}
+
+# a thing to be drawn: a sprite projected to a range of screen columns
+rec VisSprite {
+    x1: i32;
+    x2: i32;
+    # for line side calculation
+    gx: Fixed;
+    gy: Fixed;
+    # global bottom / top for silhouette clipping
+    gz:  Fixed;
+    gzt: Fixed;
+    # horizontal position of x1
+    startfrac: Fixed;
+    scale:     Fixed;
+    # negative if flipped
+    xiscale:    Fixed;
+    texturemid: Fixed;
+    patch:      i32;
+    # for color translation and shadow draw, maxbright frames as well; nil
+    # means draw as a shadow
+    colormap:  *u8;
+    mobjflags: i32;
+    drawn:     bool;
+}
+
+val MAXSPRITES:    i32   = 138;
+val MAXFRAMES:     i32   = 29;
+val MAXVISSPRITES: i32   = 128;
+val MINZ:          Fixed = 4 * 65536;
+val BASEYCENTER:   i32   = 100;
+
+# which neighbouring row the fuzz effect copies from, in a fixed pattern
+val FUZZOFFSET: [50]i32 = [50]i32{
+    1, -1, 1, -1, 1, 1, -1,
+    1, 1, -1, 1, 1, 1, -1,
+    1, 1, 1, -1, -1, -1, -1,
+    1, -1, -1, 1, 1, 1, 1, -1,
+    1, -1, 1, 1, -1, -1, 1,
+    1, -1, -1, -1, -1, 1, 1,
+    1, 1, -1, 1, 1, -1, 1
+};
+
+fun le16(p: *u8, at: i32) i32 {
+    ret ((p[at]::u16 | (p[at + 1]::u16 << 8)):~i16)::i32;
+}
+
+fun le32(p: *u8, at: i32) i32 {
+    ret (p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24)):~i32;
+}
+
+pub rec Renderer {
+    # the game whose things are drawn, or nil to draw the map alone
+    g: *defs.Game;
+
+    # a light table that overrides all others (invulnerability, the light
+    # visor), or nil
+    fixedcolormap: *u8;
+
+    # r_things: what each sprite frame is drawn from, per rotation
+    firstspritelump: i32;
+    spritewidth:     *Fixed;
+    spriteoffset:    *Fixed;
+    spritetopoffset: *Fixed;
+    sprnumframes:    [138]i32;
+    # -1 no lump, 0 one lump for all rotations, 1 a lump per rotation
+    sprrotate: [4002]i8;
+    sprlump:   [32016]i16;
+    sprflip:   [32016]bool;
+    maxframe:  i32;
+
+    vissprites:    [128]VisSprite;
+    numvissprites: i32;
+    # the row of scalelight in use for sprites
+    spritelights: i32;
+    pspritescale: Fixed;
+
+    # the clip a masked column is drawn within: a table and the index in it
+    # that column 0 has
+    mfloorclip:        *i16;
+    mfloorbase:        i32;
+    mceilingclip:      *i16;
+    mceilingbase:      i32;
+    spryscale:         Fixed;
+    sprtopscreen:      Fixed;
+    screenheightarray: [320]i16;
+    negonearray:       [320]i16;
+    clipbot:           [320]i16;
+    cliptop:           [320]i16;
+    dc_fuzz:           bool;
+    fuzzpos:           i32;
+
+    d:  *rdata.Data;
+    lv: *level.Level;
+
+    # the frame, one palette index per pixel, row by row
+    screen: [64000]u8;
+
+    # the view window within the screen
+    viewwidth:     i32;
+    viewheight:    i32;
+    viewwindowx:   i32;
+    viewwindowy:   i32;
+    centerx:       i32;
+    centery:       i32;
+    centerxfrac:   Fixed;
+    centeryfrac:   Fixed;
+    projection:    Fixed;
+    pspriteiscale: Fixed;
+
+    # the eye
+    viewx:      Fixed;
+    viewy:      Fixed;
+    viewz:      Fixed;
+    viewangle:  u32;
+    viewcos:    Fixed;
+    viewsin:    Fixed;
+    extralight: i32;
+
+    # screen column for each view-relative fine angle, and back
+    clipangle:    u32;
+    viewangletox: [4096]i32;
+    xtoviewangle: [321]u32;
+
+    # light tables, as offsets into the colormaps: by wall scale, by distance
+    scalelight: [768]i32;
+    zlight:     [2048]i32;
+
+    skyflatnum:    i32;
+    skytexture:    i32;
+    skytexturemid: Fixed;
+
+    # r_bsp: the columns already filled by solid walls, and the walls drawn
+    solidfirst:  [64]i32;
+    solidlast:   [64]i32;
+    newend:      i32;
+    drawsegs:    [256]DrawSeg;
+    numdrawsegs: i32;
+    curline:     i32;
+    frontsector: i32;
+    backsector:  i32;
+
+    # r_segs: the wall range being drawn
+    segtextured:         bool;
+    markfloor:           bool;
+    markceiling:         bool;
+    maskedtexture:       bool;
+    toptexture:          i32;
+    bottomtexture:       i32;
+    midtexture:          i32;
+    rw_normalangle:      u32;
+    rw_angle1:           u32;
+    rw_x:                i32;
+    rw_stopx:            i32;
+    rw_centerangle:      u32;
+    rw_offset:           Fixed;
+    rw_distance:         Fixed;
+    rw_scale:            Fixed;
+    rw_scalestep:        Fixed;
+    rw_midtexturemid:    Fixed;
+    rw_toptexturemid:    Fixed;
+    rw_bottomtexturemid: Fixed;
+    worldtop:            i32;
+    worldbottom:         i32;
+    worldhigh:           i32;
+    worldlow:            i32;
+    pixhigh:             Fixed;
+    pixlow:              Fixed;
+    pixhighstep:         Fixed;
+    pixlowstep:          Fixed;
+    topfrac:             Fixed;
+    topstep:             Fixed;
+    bottomfrac:          Fixed;
+    bottomstep:          Fixed;
+    # the row of scalelight in use
+    walllights:       i32;
+    maskedtexturecol: i32;
+
+    # r_plane
+    visplanes:    [128]Visplane;
+    lastvisplane: i32;
+    floorplane:   i32;
+    ceilingplane: i32;
+    openings:     [20480]i16;
+    lastopening:  i32;
+    floorclip:    [320]i16;
+    ceilingclip:  [320]i16;
+    spanstart:    [200]i32;
+    # the row of zlight in use
+    planezlight:    i32;
+    planeheight:    Fixed;
+    yslope:         [200]Fixed;
+    distscale:      [320]Fixed;
+    basexscale:     Fixed;
+    baseyscale:     Fixed;
+    cachedheight:   [200]Fixed;
+    cacheddistance: [200]Fixed;
+    cachedxstep:    [200]Fixed;
+    cachedystep:    [200]Fixed;
+
+    # r_draw: the column and the span being drawn
+    dc_colormap:   *u8;
+    dc_x:          i32;
+    dc_yl:         i32;
+    dc_yh:         i32;
+    dc_iscale:     Fixed;
+    dc_texturemid: Fixed;
+    dc_source:     *u8;
+    ds_y:          i32;
+    ds_x1:         i32;
+    ds_x2:         i32;
+    ds_colormap:   *u8;
+    ds_xfrac:      Fixed;
+    ds_yfrac:      Fixed;
+    ds_xstep:      Fixed;
+    ds_ystep:      Fixed;
+    ds_source:     *u8;
+
+    # set when a frame needed more visplanes than the original allows, where
+    # the original stops with an error
+    overflow: bool;
+}
+
+fun abs32(x: i32) i32 {
+    if (x < 0) { ret 0 - x; }
+    ret x;
+}
+
+fun sine(fine: u32) Fixed {
+    ret t.FINESINE[fine];
+}
+
+fun cosine(fine: u32) Fixed {
+    ret t.FINESINE[fine + 2048];
+}
+
+# ---------------------------------------------------------------- r_main.c
+
+# R_PointOnSide: which side of a node's partition line a point is on
+# ---
+# x:    point
+# y:    point
+# node: the partition
+# ret:  0 for the front (right) side, 1 for the back
+pub fun point_on_side(x: Fixed, y: Fixed, node: *level.Node) i32 {
+    if (node.dx == 0) {
+        if (x <= node.x) { ret (node.dy > 0)::i32; }
+        ret (node.dy < 0)::i32;
+    }
+    if (node.dy == 0) {
+        if (y <= node.y) { ret (node.dx < 0)::i32; }
+        ret (node.dx > 0)::i32;
+    }
+
+    val dx: Fixed = x - node.x;
+    val dy: Fixed = y - node.y;
+
+    # decide by signs alone where they settle it
+    if ((node.dy ^ node.dx ^ dx ^ dy) < 0) {
+        if ((node.dy ^ dx) < 0) { ret 1; }
+        ret 0;
+    }
+
+    val left:  Fixed = fixed.mul(node.dy >> 16, dx);
+    val right: Fixed = fixed.mul(dy, node.dx >> 16);
+    if (right < left) { ret 0; }
+    ret 1;
+}
+
+# R_PointInSubsector: the subsector a point lies in
+# ---
+# lv:  the map
+# x:   point
+# y:   point
+# ret: subsector number
+pub fun point_in_subsector(lv: *level.Level, x: Fixed, y: Fixed) i32 {
+    if (lv.numnodes == 0) { ret 0; }
+    var nodenum: i32 = lv.numnodes - 1;
+    for ((nodenum & 0x8000) == 0) {
+        val node: *level.Node = ?lv.nodes[nodenum];
+        nodenum = node.children[point_on_side(x, y, node)]::i32;
+    }
+    ret nodenum & 0x7fff;
+}
+
+# R_PointToAngle: the angle from the eye to a point
+fun point_to_angle(r: *Renderer, px: Fixed, py: Fixed) u32 {
+    var x: i32 = px - r.viewx;
+    var y: i32 = py - r.viewy;
+    if (x == 0 && y == 0) { ret 0; }
+
+    if (x >= 0) {
+        if (y >= 0) {
+            if (x > y) { ret t.TANTOANGLE[t.slope_div(y:~u32, x:~u32)]; }
+            ret t.ANG90 - 1 - t.TANTOANGLE[t.slope_div(x:~u32, y:~u32)];
+        }
+        y = 0 - y;
+        if (x > y) { ret 0 - t.TANTOANGLE[t.slope_div(y:~u32, x:~u32)]; }
+        ret t.ANG270 + t.TANTOANGLE[t.slope_div(x:~u32, y:~u32)];
+    }
+
+    x = 0 - x;
+    if (y >= 0) {
+        if (x > y) { ret t.ANG180 - 1 - t.TANTOANGLE[t.slope_div(y:~u32, x:~u32)]; }
+        ret t.ANG90 + t.TANTOANGLE[t.slope_div(x:~u32, y:~u32)];
+    }
+    y = 0 - y;
+    if (x > y) { ret t.ANG180 + t.TANTOANGLE[t.slope_div(y:~u32, x:~u32)]; }
+    ret t.ANG270 - 1 - t.TANTOANGLE[t.slope_div(x:~u32, y:~u32)];
+}
+
+# R_PointToDist: the distance from the eye to a point
+fun point_to_dist(r: *Renderer, x: Fixed, y: Fixed) Fixed {
+    var dx: Fixed = abs32(x - r.viewx);
+    var dy: Fixed = abs32(y - r.viewy);
+    if (dy > dx) {
+        val temp: Fixed = dx;
+        dx = dy;
+        dy = temp;
+    }
+
+    # a point exactly at the eye would index far outside the table
+    var frac: Fixed = 0;
+    if (dx != 0) { frac = fixed.div(dy, dx); }
+
+    val angle: u32 = (t.TANTOANGLE[frac >> t.DBITS] + t.ANG90) >> t.ANGLETOFINESHIFT;
+    ret fixed.div(dx, sine(angle));
+}
+
+# R_ScaleFromGlobalAngle: how large the current wall is at a view angle
+fun scale_from_global_angle(r: *Renderer, visangle: u32) Fixed {
+    val anglea: u32   = t.ANG90 + (visangle - r.viewangle);
+    val angleb: u32   = t.ANG90 + (visangle - r.rw_normalangle);
+    val sinea:  Fixed = sine(anglea >> t.ANGLETOFINESHIFT);
+    val sineb:  Fixed = sine(angleb >> t.ANGLETOFINESHIFT);
+    val num:    Fixed = fixed.mul(r.projection, sineb);
+    val den:    Fixed = fixed.mul(r.rw_distance, sinea);
+
+    if (den > (num >> 16)) {
+        val scale: Fixed = fixed.div(num, den);
+        if (scale > 64 * FRACUNIT) { ret 64 * FRACUNIT; }
+        if (scale < 256)           { ret 256; }
+        ret scale;
+    }
+    ret 64 * FRACUNIT;
+}
+
+# R_InitTextureMapping: the tables between view angles and screen columns
+fun init_texture_mapping(r: *Renderer) {
+    val focallength: Fixed = fixed.div(r.centerxfrac, t.FINETANGENT[2048 + FIELDOFVIEW / 2]);
+
+    var i: i32 = 0;
+    for (i < 4096) {
+        val tangent: Fixed = t.FINETANGENT[i];
+        var x:       i32   = 0;
+        if (tangent > FRACUNIT * 2) {
+            x = -1;
+        }
+        or (tangent < 0 - FRACUNIT * 2) {
+            x = r.viewwidth + 1;
+        }
+        or {
+            x = fixed.mul(tangent, focallength);
+            x = (r.centerxfrac - x + FRACUNIT - 1) >> 16;
+            if (x < -1) {
+                x = -1;
+            }
+            or (x > r.viewwidth + 1) {
+                x = r.viewwidth + 1;
+            }
+        }
+        r.viewangletox[i] = x;
+        i                 = i + 1;
+    }
+
+    # the smallest view angle that maps to each column
+    var x: i32 = 0;
+    for (x <= r.viewwidth) {
+        i = 0;
+        for (r.viewangletox[i] > x) { i = i + 1; }
+        r.xtoviewangle[x] = (i:~u32 << t.ANGLETOFINESHIFT) - t.ANG90;
+        x                 = x + 1;
+    }
+
+    # take out the fencepost cases
+    i = 0;
+    for (i < 4096) {
+        if (r.viewangletox[i] == -1) {
+            r.viewangletox[i] = 0;
+        }
+        or (r.viewangletox[i] == r.viewwidth + 1) {
+            r.viewangletox[i] = r.viewwidth;
+        }
+        i = i + 1;
+    }
+
+    r.clipangle = r.xtoviewangle[0];
+}
+
+# R_ExecuteSetViewSize at high detail, R_InitBuffer and R_InitLightTables
+fun set_view_size(r: *Renderer, blocks: i32) {
+    var scaledviewwidth: i32 = SCREENWIDTH;
+    if (blocks == 11) {
+        r.viewheight = SCREENHEIGHT;
+    }
+    or {
+        scaledviewwidth = blocks * 32;
+        r.viewheight    = (blocks * 168 / 10) & (0 - 8);
+    }
+
+    r.viewwidth   = scaledviewwidth;
+    r.centery     = r.viewheight / 2;
+    r.centerx     = r.viewwidth / 2;
+    r.centerxfrac = r.centerx << 16;
+    r.centeryfrac = r.centery << 16;
+    r.projection  = r.centerxfrac;
+
+    r.viewwindowx = (SCREENWIDTH - scaledviewwidth) >> 1;
+    if (scaledviewwidth == SCREENWIDTH) {
+        r.viewwindowy = 0;
+    }
+    or {
+        r.viewwindowy = (SCREENHEIGHT - SBARHEIGHT - r.viewheight) >> 1;
+    }
+
+    init_texture_mapping(r);
+
+    r.pspritescale  = FRACUNIT * r.viewwidth / SCREENWIDTH;
+    r.pspriteiscale = FRACUNIT * SCREENWIDTH / r.viewwidth;
+
+    var i: i32 = 0;
+    for (i < r.viewwidth) {
+        r.screenheightarray[i] = r.viewheight::i16;
+        i                      = i + 1;
+    }
+
+    i = 0;
+    for (i < r.viewheight) {
+        val dy: Fixed = abs32(((i - r.viewheight / 2) << 16) + FRACUNIT / 2);
+        r.yslope[i] = fixed.div(r.viewwidth / 2 * FRACUNIT, dy);
+        i           = i + 1;
+    }
+
+    i = 0;
+    for (i < r.viewwidth) {
+        val cosadj: Fixed = abs32(cosine(r.xtoviewangle[i] >> t.ANGLETOFINESHIFT));
+        r.distscale[i] = fixed.div(FRACUNIT, cosadj);
+        i              = i + 1;
+    }
+
+    # darker with distance: a light table for each sector light level and
+    # each wall scale, and one for each light level and each plane distance
+    i = 0;
+    for (i < LIGHTLEVELS) {
+        val startmap: i32 = ((LIGHTLEVELS - 1 - i) * 2) * NUMCOLORMAPS / LIGHTLEVELS;
+        var j:        i32 = 0;
+        for (j < MAXLIGHTSCALE) {
+            var lightmap: i32 = startmap - j * SCREENWIDTH / r.viewwidth / DISTMAP;
+            if (lightmap < 0)             { lightmap = 0; }
+            if (lightmap >= NUMCOLORMAPS) { lightmap = NUMCOLORMAPS - 1; }
+            r.scalelight[i * MAXLIGHTSCALE + j] = lightmap * 256;
+            j                                   = j + 1;
+        }
+        j = 0;
+        for (j < MAXLIGHTZ) {
+            var scale: i32 = fixed.div(SCREENWIDTH / 2 * FRACUNIT, (j + 1) << LIGHTZSHIFT);
+            scale = scale >> LIGHTSCALESHIFT;
+            var lightmap: i32 = startmap - scale / DISTMAP;
+            if (lightmap < 0)             { lightmap = 0; }
+            if (lightmap >= NUMCOLORMAPS) { lightmap = NUMCOLORMAPS - 1; }
+            r.zlight[i * MAXLIGHTZ + j] = lightmap * 256;
+            j                           = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# ---------------------------------------------------------------- r_draw.c
+
+# R_DrawColumn: one vertical run of a texture column, stretched
+fun draw_column(r: *Renderer) {
+    var count: i32 = r.dc_yh - r.dc_yl;
+    if (count < 0) { ret; }
+
+    var dest:     i32   = (r.dc_yl + r.viewwindowy) * SCREENWIDTH + r.viewwindowx + r.dc_x;
+    val fracstep: Fixed = r.dc_iscale;
+    var frac:     Fixed = r.dc_texturemid + (r.dc_yl - r.centery) * fracstep;
+
+    for (count >= 0) {
+        r.screen[dest] = r.dc_colormap[r.dc_source[(frac >> 16) & 127]];
+        dest           = dest + SCREENWIDTH;
+        frac           = frac + fracstep;
+        count          = count - 1;
+    }
+}
+
+# R_DrawSpan: one horizontal run of a flat, in perspective
+fun draw_span(r: *Renderer) {
+    var xfrac: Fixed = r.ds_xfrac;
+    var yfrac: Fixed = r.ds_yfrac;
+    var dest:  i32   = (r.ds_y + r.viewwindowy) * SCREENWIDTH + r.viewwindowx + r.ds_x1;
+    var count: i32   = r.ds_x2 - r.ds_x1;
+
+    # runs at least once, as the original's do-while does
+    for {
+        val spot: i32 = ((yfrac >> 10) & (63 * 64)) + ((xfrac >> 16) & 63);
+        r.screen[dest] = r.ds_colormap[r.ds_source[spot]];
+        dest           = dest + 1;
+        xfrac          = xfrac + r.ds_xstep;
+        yfrac          = yfrac + r.ds_ystep;
+        if (count == 0) { brk; }
+        count = count - 1;
+    }
+}
+
+# --------------------------------------------------------------- r_plane.c
+
+# R_MapPlane: draw one row of the current plane
+fun map_plane(r: *Renderer, y: i32, x1: i32, x2: i32) {
+    var distance: Fixed = 0;
+    if (r.planeheight != r.cachedheight[y]) {
+        r.cachedheight[y]   = r.planeheight;
+        distance            = fixed.mul(r.planeheight, r.yslope[y]);
+        r.cacheddistance[y] = distance;
+        r.ds_xstep          = fixed.mul(distance, r.basexscale);
+        r.cachedxstep[y]    = r.ds_xstep;
+        r.ds_ystep          = fixed.mul(distance, r.baseyscale);
+        r.cachedystep[y]    = r.ds_ystep;
+    }
+    or {
+        distance   = r.cacheddistance[y];
+        r.ds_xstep = r.cachedxstep[y];
+        r.ds_ystep = r.cachedystep[y];
+    }
+
+    val length: Fixed = fixed.mul(distance, r.distscale[x1]);
+    val angle:  u32   = (r.viewangle + r.xtoviewangle[x1]) >> t.ANGLETOFINESHIFT;
+    r.ds_xfrac = r.viewx + fixed.mul(cosine(angle), length);
+    r.ds_yfrac = 0 - r.viewy - fixed.mul(sine(angle), length);
+
+    var index: u32 = distance:~u32 >> 20;
+    if (index >= 128) { index = 127; }
+    r.ds_colormap = ?r.d.colormaps[r.zlight[r.planezlight + index:~i32]];
+    if (r.fixedcolormap != nil) { r.ds_colormap = r.fixedcolormap; }
+
+    r.ds_y  = y;
+    r.ds_x1 = x1;
+    r.ds_x2 = x2;
+    draw_span(r);
+}
+
+# R_ClearPlanes: at the start of a frame
+fun clear_planes(r: *Renderer) {
+    var i: i32 = 0;
+    for (i < r.viewwidth) {
+        r.floorclip[i]   = r.viewheight::i16;
+        r.ceilingclip[i] = -1;
+        i                = i + 1;
+    }
+
+    r.lastvisplane = 0;
+    r.lastopening  = 0;
+
+    i = 0;
+    for (i < SCREENHEIGHT) {
+        r.cachedheight[i] = 0;
+        i                 = i + 1;
+    }
+
+    # left to right mapping
+    val angle: u32 = (r.viewangle - t.ANG90) >> t.ANGLETOFINESHIFT;
+    r.basexscale = fixed.div(cosine(angle), r.centerxfrac);
+    r.baseyscale = 0 - fixed.div(sine(angle), r.centerxfrac);
+}
+
+fun clear_tops(pl: *Visplane) {
+    var i: i32 = 0;
+    for (i < 322) {
+        pl.top[i] = 0xff;
+        i         = i + 1;
+    }
+}
+
+# take the next free visplane; the original stops with an error when there
+# is none, and this reuses the last and records that it happened
+fun new_plane(r: *Renderer) i32 {
+    if (r.lastvisplane == MAXVISPLANES) {
+        r.overflow = 1;
+        ret MAXVISPLANES - 1;
+    }
+    r.lastvisplane = r.lastvisplane + 1;
+    ret r.lastvisplane - 1;
+}
+
+# R_FindPlane: the visplane for a height, flat and light level
+fun find_plane(r: *Renderer, height_in: Fixed, picnum: i32, lightlevel_in: i32) i32 {
+    var height:     Fixed = height_in;
+    var lightlevel: i32   = lightlevel_in;
+    if (picnum == r.skyflatnum) {
+        # all skies map together
+        height     = 0;
+        lightlevel = 0;
+    }
+
+    var check: i32 = 0;
+    for (check < r.lastvisplane) {
+        val pl: *Visplane = ?r.visplanes[check];
+        if (height == pl.height && picnum == pl.picnum && lightlevel == pl.lightlevel) { ret check; }
+        check = check + 1;
+    }
+
+    check = new_plane(r);
+    val pl: *Visplane = ?r.visplanes[check];
+    pl.height     = height;
+    pl.picnum     = picnum;
+    pl.lightlevel = lightlevel;
+    pl.minx       = SCREENWIDTH;
+    pl.maxx       = -1;
+    clear_tops(pl);
+    ret check;
+}
+
+# R_CheckPlane: the same plane if these columns are free in it, or a new one
+fun check_plane(r: *Renderer, plnum: i32, start: i32, stop: i32) i32 {
+    val pl: *Visplane = ?r.visplanes[plnum];
+
+    var intrl:  i32 = 0;
+    var intrh:  i32 = 0;
+    var unionl: i32 = 0;
+    var unionh: i32 = 0;
+    if (start < pl.minx) {
+        intrl  = pl.minx;
+        unionl = start;
+    }
+    or {
+        unionl = pl.minx;
+        intrl  = start;
+    }
+    if (stop > pl.maxx) {
+        intrh  = pl.maxx;
+        unionh = stop;
+    }
+    or {
+        unionh = pl.maxx;
+        intrh  = stop;
+    }
+
+    var x: i32 = intrl;
+    for (x <= intrh) {
+        if (pl.top[x + 1] != 0xff) { brk; }
+        x = x + 1;
+    }
+    if (x > intrh) {
+        pl.minx = unionl;
+        pl.maxx = unionh;
+        # use the same one
+        ret plnum;
+    }
+
+    # make a new visplane
+    val fresh: i32       = new_plane(r);
+    val np:    *Visplane = ?r.visplanes[fresh];
+    np.height     = pl.height;
+    np.picnum     = pl.picnum;
+    np.lightlevel = pl.lightlevel;
+    np.minx       = start;
+    np.maxx       = stop;
+    clear_tops(np);
+    ret fresh;
+}
+
+# R_MakeSpans: turn two neighbouring columns of a plane into finished rows
+fun make_spans(r: *Renderer, x: i32, t1_in: i32, b1_in: i32, t2_in: i32, b2_in: i32) {
+    var t1: i32 = t1_in;
+    var b1: i32 = b1_in;
+    var t2: i32 = t2_in;
+    var b2: i32 = b2_in;
+    for (t1 < t2 && t1 <= b1) {
+        map_plane(r, t1, r.spanstart[t1], x - 1);
+        t1 = t1 + 1;
+    }
+    for (b1 > b2 && b1 >= t1) {
+        map_plane(r, b1, r.spanstart[b1], x - 1);
+        b1 = b1 - 1;
+    }
+    for (t2 < t1 && t2 <= b2) {
+        r.spanstart[t2] = x;
+        t2              = t2 + 1;
+    }
+    for (b2 > b1 && b2 >= t2) {
+        r.spanstart[b2] = x;
+        b2              = b2 - 1;
+    }
+}
+
+# R_DrawPlanes: at the end of the walls, draw every floor, ceiling and sky
+fun draw_planes(r: *Renderer) {
+    var i: i32 = 0;
+    for (i < r.lastvisplane) {
+        val pl: *Visplane = ?r.visplanes[i];
+        i = i + 1;
+        if (pl.minx > pl.maxx) { cnt; }
+
+        if (pl.picnum == r.skyflatnum) {
+            # the sky is drawn as full-bright columns, never shaded by distance
+            r.dc_iscale     = r.pspriteiscale;
+            r.dc_colormap   = r.d.colormaps;
+            r.dc_texturemid = r.skytexturemid;
+            var x: i32 = pl.minx;
+            for (x <= pl.maxx) {
+                r.dc_yl = pl.top[x + 1]::i32;
+                r.dc_yh = pl.bottom[x + 1]::i32;
+                if (r.dc_yl <= r.dc_yh) {
+                    val angle: u32 = (r.viewangle + r.xtoviewangle[x]) >> ANGLETOSKYSHIFT;
+                    r.dc_x      = x;
+                    r.dc_source = rdata.get_column(r.d, r.skytexture, angle:~i32);
+                    draw_column(r);
+                }
+                x = x + 1;
+            }
+            cnt;
+        }
+
+        r.ds_source   = rdata.flat(r.d, r.d.flattranslation[pl.picnum]);
+        r.planeheight = abs32(pl.height - r.viewz);
+        var light: i32 = (pl.lightlevel >> LIGHTSEGSHIFT) + r.extralight;
+        if (light >= LIGHTLEVELS) { light = LIGHTLEVELS - 1; }
+        if (light < 0)            { light = 0; }
+        r.planezlight = light * MAXLIGHTZ;
+
+        pl.top[pl.maxx + 2] = 0xff;
+        pl.top[pl.minx]     = 0xff;
+
+        val stop: i32 = pl.maxx + 1;
+        var x:    i32 = pl.minx;
+        for (x <= stop) {
+            make_spans(r, x, pl.top[x]::i32, pl.bottom[x]::i32, pl.top[x + 1]::i32, pl.bottom[x + 1]::i32);
+            x = x + 1;
+        }
+    }
+}
+
+# ---------------------------------------------------------------- r_segs.c
+
+# R_RenderSegLoop: draw the columns of the current wall range, marking the
+# ceiling above and the floor below as it goes
+fun render_seg_loop(r: *Renderer) {
+    var texturecolumn: i32 = 0;
+
+    for (r.rw_x < r.rw_stopx) {
+        val x: i32 = r.rw_x;
+
+        # mark floor / ceiling areas
+        var yl: i32 = (r.topfrac + HEIGHTUNIT - 1) >> HEIGHTBITS;
+
+        # no space above wall?
+        if (yl < r.ceilingclip[x]::i32 + 1) { yl = r.ceilingclip[x]::i32 + 1; }
+
+        if (r.markceiling) {
+            val top:    i32 = r.ceilingclip[x]::i32 + 1;
+            var bottom: i32 = yl - 1;
+            if (bottom >= r.floorclip[x]::i32) { bottom = r.floorclip[x]::i32 - 1; }
+            if (top <= bottom) {
+                r.visplanes[r.ceilingplane].top[x + 1]    = top::u8;
+                r.visplanes[r.ceilingplane].bottom[x + 1] = bottom::u8;
+            }
+        }
+
+        var yh: i32 = r.bottomfrac >> HEIGHTBITS;
+        if (yh >= r.floorclip[x]::i32) { yh = r.floorclip[x]::i32 - 1; }
+
+        if (r.markfloor) {
+            var top:    i32 = yh + 1;
+            val bottom: i32 = r.floorclip[x]::i32 - 1;
+            if (top <= r.ceilingclip[x]::i32) { top = r.ceilingclip[x]::i32 + 1; }
+            if (top <= bottom) {
+                r.visplanes[r.floorplane].top[x + 1]    = top::u8;
+                r.visplanes[r.floorplane].bottom[x + 1] = bottom::u8;
+            }
+        }
+
+        # texturecolumn and lighting are independent of wall tiers
+        if (r.segtextured) {
+            val angle: u32 = (r.rw_centerangle + r.xtoviewangle[x]) >> t.ANGLETOFINESHIFT;
+            texturecolumn = r.rw_offset - fixed.mul(t.FINETANGENT[angle], r.rw_distance);
+            texturecolumn = texturecolumn >> 16;
+
+            var index: u32 = r.rw_scale:~u32 >> 12;
+            if (index >= 48) { index = 47; }
+            r.dc_colormap = ?r.d.colormaps[r.scalelight[r.walllights + index:~i32]];
+            if (r.fixedcolormap != nil) { r.dc_colormap = r.fixedcolormap; }
+            r.dc_x      = x;
+            r.dc_iscale = (0xffffffff / r.rw_scale:~u32):~i32;
+        }
+
+        # draw the wall tiers
+        if (r.midtexture != 0) {
+            # single sided line
+            r.dc_yl         = yl;
+            r.dc_yh         = yh;
+            r.dc_texturemid = r.rw_midtexturemid;
+            r.dc_source     = rdata.get_column(r.d, r.midtexture, texturecolumn);
+            draw_column(r);
+            r.ceilingclip[x] = r.viewheight::i16;
+            r.floorclip[x]   = -1;
+        }
+        or {
+            # two sided line
+            if (r.toptexture != 0) {
+                # top wall
+                var mid: i32 = r.pixhigh >> HEIGHTBITS;
+                r.pixhigh = r.pixhigh + r.pixhighstep;
+                if (mid >= r.floorclip[x]::i32) { mid = r.floorclip[x]::i32 - 1; }
+
+                if (mid >= yl) {
+                    r.dc_yl         = yl;
+                    r.dc_yh         = mid;
+                    r.dc_texturemid = r.rw_toptexturemid;
+                    r.dc_source     = rdata.get_column(r.d, r.toptexture, texturecolumn);
+                    draw_column(r);
+                    r.ceilingclip[x] = mid::i16;
+                }
+                or {
+                    r.ceilingclip[x] = (yl - 1)::i16;
+                }
+            }
+            or (r.markceiling) {
+                # no top wall
+                r.ceilingclip[x] = (yl - 1)::i16;
+            }
+
+            if (r.bottomtexture != 0) {
+                # bottom wall
+                var mid: i32 = (r.pixlow + HEIGHTUNIT - 1) >> HEIGHTBITS;
+                r.pixlow = r.pixlow + r.pixlowstep;
+
+                # no space above wall?
+                if (mid <= r.ceilingclip[x]::i32) { mid = r.ceilingclip[x]::i32 + 1; }
+
+                if (mid <= yh) {
+                    r.dc_yl         = mid;
+                    r.dc_yh         = yh;
+                    r.dc_texturemid = r.rw_bottomtexturemid;
+                    r.dc_source     = rdata.get_column(r.d, r.bottomtexture, texturecolumn);
+                    draw_column(r);
+                    r.floorclip[x] = mid::i16;
+                }
+                or {
+                    r.floorclip[x] = (yh + 1)::i16;
+                }
+            }
+            or (r.markfloor) {
+                # no bottom wall
+                r.floorclip[x] = (yh + 1)::i16;
+            }
+
+            if (r.maskedtexture) {
+                # save texturecol for backdrawing of masked mid texture
+                r.openings[r.maskedtexturecol + x] = texturecolumn::i16;
+            }
+        }
+
+        r.rw_scale   = r.rw_scale + r.rw_scalestep;
+        r.topfrac    = r.topfrac + r.topstep;
+        r.bottomfrac = r.bottomfrac + r.bottomstep;
+        r.rw_x       = r.rw_x + 1;
+    }
+}
+
+# R_StoreWallRange: a wall segment between two screen columns that survived
+# clipping; work out its textures and slopes, then draw it
+fun store_wall_range(r: *Renderer, start: i32, stop: i32) {
+    # don't overflow and crash
+    if (r.numdrawsegs == MAXDRAWSEGS) { ret; }
+
+    val lv:      *level.Level  = r.lv;
+    val curline: *level.Seg    = ?lv.segs[r.curline];
+    val sidedef: *level.Side   = ?lv.sides[curline.sidedef];
+    val linedef: *level.Line   = ?lv.lines[curline.linedef];
+    val front:   *level.Sector = ?lv.sectors[r.frontsector];
+    val ds:      *DrawSeg      = ?r.drawsegs[r.numdrawsegs];
+    val v1:      level.Vertex  = lv.vertexes[curline.v1];
+    val v2:      level.Vertex  = lv.vertexes[curline.v2];
+
+    # mark the segment as visible for the automap
+    linedef.flags = linedef.flags | ML_MAPPED;
+
+    # calculate rw_distance for scale calculation
+    r.rw_normalangle = curline.angle + t.ANG90;
+    var offsetangle: u32 = abs32((r.rw_normalangle - r.rw_angle1):~i32):~u32;
+    if (offsetangle > t.ANG90) { offsetangle = t.ANG90; }
+
+    val distangle: u32   = t.ANG90 - offsetangle;
+    val hyp:       Fixed = point_to_dist(r, v1.x, v1.y);
+    var sineval:   Fixed = sine(distangle >> t.ANGLETOFINESHIFT);
+    r.rw_distance = fixed.mul(hyp, sineval);
+
+    r.rw_x     = start;
+    ds.x1      = start;
+    ds.x2      = stop;
+    ds.curline = r.curline;
+    r.rw_stopx = stop + 1;
+
+    # calculate scale at both ends and step
+    r.rw_scale = scale_from_global_angle(r, r.viewangle + r.xtoviewangle[start]);
+    ds.scale1  = r.rw_scale;
+    if (stop > start) {
+        ds.scale2      = scale_from_global_angle(r, r.viewangle + r.xtoviewangle[stop]);
+        r.rw_scalestep = (ds.scale2 - r.rw_scale) / (stop - start);
+        ds.scalestep   = r.rw_scalestep;
+    }
+    or {
+        # a single column: the step keeps whatever the last wall left in it
+        ds.scale2 = ds.scale1;
+    }
+
+    # calculate texture boundaries and decide if floor / ceiling marks are
+    # needed
+    r.worldtop    = front.ceilingheight - r.viewz;
+    r.worldbottom = front.floorheight - r.viewz;
+
+    r.midtexture     = 0;
+    r.toptexture     = 0;
+    r.bottomtexture  = 0;
+    r.maskedtexture  = 0;
+    ds.masked        = 0;
+    ds.sprtopclip    = CLIP_NONE;
+    ds.sprbottomclip = CLIP_NONE;
+
+    if (r.backsector == level.NONE) {
+        # single sided line
+        r.midtexture = r.d.texturetranslation[sidedef.midtex];
+        # a single sided line is terminal, so it must mark ends
+        r.markfloor   = 1;
+        r.markceiling = 1;
+        if ((linedef.flags & ML_DONTPEGBOTTOM) != 0) {
+            # bottom of texture at bottom
+            r.rw_midtexturemid = front.floorheight + (r.d.textures[sidedef.midtex].height << 16) - r.viewz;
+        }
+        or {
+            # top of texture at top
+            r.rw_midtexturemid = r.worldtop;
+        }
+        r.rw_midtexturemid = r.rw_midtexturemid + sidedef.rowoffset;
+
+        ds.silhouette    = SIL_BOTH;
+        ds.sprtopclip    = CLIP_SCREEN;
+        ds.sprbottomclip = CLIP_NEGONE;
+        ds.bsilheight    = MAXINT;
+        ds.tsilheight    = MININT;
+    }
+    or {
+        # two sided line
+        val back: *level.Sector = ?lv.sectors[r.backsector];
+        ds.silhouette = 0;
+
+        if (front.floorheight > back.floorheight) {
+            ds.silhouette = SIL_BOTTOM;
+            ds.bsilheight = front.floorheight;
+        }
+        or (back.floorheight > r.viewz) {
+            ds.silhouette = SIL_BOTTOM;
+            ds.bsilheight = MAXINT;
+        }
+
+        if (front.ceilingheight < back.ceilingheight) {
+            ds.silhouette = ds.silhouette | SIL_TOP;
+            ds.tsilheight = front.ceilingheight;
+        }
+        or (back.ceilingheight < r.viewz) {
+            ds.silhouette = ds.silhouette | SIL_TOP;
+            ds.tsilheight = MININT;
+        }
+
+        if (back.ceilingheight <= front.floorheight) {
+            ds.sprbottomclip = CLIP_NEGONE;
+            ds.bsilheight    = MAXINT;
+            ds.silhouette    = ds.silhouette | SIL_BOTTOM;
+        }
+
+        if (back.floorheight >= front.ceilingheight) {
+            ds.sprtopclip = CLIP_SCREEN;
+            ds.tsilheight = MININT;
+            ds.silhouette = ds.silhouette | SIL_TOP;
+        }
+
+        r.worldhigh = back.ceilingheight - r.viewz;
+        r.worldlow  = back.floorheight - r.viewz;
+
+        # hack to allow height changes in outdoor areas
+        if (front.ceilingflat == r.skyflatnum && back.ceilingflat == r.skyflatnum) {
+            r.worldtop = r.worldhigh;
+        }
+
+        r.markfloor = r.worldlow != r.worldbottom || back.floorflat != front.floorflat ||
+            back.lightlevel != front.lightlevel;
+        r.markceiling = r.worldhigh != r.worldtop || back.ceilingflat != front.ceilingflat ||
+            back.lightlevel != front.lightlevel;
+
+        if (back.ceilingheight <= front.floorheight || back.floorheight >= front.ceilingheight) {
+            # closed door
+            r.markceiling = 1;
+            r.markfloor   = 1;
+        }
+
+        if (r.worldhigh < r.worldtop) {
+            # top texture
+            r.toptexture = r.d.texturetranslation[sidedef.toptex];
+            if ((linedef.flags & ML_DONTPEGTOP) != 0) {
+                # top of texture at top
+                r.rw_toptexturemid = r.worldtop;
+            }
+            or {
+                # bottom of texture
+                r.rw_toptexturemid = back.ceilingheight + (r.d.textures[sidedef.toptex].height << 16) - r.viewz;
+            }
+        }
+        if (r.worldlow > r.worldbottom) {
+            # bottom texture
+            r.bottomtexture = r.d.texturetranslation[sidedef.bottomtex];
+            if ((linedef.flags & ML_DONTPEGBOTTOM) != 0) {
+                # bottom of texture at bottom, top of texture at top
+                r.rw_bottomtexturemid = r.worldtop;
+            }
+            or {
+                # top of texture at top
+                r.rw_bottomtexturemid = r.worldlow;
+            }
+        }
+        r.rw_toptexturemid    = r.rw_toptexturemid + sidedef.rowoffset;
+        r.rw_bottomtexturemid = r.rw_bottomtexturemid + sidedef.rowoffset;
+
+        # allocate space for masked texture tables
+        if (sidedef.midtex != 0) {
+            # masked midtexture
+            r.maskedtexture    = 1;
+            r.maskedtexturecol = r.lastopening - r.rw_x;
+            ds.masked          = 1;
+            ds.maskedbase      = r.maskedtexturecol;
+            r.lastopening      = r.lastopening + (r.rw_stopx - r.rw_x);
+        }
+    }
+
+    # calculate rw_offset (only needed for textured lines)
+    r.segtextured = r.midtexture != 0 || r.toptexture != 0 || r.bottomtexture != 0 || r.maskedtexture;
+
+    if (r.segtextured) {
+        offsetangle = r.rw_normalangle - r.rw_angle1;
+        if (offsetangle > t.ANG180) { offsetangle = 0 - offsetangle; }
+        if (offsetangle > t.ANG90)  { offsetangle = t.ANG90; }
+
+        sineval     = sine(offsetangle >> t.ANGLETOFINESHIFT);
+        r.rw_offset = fixed.mul(hyp, sineval);
+        if (r.rw_normalangle - r.rw_angle1 < t.ANG180) { r.rw_offset = 0 - r.rw_offset; }
+
+        r.rw_offset      = r.rw_offset + sidedef.textureoffset + curline.offset;
+        r.rw_centerangle = t.ANG90 + r.viewangle - r.rw_normalangle;
+
+        # calculate light table: walls facing east or west are a shade
+        # brighter, north or south a shade darker
+        var lightnum: i32 = (front.lightlevel::i32 >> LIGHTSEGSHIFT) + r.extralight;
+        if (v1.y == v2.y) {
+            lightnum = lightnum - 1;
+        }
+        or (v1.x == v2.x) {
+            lightnum = lightnum + 1;
+        }
+        if (lightnum < 0) {
+            lightnum = 0;
+        }
+        or (lightnum >= LIGHTLEVELS) {
+            lightnum = LIGHTLEVELS - 1;
+        }
+        r.walllights = lightnum * MAXLIGHTSCALE;
+    }
+
+    # if a floor / ceiling plane is on the wrong side of the view plane, it
+    # is definitely invisible and doesn't need to be marked
+    if (front.floorheight >= r.viewz) {
+        # above view plane
+        r.markfloor = 0;
+    }
+    if (front.ceilingheight <= r.viewz && front.ceilingflat != r.skyflatnum) {
+        # below view plane
+        r.markceiling = 0;
+    }
+
+    # calculate incremental stepping values for texture edges
+    r.worldtop    = r.worldtop >> 4;
+    r.worldbottom = r.worldbottom >> 4;
+
+    r.topstep = 0 - fixed.mul(r.rw_scalestep, r.worldtop);
+    r.topfrac = (r.centeryfrac >> 4) - fixed.mul(r.worldtop, r.rw_scale);
+
+    r.bottomstep = 0 - fixed.mul(r.rw_scalestep, r.worldbottom);
+    r.bottomfrac = (r.centeryfrac >> 4) - fixed.mul(r.worldbottom, r.rw_scale);
+
+    if (r.backsector != level.NONE) {
+        r.worldhigh = r.worldhigh >> 4;
+        r.worldlow  = r.worldlow >> 4;
+
+        if (r.worldhigh < r.worldtop) {
+            r.pixhigh     = (r.centeryfrac >> 4) - fixed.mul(r.worldhigh, r.rw_scale);
+            r.pixhighstep = 0 - fixed.mul(r.rw_scalestep, r.worldhigh);
+        }
+        if (r.worldlow > r.worldbottom) {
+            r.pixlow     = (r.centeryfrac >> 4) - fixed.mul(r.worldlow, r.rw_scale);
+            r.pixlowstep = 0 - fixed.mul(r.rw_scalestep, r.worldlow);
+        }
+    }
+
+    # render it
+    if (r.markceiling) { r.ceilingplane = check_plane(r, r.ceilingplane, r.rw_x, r.rw_stopx - 1); }
+    if (r.markfloor)   { r.floorplane = check_plane(r, r.floorplane, r.rw_x, r.rw_stopx - 1); }
+
+    render_seg_loop(r);
+
+    # save sprite clipping info
+    if (((ds.silhouette & SIL_TOP) != 0 || r.maskedtexture) && ds.sprtopclip == CLIP_NONE) {
+        var x: i32 = start;
+        for (x < r.rw_stopx) {
+            r.openings[r.lastopening + x - start] = r.ceilingclip[x];
+            x                                     = x + 1;
+        }
+        ds.sprtopclip = CLIP_OPENINGS;
+        ds.sprtopbase = r.lastopening - start;
+        r.lastopening = r.lastopening + (r.rw_stopx - start);
+    }
+
+    if (((ds.silhouette & SIL_BOTTOM) != 0 || r.maskedtexture) && ds.sprbottomclip == CLIP_NONE) {
+        var x: i32 = start;
+        for (x < r.rw_stopx) {
+            r.openings[r.lastopening + x - start] = r.floorclip[x];
+            x                                     = x + 1;
+        }
+        ds.sprbottomclip = CLIP_OPENINGS;
+        ds.sprbottombase = r.lastopening - start;
+        r.lastopening    = r.lastopening + (r.rw_stopx - start);
+    }
+
+    if (r.maskedtexture && (ds.silhouette & SIL_TOP) == 0) {
+        ds.silhouette = ds.silhouette | SIL_TOP;
+        ds.tsilheight = MININT;
+    }
+    if (r.maskedtexture && (ds.silhouette & SIL_BOTTOM) == 0) {
+        ds.silhouette = ds.silhouette | SIL_BOTTOM;
+        ds.bsilheight = MAXINT;
+    }
+    r.numdrawsegs = r.numdrawsegs + 1;
+}
+
+# ----------------------------------------------------------------- r_bsp.c
+
+# R_ClipSolidWallSegment: draw the parts of a column range that no solid wall
+# has covered yet, and add the range to the covered list
+fun clip_solid_wall_segment(r: *Renderer, first: i32, last: i32) {
+    # find the first range that touches the range (adjacent pixels are
+    # touching)
+    var start: i32 = 0;
+    for (r.solidlast[start] < first - 1) { start = start + 1; }
+
+    if (first < r.solidfirst[start]) {
+        if (last < r.solidfirst[start] - 1) {
+            # post is entirely visible (above start), so insert a new
+            # clippost
+            store_wall_range(r, first, last);
+            var next: i32 = r.newend;
+            r.newend = r.newend + 1;
+            for (next != start) {
+                r.solidfirst[next] = r.solidfirst[next - 1];
+                r.solidlast[next]  = r.solidlast[next - 1];
+                next               = next - 1;
+            }
+            r.solidfirst[next] = first;
+            r.solidlast[next]  = last;
+            ret;
+        }
+
+        # there is a fragment above *start
+        store_wall_range(r, first, r.solidfirst[start] - 1);
+        # now adjust the clip size
+        r.solidfirst[start] = first;
+    }
+
+    # bottom contained in start?
+    if (last <= r.solidlast[start]) { ret; }
+
+    var next:     i32  = start;
+    var crunched: bool = 0;
+    for (last >= r.solidfirst[next + 1] - 1) {
+        # there is a fragment between two posts
+        store_wall_range(r, r.solidlast[next] + 1, r.solidfirst[next + 1] - 1);
+        next = next + 1;
+
+        if (last <= r.solidlast[next]) {
+            # bottom is contained in next; adjust the clip size
+            r.solidlast[start] = r.solidlast[next];
+            crunched           = 1;
+            brk;
+        }
+    }
+
+    if (!crunched) {
+        # there is a fragment after *next
+        store_wall_range(r, r.solidlast[next] + 1, last);
+        # adjust the clip size
+        r.solidlast[start] = last;
+    }
+
+    # remove start+1 to next from the clip list, because start now covers
+    # their area
+    if (next == start) {
+        # post just extended past the bottom of one post
+        ret;
+    }
+
+    for {
+        val was: i32 = next;
+        next = next + 1;
+        if (was == r.newend) { brk; }
+        # remove a post
+        start               = start + 1;
+        r.solidfirst[start] = r.solidfirst[next];
+        r.solidlast[start]  = r.solidlast[next];
+    }
+    r.newend = start + 1;
+}
+
+# R_ClipPassWallSegment: draw the uncovered parts of a column range without
+# adding it to the covered list, for walls one can see over or through
+fun clip_pass_wall_segment(r: *Renderer, first: i32, last: i32) {
+    var start: i32 = 0;
+    for (r.solidlast[start] < first - 1) { start = start + 1; }
+
+    if (first < r.solidfirst[start]) {
+        if (last < r.solidfirst[start] - 1) {
+            # post is entirely visible (above start)
+            store_wall_range(r, first, last);
+            ret;
+        }
+        # there is a fragment above *start
+        store_wall_range(r, first, r.solidfirst[start] - 1);
+    }
+
+    # bottom contained in start?
+    if (last <= r.solidlast[start]) { ret; }
+
+    for (last >= r.solidfirst[start + 1] - 1) {
+        # there is a fragment between two posts
+        store_wall_range(r, r.solidlast[start] + 1, r.solidfirst[start + 1] - 1);
+        start = start + 1;
+        if (last <= r.solidlast[start]) { ret; }
+    }
+
+    # there is a fragment after *next
+    store_wall_range(r, r.solidlast[start] + 1, last);
+}
+
+# R_ClearClipSegs
+fun clear_clip_segs(r: *Renderer) {
+    r.solidfirst[0] = 0 - MAXINT;
+    r.solidlast[0]  = -1;
+    r.solidfirst[1] = r.viewwidth;
+    r.solidlast[1]  = MAXINT;
+    r.newend        = 2;
+}
+
+# R_AddLine: clip a seg to the view and to what is already drawn, then draw
+# what is left of it
+fun add_line(r: *Renderer, segnum: i32) {
+    val lv:   *level.Level = r.lv;
+    val line: *level.Seg   = ?lv.segs[segnum];
+    r.curline = segnum;
+
+    var angle1: u32 = point_to_angle(r, lv.vertexes[line.v1].x, lv.vertexes[line.v1].y);
+    var angle2: u32 = point_to_angle(r, lv.vertexes[line.v2].x, lv.vertexes[line.v2].y);
+
+    # clip to view edges
+    val span: u32 = angle1 - angle2;
+
+    # back side? i.e. backface culling?
+    if (span >= t.ANG180) { ret; }
+
+    # global angle needed by segcalc
+    r.rw_angle1 = angle1;
+    angle1      = angle1 - r.viewangle;
+    angle2      = angle2 - r.viewangle;
+
+    var tspan: u32 = angle1 + r.clipangle;
+    if (tspan > 2 * r.clipangle) {
+        tspan = tspan - 2 * r.clipangle;
+        # totally off the left edge?
+        if (tspan >= span) { ret; }
+        angle1 = r.clipangle;
+    }
+    tspan = r.clipangle - angle2;
+    if (tspan > 2 * r.clipangle) {
+        tspan = tspan - 2 * r.clipangle;
+        # totally off the left edge?
+        if (tspan >= span) { ret; }
+        angle2 = 0 - r.clipangle;
+    }
+
+    # the seg is in the view range, but not necessarily visible
+    angle1 = (angle1 + t.ANG90) >> t.ANGLETOFINESHIFT;
+    angle2 = (angle2 + t.ANG90) >> t.ANGLETOFINESHIFT;
+    val x1: i32 = r.viewangletox[angle1];
+    val x2: i32 = r.viewangletox[angle2];
+
+    # does not cross a pixel?
+    if (x1 == x2) { ret; }
+
+    r.backsector = line.backsector;
+
+    # single sided line?
+    if (r.backsector == level.NONE) {
+        clip_solid_wall_segment(r, x1, x2 - 1);
+        ret;
+    }
+
+    val front: *level.Sector = ?lv.sectors[r.frontsector];
+    val back:  *level.Sector = ?lv.sectors[r.backsector];
+
+    # closed door
+    if (back.ceilingheight <= front.floorheight || back.floorheight >= front.ceilingheight) {
+        clip_solid_wall_segment(r, x1, x2 - 1);
+        ret;
+    }
+
+    # window
+    if (back.ceilingheight != front.ceilingheight || back.floorheight != front.floorheight) {
+        clip_pass_wall_segment(r, x1, x2 - 1);
+        ret;
+    }
+
+    # reject empty lines used for triggers and special events: identical
+    # floor and ceiling on both sides, identical light levels on both sides,
+    # and no middle texture
+    if (back.ceilingflat == front.ceilingflat && back.floorflat == front.floorflat &&
+        back.lightlevel == front.lightlevel && lv.sides[line.sidedef].midtex == 0) {
+        ret;
+    }
+
+    clip_pass_wall_segment(r, x1, x2 - 1);
+}
+
+# which two corners of a bounding box span it, as seen from each of the nine
+# places the eye can be relative to the box
+val CHECKCOORD: [48]u8 = [48]u8{
+    3, 0, 2, 1,
+    3, 0, 2, 0,
+    3, 1, 2, 0,
+    0, 0, 0, 0,
+    2, 0, 2, 1,
+    0, 0, 0, 0,
+    3, 1, 3, 0,
+    0, 0, 0, 0,
+    2, 0, 3, 1,
+    2, 1, 3, 1,
+    2, 1, 3, 0,
+    0, 0, 0, 0
+};
+
+# R_CheckBBox: whether any of a bounding box could still be seen
+fun check_bbox(r: *Renderer, bspcoord: *Fixed) bool {
+    # find the corners of the box that define the edges from the current
+    # viewpoint
+    var boxx: i32 = 2;
+    if (r.viewx <= bspcoord[level.BOXLEFT]) {
+        boxx = 0;
+    }
+    or (r.viewx < bspcoord[level.BOXRIGHT]) {
+        boxx = 1;
+    }
+
+    var boxy: i32 = 2;
+    if (r.viewy >= bspcoord[level.BOXTOP]) {
+        boxy = 0;
+    }
+    or (r.viewy > bspcoord[level.BOXBOTTOM]) {
+        boxy = 1;
+    }
+
+    val boxpos: i32 = (boxy << 2) + boxx;
+    if (boxpos == 5) { ret 1; }
+
+    val x1: Fixed = bspcoord[CHECKCOORD[boxpos * 4]];
+    val y1: Fixed = bspcoord[CHECKCOORD[boxpos * 4 + 1]];
+    val x2: Fixed = bspcoord[CHECKCOORD[boxpos * 4 + 2]];
+    val y2: Fixed = bspcoord[CHECKCOORD[boxpos * 4 + 3]];
+
+    # check clip list for an open space
+    var angle1: u32 = point_to_angle(r, x1, y1) - r.viewangle;
+    var angle2: u32 = point_to_angle(r, x2, y2) - r.viewangle;
+
+    val span: u32 = angle1 - angle2;
+
+    # sitting on a line?
+    if (span >= t.ANG180) { ret 1; }
+
+    var tspan: u32 = angle1 + r.clipangle;
+    if (tspan > 2 * r.clipangle) {
+        tspan = tspan - 2 * r.clipangle;
+        # totally off the left edge?
+        if (tspan >= span) { ret 0; }
+        angle1 = r.clipangle;
+    }
+    tspan = r.clipangle - angle2;
+    if (tspan > 2 * r.clipangle) {
+        tspan = tspan - 2 * r.clipangle;
+        # totally off the left edge?
+        if (tspan >= span) { ret 0; }
+        angle2 = 0 - r.clipangle;
+    }
+
+    # find the first clippost that touches the source post (adjacent pixels
+    # are touching)
+    angle1 = (angle1 + t.ANG90) >> t.ANGLETOFINESHIFT;
+    angle2 = (angle2 + t.ANG90) >> t.ANGLETOFINESHIFT;
+    val sx1: i32 = r.viewangletox[angle1];
+    var sx2: i32 = r.viewangletox[angle2];
+
+    # does not cross a pixel
+    if (sx1 == sx2) { ret 0; }
+    sx2 = sx2 - 1;
+
+    var start: i32 = 0;
+    for (r.solidlast[start] < sx2) { start = start + 1; }
+
+    if (sx1 >= r.solidfirst[start] && sx2 <= r.solidlast[start]) {
+        # the clippost contains the new span
+        ret 0;
+    }
+    ret 1;
+}
+
+# R_Subsector: find this subsector's floor and ceiling planes and draw its
+# walls
+fun subsector(r: *Renderer, num: i32) {
+    val sub:   *level.Subsector = ?r.lv.subsectors[num];
+    val front: *level.Sector    = ?r.lv.sectors[sub.sector];
+    r.frontsector = sub.sector;
+
+    if (front.floorheight < r.viewz) {
+        r.floorplane = find_plane(r, front.floorheight, front.floorflat, front.lightlevel::i32);
+    }
+    or {
+        r.floorplane = -1;
+    }
+
+    if (front.ceilingheight > r.viewz || front.ceilingflat == r.skyflatnum) {
+        r.ceilingplane = find_plane(r, front.ceilingheight, front.ceilingflat, front.lightlevel::i32);
+    }
+    or {
+        r.ceilingplane = -1;
+    }
+
+    add_sprites(r, sub.sector);
+
+    var count: i32 = sub.numlines;
+    var line:  i32 = sub.firstline;
+    for (count > 0) {
+        add_line(r, line);
+        line  = line + 1;
+        count = count - 1;
+    }
+}
+
+# R_RenderBSPNode: draw everything below a node, nearest first
+fun render_bsp_node(r: *Renderer, bspnum: i32) {
+    # found a subsector?
+    if ((bspnum & 0x8000) != 0) {
+        if (bspnum == -1) {
+            subsector(r, 0);
+        }
+        or {
+            subsector(r, bspnum & 0x7fff);
+        }
+        ret;
+    }
+
+    val bsp: *level.Node = ?r.lv.nodes[bspnum];
+
+    # decide which side the view point is on
+    val side: i32 = point_on_side(r.viewx, r.viewy, bsp);
+
+    # recursively divide front space
+    render_bsp_node(r, bsp.children[side]::i32);
+
+    # possibly divide back space
+    if (check_bbox(r, ?bsp.bbox[(side ^ 1) * 4])) { render_bsp_node(r, bsp.children[side ^ 1]::i32); }
+}
+
+# --------------------------------------------------------------- r_things.c
+
+# R_InstallSpriteLump: local function for R_InitSprites
+fun install_sprite_lump(r: *Renderer, sprite: i32, lump: i32, frame: i32, rotation: i32, flipped: bool) {
+    if (frame < 0 || frame >= MAXFRAMES || rotation < 0 || rotation > 8) { ret; }
+
+    if (frame > r.maxframe) { r.maxframe = frame; }
+
+    val at: i32 = sprite * MAXFRAMES + frame;
+    if (rotation == 0) {
+        # the lump should be used for all rotations
+        r.sprrotate[at] = 0;
+        var k: i32 = 0;
+        for (k < 8) {
+            r.sprlump[at * 8 + k] = (lump - r.firstspritelump)::i16;
+            r.sprflip[at * 8 + k] = flipped;
+            k                     = k + 1;
+        }
+        ret;
+    }
+
+    # the lump is only used for one rotation
+    r.sprrotate[at]                  = 1;
+    r.sprlump[at * 8 + rotation - 1] = (lump - r.firstspritelump)::i16;
+    r.sprflip[at * 8 + rotation - 1] = flipped;
+}
+
+# R_InitSpriteDefs and R_InitSpriteLumps: pass a null terminated list of
+# sprite names (4 chars exactly) to be used. builds the sprite rotation
+# matrixes to account for horizontally flipped sprites. a sprite lump's name
+# is the four letters, a frame letter and a rotation digit, and may go on to
+# name a second frame and rotation that it serves mirrored.
+fun init_sprites(a: *allocator.Allocator, r: *Renderer) bool {
+    val w:     *wad.Wad = r.d.w;
+    val start: opt[u32] = wad.find(w, "S_START");
+    val end:   opt[u32] = wad.find(w, "S_END");
+    if (sel start.none) { ret 0; }
+    if (sel end.none)   { ret 0; }
+
+    r.firstspritelump = start.some::i32 + 1;
+    val last:  i32 = end.some::i32 - 1;
+    val count: i32 = last - r.firstspritelump + 1;
+    if (count <= 0) { ret 0; }
+
+    val widths: res[*Fixed, allocator.Error] = allocator.zallocate[Fixed](a, (count * 3)::usize);
+    if (sel widths.err) { ret 0; }
+    r.spritewidth     = widths.ok;
+    r.spriteoffset    = ?widths.ok[count];
+    r.spritetopoffset = ?widths.ok[count * 2];
+
+    var i: i32 = 0;
+    for (i < count) {
+        val patch: *u8 = wad.bytes(w, (r.firstspritelump + i)::u32);
+        if (wad.lump(w, (r.firstspritelump + i)::u32).size >= 8) {
+            r.spritewidth[i]     = le16(patch, 0) << 16;
+            r.spriteoffset[i]    = le16(patch, 4) << 16;
+            r.spritetopoffset[i] = le16(patch, 6) << 16;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < MAXSPRITES * MAXFRAMES) {
+        r.sprrotate[i] = -1;
+        i              = i + 1;
+    }
+    i = 0;
+    for (i < MAXSPRITES * MAXFRAMES * 8) {
+        r.sprlump[i] = -1;
+        i            = i + 1;
+    }
+
+    # scan all the lump names for each of the names, noting the highest
+    # frame letter
+    var s: i32 = 0;
+    for (s < info.NUMSPRITES) {
+        r.maxframe = -1;
+        var l: i32 = r.firstspritelump;
+        for (l <= last) {
+            val name: wad.Lump = wad.lump(w, l::u32);
+            if (name.name[0] == info.SPRNAMES[s * 4] && name.name[1] == info.SPRNAMES[s * 4 + 1] &&
+                name.name[2] == info.SPRNAMES[s * 4 + 2] && name.name[3] == info.SPRNAMES[s * 4 + 3]) {
+                install_sprite_lump(r, s, l, name.name[4]::i32 - 'A', name.name[5]::i32 - '0', 0);
+                if (name.name[6] != 0) {
+                    install_sprite_lump(r, s, l, name.name[6]::i32 - 'A', name.name[7]::i32 - '0', 1);
+                }
+            }
+            l = l + 1;
+        }
+        r.sprnumframes[s] = r.maxframe + 1;
+        s                 = s + 1;
+    }
+
+    i = 0;
+    for (i < SCREENWIDTH) {
+        r.negonearray[i] = -1;
+        i                = i + 1;
+    }
+    ret 1;
+}
+
+# the light table for a sprite or wall at a scale, in the current sector
+fun sprite_light(r: *Renderer, index: i32) *u8 {
+    ret ?r.d.colormaps[r.scalelight[r.spritelights + index]];
+}
+
+# R_DrawFuzzColumn: framebuffer postprocessing. creates a fuzzy image by
+# copying pixels from adjacent ones to left and right. used with an all black
+# colormap, this could create the SHADOW effect, i.e. spectres and invisible
+# players.
+fun draw_fuzz_column(r: *Renderer) {
+    # adjust borders. low...
+    if (r.dc_yl == 0) { r.dc_yl = 1; }
+
+    # .. and high
+    if (r.dc_yh == r.viewheight - 1) { r.dc_yh = r.viewheight - 2; }
+
+    var count: i32 = r.dc_yh - r.dc_yl;
+
+    # zero length
+    if (count < 0) { ret; }
+
+    var dest: i32 = (r.dc_yl + r.viewwindowy) * SCREENWIDTH + r.viewwindowx + r.dc_x;
+
+    # looks like an attempt at dithering, using the colormap #6 (of 0-31, a
+    # bit brighter than average)
+    for (count >= 0) {
+        # lookup framebuffer, and retrieve a pixel that is either one column
+        # left or right of the current one. add index from colormap to index.
+        r.screen[dest] = r.d.colormaps[6 * 256 + r.screen[dest + FUZZOFFSET[r.fuzzpos] * SCREENWIDTH]::i32];
+
+        # clamp table lookup index
+        r.fuzzpos = r.fuzzpos + 1;
+        if (r.fuzzpos == 50) { r.fuzzpos = 0; }
+
+        dest  = dest + SCREENWIDTH;
+        count = count - 1;
+    }
+}
+
+# R_DrawMaskedColumn: used for sprites and masked mid textures. masked means:
+# partly transparent, i.e. stored in posts/runs of opaque pixels.
+fun draw_masked_column(r: *Renderer, column: *u8) {
+    val basetexturemid: Fixed = r.dc_texturemid;
+    var at:             i32   = 0;
+
+    for (column[at] != 0xff) {
+        val topdelta: i32 = column[at]::i32;
+        val length:   i32 = column[at + 1]::i32;
+
+        # calculate unclipped screen coordinates for post
+        val topscreen:    i32 = r.sprtopscreen + r.spryscale * topdelta;
+        val bottomscreen: i32 = topscreen + r.spryscale * length;
+
+        r.dc_yl = (topscreen + FRACUNIT - 1) >> 16;
+        r.dc_yh = (bottomscreen - 1) >> 16;
+
+        if (r.dc_yh >= r.mfloorclip[r.mfloorbase + r.dc_x]::i32) { r.dc_yh = r.mfloorclip[r.mfloorbase + r.dc_x]::i32 - 1; }
+        if (r.dc_yl <= r.mceilingclip[r.mceilingbase + r.dc_x]::i32) {
+            r.dc_yl = r.mceilingclip[r.mceilingbase + r.dc_x]::i32 + 1;
+        }
+
+        if (r.dc_yl <= r.dc_yh) {
+            r.dc_source     = ?column[at + 3];
+            r.dc_texturemid = basetexturemid - (topdelta << 16);
+
+            # drawn by either R_DrawColumn or (SHADOW) R_DrawFuzzColumn
+            if (r.dc_fuzz) {
+                draw_fuzz_column(r);
+            }
+            or {
+                draw_column(r);
+            }
+        }
+        at = at + length + 4;
+    }
+
+    r.dc_texturemid = basetexturemid;
+}
+
+# R_DrawVisSprite: mfloorclip and mceilingclip should also be set
+fun draw_vis_sprite(r: *Renderer, vis: *VisSprite) {
+    val patch: *u8 = wad.bytes(r.d.w, (vis.patch + r.firstspritelump)::u32);
+    val width: i32 = le16(patch, 0);
+
+    r.dc_colormap = vis.colormap;
+    # NULL colormap = shadow draw
+    r.dc_fuzz = vis.colormap == nil;
+
+    r.dc_iscale     = abs32(vis.xiscale);
+    r.dc_texturemid = vis.texturemid;
+    var frac: Fixed = vis.startfrac;
+    r.spryscale    = vis.scale;
+    r.sprtopscreen = r.centeryfrac - fixed.mul(r.dc_texturemid, r.spryscale);
+
+    r.dc_x = vis.x1;
+    for (r.dc_x <= vis.x2) {
+        val texturecolumn: i32 = frac >> 16;
+        # the original stops with an error on a column outside the patch
+        if (texturecolumn >= 0 && texturecolumn < width) {
+            draw_masked_column(r, ?patch[le32(patch, 8 + texturecolumn * 4)]);
+        }
+        r.dc_x = r.dc_x + 1;
+        frac   = frac + vis.xiscale;
+    }
+
+    r.dc_fuzz = 0;
+}
+
+# R_ProjectSprite: generates a vissprite for a thing if it might be visible
+fun project_sprite(r: *Renderer, thing: *defs.Mobj) {
+    # transform the origin point
+    val tr_x: Fixed = thing.x - r.viewx;
+    val tr_y: Fixed = thing.y - r.viewy;
+
+    var gxt: Fixed = fixed.mul(tr_x, r.viewcos);
+    var gyt: Fixed = 0 - fixed.mul(tr_y, r.viewsin);
+
+    val tz: Fixed = gxt - gyt;
+
+    # thing is behind view plane?
+    if (tz < MINZ) { ret; }
+
+    val xscale: Fixed = fixed.div(r.projection, tz);
+
+    gxt = 0 - fixed.mul(tr_x, r.viewsin);
+    gyt = fixed.mul(tr_y, r.viewcos);
+    var tx: Fixed = 0 - (gyt + gxt);
+
+    # too far off the side?
+    if (abs32(tx) > (tz << 2)) { ret; }
+
+    # decide which patch to use for sprite relative to player
+    val frame: i32 = thing.frame & defs.FF_FRAMEMASK;
+    if (thing.sprite < 0 || thing.sprite >= info.NUMSPRITES || frame >= r.sprnumframes[thing.sprite]) { ret; }
+    val at: i32 = thing.sprite * MAXFRAMES + frame;
+
+    var rot: u32 = 0;
+    if (r.sprrotate[at] == 1) {
+        # choose a different rotation based on player view
+        val ang: u32 = point_to_angle(r, thing.x, thing.y);
+        rot = (ang - thing.angle + (t.ANG45 / 2) * 9) >> 29;
+    }
+    val lump: i32  = r.sprlump[at * 8 + rot:~i32]::i32;
+    val flip: bool = r.sprflip[at * 8 + rot:~i32];
+    if (lump < 0) { ret; }
+
+    # calculate edges of the shape
+    tx = tx - r.spriteoffset[lump];
+    val x1: i32 = (r.centerxfrac + fixed.mul(tx, xscale)) >> 16;
+
+    # off the right side?
+    if (x1 > r.viewwidth) { ret; }
+
+    tx = tx + r.spritewidth[lump];
+    val x2: i32 = ((r.centerxfrac + fixed.mul(tx, xscale)) >> 16) - 1;
+
+    # off the left side
+    if (x2 < 0) { ret; }
+
+    # store information in a vissprite
+    if (r.numvissprites == MAXVISSPRITES) { ret; }
+    val vis: *VisSprite = ?r.vissprites[r.numvissprites];
+    r.numvissprites = r.numvissprites + 1;
+
+    vis.drawn      = 0;
+    vis.mobjflags  = thing.flags;
+    vis.scale      = xscale;
+    vis.gx         = thing.x;
+    vis.gy         = thing.y;
+    vis.gz         = thing.z;
+    vis.gzt        = thing.z + r.spritetopoffset[lump];
+    vis.texturemid = vis.gzt - r.viewz;
+    vis.x1         = x1;
+    if (x1 < 0) { vis.x1 = 0; }
+    vis.x2 = x2;
+    if (x2 >= r.viewwidth) { vis.x2 = r.viewwidth - 1; }
+    val iscale: Fixed = fixed.div(FRACUNIT, xscale);
+
+    if (flip) {
+        vis.startfrac = r.spritewidth[lump] - 1;
+        vis.xiscale   = 0 - iscale;
+    }
+    or {
+        vis.startfrac = 0;
+        vis.xiscale   = iscale;
+    }
+
+    if (vis.x1 > x1) { vis.startfrac = vis.startfrac + vis.xiscale * (vis.x1 - x1); }
+    vis.patch = lump;
+
+    # get light level
+    if ((thing.flags & defs.MF_SHADOW) != 0) {
+        # shadow draw
+        vis.colormap = nil;
+    }
+    or (r.fixedcolormap != nil) {
+        # fixed map
+        vis.colormap = r.fixedcolormap;
+    }
+    or ((thing.frame & defs.FF_FULLBRIGHT) != 0) {
+        # full bright
+        vis.colormap = r.d.colormaps;
+    }
+    or {
+        # diminished light
+        var index: i32 = xscale >> LIGHTSCALESHIFT;
+        if (index >= MAXLIGHTSCALE) { index = MAXLIGHTSCALE - 1; }
+        vis.colormap = sprite_light(r, index);
+    }
+}
+
+# choose the row of light tables for a sector light level
+fun set_sprite_lights(r: *Renderer, lightlevel: i32) {
+    var lightnum: i32 = (lightlevel >> LIGHTSEGSHIFT) + r.extralight;
+    if (lightnum < 0) {
+        lightnum = 0;
+    }
+    or (lightnum >= LIGHTLEVELS) {
+        lightnum = LIGHTLEVELS - 1;
+    }
+    r.spritelights = lightnum * MAXLIGHTSCALE;
+}
+
+# R_AddSprites: during BSP traversal, this adds sprites by sector
+fun add_sprites(r: *Renderer, secnum: i32) {
+    if (r.g == nil) { ret; }
+    val sec: *level.Sector = ?r.lv.sectors[secnum];
+
+    # BSP is traversed by subsector. a sector might have been split into
+    # several subsectors during BSP building. thus we check whether its
+    # already added.
+    if (sec.validcount == r.g.validcount) { ret; }
+
+    # well, now it will be done
+    sec.validcount = r.g.validcount;
+
+    set_sprite_lights(r, sec.lightlevel::i32);
+
+    # handle all things in sector
+    var thing: *defs.Mobj = sec.thinglist:~*defs.Mobj;
+    for (thing != nil) {
+        project_sprite(r, thing);
+        thing = thing.snext;
+    }
+}
+
+# R_DrawPSprite
+fun draw_psprite(r: *Renderer, player: *defs.Player, psp: *defs.Pspdef) {
+    # decide which patch to use
+    val sprite: i32 = info.st_sprite(psp.state);
+    val frame:  i32 = info.st_frame(psp.state);
+    if ((frame & defs.FF_FRAMEMASK) >= r.sprnumframes[sprite]) { ret; }
+    val at:   i32  = sprite * MAXFRAMES + (frame & defs.FF_FRAMEMASK);
+    val lump: i32  = r.sprlump[at * 8]::i32;
+    val flip: bool = r.sprflip[at * 8];
+    if (lump < 0) { ret; }
+
+    # calculate edges of the shape
+    var tx: Fixed = psp.sx - 160 * FRACUNIT;
+
+    tx = tx - r.spriteoffset[lump];
+    val x1: i32 = (r.centerxfrac + fixed.mul(tx, r.pspritescale)) >> 16;
+
+    # off the right side
+    if (x1 > r.viewwidth) { ret; }
+
+    tx = tx + r.spritewidth[lump];
+    val x2: i32 = ((r.centerxfrac + fixed.mul(tx, r.pspritescale)) >> 16) - 1;
+
+    # off the left side
+    if (x2 < 0) { ret; }
+
+    # store information in a vissprite
+    var vis: VisSprite;
+    vis.mobjflags  = 0;
+    vis.texturemid = (BASEYCENTER << 16) + FRACUNIT / 2 - (psp.sy - r.spritetopoffset[lump]);
+    vis.x1         = x1;
+    if (x1 < 0) { vis.x1 = 0; }
+    vis.x2 = x2;
+    if (x2 >= r.viewwidth) { vis.x2 = r.viewwidth - 1; }
+    vis.scale = r.pspritescale;
+
+    if (flip) {
+        vis.xiscale   = 0 - r.pspriteiscale;
+        vis.startfrac = r.spritewidth[lump] - 1;
+    }
+    or {
+        vis.xiscale   = r.pspriteiscale;
+        vis.startfrac = 0;
+    }
+
+    if (vis.x1 > x1) { vis.startfrac = vis.startfrac + vis.xiscale * (vis.x1 - x1); }
+
+    vis.patch = lump;
+
+    if (player.powers[defs.PW_INVISIBILITY] > 4 * 32 || (player.powers[defs.PW_INVISIBILITY] & 8) != 0) {
+        # shadow draw
+        vis.colormap = nil;
+    }
+    or (r.fixedcolormap != nil) {
+        # fixed color
+        vis.colormap = r.fixedcolormap;
+    }
+    or ((frame & defs.FF_FULLBRIGHT) != 0) {
+        # full bright
+        vis.colormap = r.d.colormaps;
+    }
+    or {
+        # local light
+        vis.colormap = sprite_light(r, MAXLIGHTSCALE - 1);
+    }
+
+    draw_vis_sprite(r, ?vis);
+}
+
+# R_DrawPlayerSprites
+fun draw_player_sprites(r: *Renderer, player: *defs.Player) {
+    # get light level
+    set_sprite_lights(r, r.lv.sectors[r.lv.subsectors[player.mo.subsector].sector].lightlevel::i32);
+
+    # clip to screen bounds
+    r.mfloorclip   = ?r.screenheightarray[0];
+    r.mfloorbase   = 0;
+    r.mceilingclip = ?r.negonearray[0];
+    r.mceilingbase = 0;
+
+    # add all active psprites
+    var i: i32 = 0;
+    for (i < defs.NUMPSPRITES) {
+        if (player.psprites[i].state != info.S_NULL) { draw_psprite(r, player, ?player.psprites[i]); }
+        i = i + 1;
+    }
+}
+
+# R_PointOnSegSide
+fun point_on_seg_side(r: *Renderer, x: Fixed, y: Fixed, segnum: i32) i32 {
+    val line: *level.Seg = ?r.lv.segs[segnum];
+    val lx:   Fixed      = r.lv.vertexes[line.v1].x;
+    val ly:   Fixed      = r.lv.vertexes[line.v1].y;
+    val ldx:  Fixed      = r.lv.vertexes[line.v2].x - lx;
+    val ldy:  Fixed      = r.lv.vertexes[line.v2].y - ly;
+
+    if (ldx == 0) {
+        if (x <= lx) { ret (ldy > 0)::i32; }
+        ret (ldy < 0)::i32;
+    }
+    if (ldy == 0) {
+        if (y <= ly) { ret (ldx < 0)::i32; }
+        ret (ldx > 0)::i32;
+    }
+
+    val dx: Fixed = x - lx;
+    val dy: Fixed = y - ly;
+
+    # try to quickly decide by looking at sign bits
+    if ((ldy ^ ldx ^ dx ^ dy) < 0) {
+        if ((ldy ^ dx) < 0) {
+            # (left is negative)
+            ret 1;
+        }
+        ret 0;
+    }
+
+    val left:  Fixed = fixed.mul(ldy >> 16, dx);
+    val right: Fixed = fixed.mul(dy, ldx >> 16);
+
+    if (right < left) {
+        # front side
+        ret 0;
+    }
+    # back side
+    ret 1;
+}
+
+# R_RenderMaskedSegRange: the see-through middle texture of a two-sided line,
+# drawn after the solid walls, back to front along with the sprites
+fun render_masked_seg_range(r: *Renderer, ds: *DrawSeg, x1: i32, x2: i32) {
+    # calculate light table. use different light tables for horizontal /
+    # vertical / diagonal. diagonal?
+    # OPTIMIZE: get rid of LIGHTSEGSHIFT globally
+    val lv:      *level.Level  = r.lv;
+    val curline: *level.Seg    = ?lv.segs[ds.curline];
+    val front:   *level.Sector = ?lv.sectors[curline.frontsector];
+    val back:    *level.Sector = ?lv.sectors[curline.backsector];
+    val sidedef: *level.Side   = ?lv.sides[curline.sidedef];
+    val texnum:  i32           = r.d.texturetranslation[sidedef.midtex];
+
+    var lightnum: i32 = (front.lightlevel::i32 >> LIGHTSEGSHIFT) + r.extralight;
+
+    if (lv.vertexes[curline.v1].y == lv.vertexes[curline.v2].y) {
+        lightnum = lightnum - 1;
+    }
+    or (lv.vertexes[curline.v1].x == lv.vertexes[curline.v2].x) {
+        lightnum = lightnum + 1;
+    }
+
+    if (lightnum < 0) {
+        lightnum = 0;
+    }
+    or (lightnum >= LIGHTLEVELS) {
+        lightnum = LIGHTLEVELS - 1;
+    }
+    r.walllights = lightnum * MAXLIGHTSCALE;
+
+    r.rw_scalestep = ds.scalestep;
+    r.spryscale    = ds.scale1 + (x1 - ds.x1) * r.rw_scalestep;
+    set_clip(r, ds.sprbottomclip, ds.sprbottombase, 0);
+    set_clip(r, ds.sprtopclip, ds.sprtopbase, 1);
+
+    # find positioning
+    if ((lv.lines[curline.linedef].flags & ML_DONTPEGBOTTOM) != 0) {
+        r.dc_texturemid = back.floorheight;
+        if (front.floorheight > back.floorheight) { r.dc_texturemid = front.floorheight; }
+        r.dc_texturemid = r.dc_texturemid + (r.d.textures[texnum].height << 16) - r.viewz;
+    }
+    or {
+        r.dc_texturemid = back.ceilingheight;
+        if (front.ceilingheight < back.ceilingheight) { r.dc_texturemid = front.ceilingheight; }
+        r.dc_texturemid = r.dc_texturemid - r.viewz;
+    }
+    r.dc_texturemid = r.dc_texturemid + sidedef.rowoffset;
+
+    if (r.fixedcolormap != nil) { r.dc_colormap = r.fixedcolormap; }
+
+    # draw the columns
+    r.dc_x = x1;
+    for (r.dc_x <= x2) {
+        val col: i16 = r.openings[ds.maskedbase + r.dc_x];
+        if (col != MAXSHORT) {
+            if (r.fixedcolormap == nil) {
+                var index: u32 = r.spryscale:~u32 >> 12;
+                if (index >= 48) { index = 47; }
+                r.dc_colormap = ?r.d.colormaps[r.scalelight[r.walllights + index:~i32]];
+            }
+
+            r.sprtopscreen = r.centeryfrac - fixed.mul(r.dc_texturemid, r.spryscale);
+            r.dc_iscale    = (0xffffffff / r.spryscale:~u32):~i32;
+
+            # draw the texture. a masked texture is a single patch, so its
+            # column is the patch's own posts, three bytes before the pixels.
+            val pixels: *u8 = rdata.get_column(r.d, texnum, col::i32);
+            draw_masked_column(r, (pixels::usize - 3)::*u8);
+            r.openings[ds.maskedbase + r.dc_x] = MAXSHORT;
+        }
+        r.spryscale = r.spryscale + r.rw_scalestep;
+        r.dc_x      = r.dc_x + 1;
+    }
+}
+
+# point the masked-column clips at what a drawseg recorded
+fun set_clip(r: *Renderer, kind: u8, base: i32, top: bool) {
+    var p: *i16 = ?r.openings[0];
+    var b: i32  = base;
+    if (kind == CLIP_SCREEN) {
+        p = ?r.screenheightarray[0];
+        b = 0;
+    }
+    or (kind == CLIP_NEGONE) {
+        p = ?r.negonearray[0];
+        b = 0;
+    }
+    if (top) {
+        r.mceilingclip = p;
+        r.mceilingbase = b;
+    }
+    or {
+        r.mfloorclip = p;
+        r.mfloorbase = b;
+    }
+}
+
+# a column's clip value from a drawseg's record
+fun clip_at(r: *Renderer, kind: u8, base: i32, x: i32) i16 {
+    if (kind == CLIP_SCREEN) { ret r.screenheightarray[x]; }
+    if (kind == CLIP_NEGONE) { ret -1; }
+    ret r.openings[base + x];
+}
+
+# R_DrawSprite
+fun draw_sprite(r: *Renderer, spr: *VisSprite) {
+    var x: i32 = spr.x1;
+    for (x <= spr.x2) {
+        r.clipbot[x] = -2;
+        r.cliptop[x] = -2;
+        x            = x + 1;
+    }
+
+    # scan drawsegs from end to start for obscuring segs. the first drawseg
+    # that has a greater scale is the clip seg.
+    var n: i32 = r.numdrawsegs - 1;
+    for (n >= 0) {
+        val ds: *DrawSeg = ?r.drawsegs[n];
+        n = n - 1;
+
+        # determine if the drawseg obscures the sprite
+        if (ds.x1 > spr.x2 || ds.x2 < spr.x1 || (ds.silhouette == 0 && !ds.masked)) {
+            # does not cover sprite
+            cnt;
+        }
+
+        var r1: i32 = ds.x1;
+        if (ds.x1 < spr.x1) { r1 = spr.x1; }
+        var r2: i32 = ds.x2;
+        if (ds.x2 > spr.x2) { r2 = spr.x2; }
+
+        var lowscale: Fixed = ds.scale1;
+        var scale:    Fixed = ds.scale2;
+        if (ds.scale1 > ds.scale2) {
+            lowscale = ds.scale2;
+            scale    = ds.scale1;
+        }
+
+        if (scale < spr.scale || (lowscale < spr.scale && point_on_seg_side(r, spr.gx, spr.gy, ds.curline) == 0)) {
+            # masked mid texture?
+            if (ds.masked) { render_masked_seg_range(r, ds, r1, r2); }
+            # seg is behind sprite
+            cnt;
+        }
+
+        # clip this piece of the sprite
+        var silhouette: i32 = ds.silhouette;
+
+        if (spr.gz >= ds.bsilheight)  { silhouette = silhouette & ~SIL_BOTTOM; }
+        if (spr.gzt <= ds.tsilheight) { silhouette = silhouette & ~SIL_TOP; }
+
+        if ((silhouette & SIL_BOTTOM) != 0) {
+            # bottom sil
+            x = r1;
+            for (x <= r2) {
+                if (r.clipbot[x] == -2) { r.clipbot[x] = clip_at(r, ds.sprbottomclip, ds.sprbottombase, x); }
+                x = x + 1;
+            }
+        }
+        if ((silhouette & SIL_TOP) != 0) {
+            # top sil
+            x = r1;
+            for (x <= r2) {
+                if (r.cliptop[x] == -2) { r.cliptop[x] = clip_at(r, ds.sprtopclip, ds.sprtopbase, x); }
+                x = x + 1;
+            }
+        }
+    }
+
+    # all clipping has been performed, so draw the sprite. check for
+    # unclipped columns.
+    x = spr.x1;
+    for (x <= spr.x2) {
+        if (r.clipbot[x] == -2) { r.clipbot[x] = r.viewheight::i16; }
+        if (r.cliptop[x] == -2) { r.cliptop[x] = -1; }
+        x = x + 1;
+    }
+
+    r.mfloorclip   = ?r.clipbot[0];
+    r.mfloorbase   = 0;
+    r.mceilingclip = ?r.cliptop[0];
+    r.mceilingbase = 0;
+    draw_vis_sprite(r, spr);
+}
+
+# R_DrawMasked: sprites and see-through walls, farthest first, then the
+# player's weapon over everything
+fun draw_masked(r: *Renderer, player: *defs.Player) {
+    # R_SortVisSprites: draw in order of increasing scale. of two at the same
+    # scale the earlier found is drawn first, as the original's list sort
+    # leaves them.
+    var done: i32 = 0;
+    for (done < r.numvissprites) {
+        var best:      i32   = -1;
+        var bestscale: Fixed = MAXINT;
+        var i:         i32   = 0;
+        for (i < r.numvissprites) {
+            if (!r.vissprites[i].drawn && r.vissprites[i].scale < bestscale) {
+                bestscale = r.vissprites[i].scale;
+                best      = i;
+            }
+            i = i + 1;
+        }
+        if (best < 0) { brk; }
+        r.vissprites[best].drawn = 1;
+        draw_sprite(r, ?r.vissprites[best]);
+        done = done + 1;
+    }
+
+    # render any remaining masked mid textures
+    var n: i32 = r.numdrawsegs - 1;
+    for (n >= 0) {
+        val ds: *DrawSeg = ?r.drawsegs[n];
+        if (ds.masked) { render_masked_seg_range(r, ds, ds.x1, ds.x2); }
+        n = n - 1;
+    }
+
+    # draw the psprites on top of everything
+    if (player != nil) { draw_player_sprites(r, player); }
+}
+
+# ------------------------------------------------------------------ frames
+
+# why a renderer could not be made
+pub tag RenderError: u8 {
+    # the WAD lacks the sky flat, the first episode's sky texture, or its
+    # sprites
+    sky;
+    memory;
+}
+
+# make a renderer for a map, at the standard view size with the status bar
+# ---
+# a:   allocator for the renderer's state
+# d:   the WAD's graphics
+# lv:  the map, already given its texture numbers by rdata.bind
+# ret: the renderer, or why there is none
+pub fun make(a: *allocator.Allocator, d: *rdata.Data, lv: *level.Level) res[*Renderer, RenderError] {
+    val got: res[*Renderer, allocator.Error] = allocator.zallocate[Renderer](a, 1);
+    if (sel got.err) { ret res[*Renderer, RenderError].err{RenderError.memory{}}; }
+    val r: *Renderer = got.ok;
+
+    r.d             = d;
+    r.lv            = lv;
+    r.skyflatnum    = rdata.flat_num(d, "F_SKY1");
+    r.skytexture    = rdata.texture_num(d, "SKY1");
+    r.skytexturemid = 100 * FRACUNIT;
+    if (r.skyflatnum < 0 || r.skytexture < 0) { ret res[*Renderer, RenderError].err{RenderError.sky{}}; }
+
+    set_view_size(r, 10);
+    if (!init_sprites(a, r)) { ret res[*Renderer, RenderError].err{RenderError.sky{}}; }
+    ret res[*Renderer, RenderError].ok{r};
+}
+
+# the walls and planes of a frame, from the eye already set in r
+fun render_world(r: *Renderer) {
+    r.viewsin = sine(r.viewangle >> t.ANGLETOFINESHIFT);
+    r.viewcos = cosine(r.viewangle >> t.ANGLETOFINESHIFT);
+
+    clear_clip_segs(r);
+    r.numdrawsegs   = 0;
+    r.numvissprites = 0;
+    clear_planes(r);
+
+    # the head node is the last node output
+    render_bsp_node(r, r.lv.numnodes - 1);
+    draw_planes(r);
+}
+
+# draw the world from a point into r.screen, with nothing in it but the map
+# ---
+# r:     the renderer
+# x:     eye position
+# y:     eye position
+# z:     eye height
+# angle: direction of view
+pub fun render(r: *Renderer, x: Fixed, y: Fixed, z: Fixed, angle: u32) {
+    r.g             = nil;
+    r.viewx         = x;
+    r.viewy         = y;
+    r.viewz         = z;
+    r.viewangle     = angle;
+    r.extralight    = 0;
+    r.fixedcolormap = nil;
+    render_world(r);
+}
+
+# R_RenderPlayerView: draw what a player sees into r.screen, with the things
+# in the world and the weapon in hand
+# ---
+# r:      the renderer
+# g:      the game the player is in
+# player: whose eyes
+pub fun render_player_view(r: *Renderer, g: *defs.Game, player: *defs.Player) {
+    # R_SetupFrame
+    r.g          = g;
+    r.viewx      = player.mo.x;
+    r.viewy      = player.mo.y;
+    r.viewangle  = player.mo.angle;
+    r.extralight = player.extralight;
+    r.viewz      = player.viewz;
+
+    r.fixedcolormap = nil;
+    if (player.fixedcolormap != 0) { r.fixedcolormap = ?r.d.colormaps[player.fixedcolormap * 256]; }
+
+    # the renderer and the simulation share this counter; each sector's
+    # things are projected once per frame by comparing against it
+    g.validcount = g.validcount + 1;
+
+    render_world(r);
+    draw_masked(r, player);
+}

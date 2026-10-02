@@ -1,0 +1,76 @@
+# 16.16 fixed-point arithmetic, the number system of the whole simulation
+#
+# Ported from m_fixed.c. The division follows the DOS executable (a 64-bit
+# integer divide), not linuxdoom's detour through a double: the recorded demos
+# came from the DOS build, and they are the oracle.
+
+pub def Fixed: i32;
+
+pub val FRACBITS: i32   = 16;
+pub val FRACUNIT: Fixed = 65536;
+
+val MAXINT: i32 = 0x7fffffff;
+val MININT: i32 = -0x7fffffff - 1;
+
+# C's abs() on a 32-bit int, which leaves the most negative value negative
+fun abs32(x: i32) i32 {
+    if (x < 0) { ret 0 - x; }
+    ret x;
+}
+
+# multiply two fixed-point numbers
+# ---
+# a:   left operand
+# b:   right operand
+# ret: the product, truncated toward negative infinity
+pub fun mul(a: Fixed, b: Fixed) Fixed {
+    ret ((a::i64 * b::i64) >> 16)::i32;
+}
+
+# divide two fixed-point numbers, saturating where the quotient cannot fit
+# ---
+# a:   dividend
+# b:   divisor
+# ret: the quotient, or the largest value of the right sign on overflow
+pub fun div(a: Fixed, b: Fixed) Fixed {
+    if ((abs32(a) >> 14) >= abs32(b)) {
+        if ((a ^ b) < 0) { ret MININT; }
+        ret MAXINT;
+    }
+    ret ((a::i64 << 16) / b::i64)::i32;
+}
+
+test mul__units {
+    if (mul(FRACUNIT, FRACUNIT) != FRACUNIT)                     { ret 1; }
+    if (mul(3 * FRACUNIT, FRACUNIT / 2) != 3 * 32768)            { ret 2; }
+    if (mul(0 - 2 * FRACUNIT, 3 * FRACUNIT) != 0 - 6 * FRACUNIT) { ret 3; }
+    ret 0;
+}
+
+test mul__rounds_toward_negative_infinity {
+    # -1 * 1.0 is exactly -1; -1 * 0.5 is -0.5 raw units, which floors to -1
+    if (mul(0 - 1, FRACUNIT) != 0 - 1)     { ret 1; }
+    if (mul(0 - 1, FRACUNIT / 2) != 0 - 1) { ret 2; }
+    if (mul(1, FRACUNIT / 2) != 0)         { ret 3; }
+    ret 0;
+}
+
+test div__units {
+    if (div(FRACUNIT, FRACUNIT) != FRACUNIT)              { ret 1; }
+    if (div(FRACUNIT, 2 * FRACUNIT) != FRACUNIT / 2)      { ret 2; }
+    if (div(0 - 3 * FRACUNIT, 2 * FRACUNIT) != 0 - 98304) { ret 3; }
+    # integer division truncates toward zero, unlike the multiply's shift
+    if (div(0 - 1, 2 * FRACUNIT) != 0) { ret 4; }
+    ret 0;
+}
+
+test div__saturates {
+    if (div(FRACUNIT, 0) != MAXINT)           { ret 1; }
+    if (div(0 - FRACUNIT, 0) != MININT)       { ret 2; }
+    if (div(100 * FRACUNIT, 1) != MAXINT)     { ret 3; }
+    if (div(100 * FRACUNIT, 0 - 1) != MININT) { ret 4; }
+    # the most negative dividend stays negative through abs, so it does not
+    # saturate and the divide itself must not trap
+    if (div(MININT, FRACUNIT) != MININT) { ret 5; }
+    ret 0;
+}

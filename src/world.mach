@@ -1,0 +1,2362 @@
+# the core of the simulation: things that exist, how they move and collide,
+# how they are hurt, and what a player picks up
+#
+# Ported from p_mobj.c, p_map.c and p_inter.c, with the parts of p_tick.c,
+# p_pspr.c and p_enemy.c that those three cannot do without. In C they are
+# separate files that call each other in a circle: moving a thing can damage
+# another, damage kills, death spawns things, and spawning tries a move. Mach
+# modules cannot import in a circle, so the circle lives in this one module.
+#
+# What stays out is reached through the two hooks in defs.mach: the action a
+# state runs on entry, and the special a line sets off.
+
+use std.types.bool.bool;
+use std.types.string.str;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.defs.Intercept;
+use doom.defs.Mobj;
+use doom.defs.Player;
+use doom.defs.Pspdef;
+use doom.defs.Thinker;
+use doom.fixed;
+use doom.fixed.Fixed;
+use doom.info;
+use doom.level;
+use doom.maputl;
+use doom.render;
+use t: doom.tables;
+
+val STOPSPEED: Fixed = 0x1000;
+val FRICTION:  Fixed = 0xe800;
+
+val BONUSADD: i32 = 6;
+
+pub val WEAPONBOTTOM: Fixed = 128 * 65536;
+pub val WEAPONTOP:    Fixed = 32 * 65536;
+pub val BFGCELLS:     i32   = 40;
+
+val MAXAMMO:  [4]i32 = [4]i32{200, 50, 300, 50};
+val CLIPAMMO: [4]i32 = [4]i32{10, 4, 20, 1};
+
+# per weapon: ammunition, then the up, down, ready, attack and flash states
+val WEAPONINFO: [54]i32 = [54]i32{
+    defs.AM_NOAMMO, info.S_PUNCHUP, info.S_PUNCHDOWN, info.S_PUNCH, info.S_PUNCH1, info.S_NULL,
+    defs.AM_CLIP, info.S_PISTOLUP, info.S_PISTOLDOWN, info.S_PISTOL, info.S_PISTOL1, info.S_PISTOLFLASH,
+    defs.AM_SHELL, info.S_SGUNUP, info.S_SGUNDOWN, info.S_SGUN, info.S_SGUN1, info.S_SGUNFLASH1,
+    defs.AM_CLIP, info.S_CHAINUP, info.S_CHAINDOWN, info.S_CHAIN, info.S_CHAIN1, info.S_CHAINFLASH1,
+    defs.AM_MISL, info.S_MISSILEUP, info.S_MISSILEDOWN, info.S_MISSILE, info.S_MISSILE1, info.S_MISSILEFLASH1,
+    defs.AM_CELL, info.S_PLASMAUP, info.S_PLASMADOWN, info.S_PLASMA, info.S_PLASMA1, info.S_PLASMAFLASH1,
+    defs.AM_CELL, info.S_BFGUP, info.S_BFGDOWN, info.S_BFG, info.S_BFG1, info.S_BFGFLASH1,
+    defs.AM_NOAMMO, info.S_SAWUP, info.S_SAWDOWN, info.S_SAW, info.S_SAW1, info.S_NULL,
+    defs.AM_SHELL, info.S_DSGUNUP, info.S_DSGUNDOWN, info.S_DSGUN, info.S_DSGUN1, info.S_DSGUNFLASH1
+};
+
+pub val WI_AMMO:  i32 = 0;
+pub val WI_UP:    i32 = 1;
+pub val WI_DOWN:  i32 = 2;
+pub val WI_READY: i32 = 3;
+pub val WI_ATK:   i32 = 4;
+pub val WI_FLASH: i32 = 5;
+
+# a field of a weapon's row
+pub fun weaponinfo(weapon: i32, field: i32) i32 {
+    ret WEAPONINFO[weapon * 6 + field];
+}
+
+fun abs32(x: i32) i32 {
+    if (x < 0) { ret 0 - x; }
+    ret x;
+}
+
+# the difference of two random numbers, the first drawn first. C leaves the
+# order of P_Random() - P_Random() to the compiler; the DOS build drew the
+# left one first.
+pub fun sub_random(g: *Game) i32 {
+    val r: i32 = defs.p_random(g);
+    ret r - defs.p_random(g);
+}
+
+# R_PointToAngle2: the angle from one point to another
+pub fun point_to_angle2(x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed) u32 {
+    var x: i32 = x2 - x1;
+    var y: i32 = y2 - y1;
+    if (x == 0 && y == 0) { ret 0; }
+
+    if (x >= 0) {
+        if (y >= 0) {
+            if (x > y) { ret t.TANTOANGLE[t.slope_div(y:~u32, x:~u32)]; }
+            ret t.ANG90 - 1 - t.TANTOANGLE[t.slope_div(x:~u32, y:~u32)];
+        }
+        y = 0 - y;
+        if (x > y) { ret 0 - t.TANTOANGLE[t.slope_div(y:~u32, x:~u32)]; }
+        ret t.ANG270 + t.TANTOANGLE[t.slope_div(x:~u32, y:~u32)];
+    }
+
+    x = 0 - x;
+    if (y >= 0) {
+        if (x > y) { ret t.ANG180 - 1 - t.TANTOANGLE[t.slope_div(y:~u32, x:~u32)]; }
+        ret t.ANG90 + t.TANTOANGLE[t.slope_div(x:~u32, y:~u32)];
+    }
+    y = 0 - y;
+    if (x > y) { ret t.ANG180 + t.TANTOANGLE[t.slope_div(y:~u32, x:~u32)]; }
+    ret t.ANG270 - 1 - t.TANTOANGLE[t.slope_div(x:~u32, y:~u32)];
+}
+
+fun sine(fine: u32) Fixed {
+    ret t.FINESINE[fine];
+}
+
+fun cosine(fine: u32) Fixed {
+    ret t.FINESINE[fine + 2048];
+}
+
+# ----------------------------------------------------------------- p_tick.c
+
+# P_InitThinkers
+pub fun init_thinkers(g: *Game) {
+    g.thinkercap.prev = ?g.thinkercap;
+    g.thinkercap.next = ?g.thinkercap;
+}
+
+# P_AddThinker: adds a new thinker at the end of the list
+pub fun add_thinker(g: *Game, thinker: *Thinker) {
+    g.thinkercap.prev.next = thinker;
+    thinker.next           = ?g.thinkercap;
+    thinker.prev           = g.thinkercap.prev;
+    g.thinkercap.prev      = thinker;
+}
+
+# P_RemoveThinker: deallocation is lazy; it is unlinked when its turn comes up
+pub fun remove_thinker(thinker: *Thinker) {
+    thinker.kind = defs.TH_REMOVED;
+}
+
+# ----------------------------------------------------------------- p_mobj.c
+
+# P_SetMobjState
+# ---
+# ret: true if the mobj is still present
+pub fun set_mobj_state(g: *Game, mobj: *Mobj, state_in: i32) bool {
+    var state: i32 = state_in;
+    for {
+        if (state == info.S_NULL) {
+            mobj.state = info.S_NULL;
+            remove_mobj(g, mobj);
+            ret 0;
+        }
+
+        mobj.state  = state;
+        mobj.tics   = info.st_tics(state);
+        mobj.sprite = info.st_sprite(state);
+        mobj.frame  = info.st_frame(state);
+
+        # modified handling: call action functions when the state is set
+        val action: i32 = info.st_action(state);
+        if (action != info.A_NULL) { g.run_action(g, mobj, nil, nil, action); }
+
+        state = info.st_next(state);
+        if (mobj.tics != 0) { brk; }
+    }
+    ret 1;
+}
+
+# P_ExplodeMissile
+pub fun explode_missile(g: *Game, mo: *Mobj) {
+    mo.momx = 0;
+    mo.momy = 0;
+    mo.momz = 0;
+
+    set_mobj_state(g, mo, info.mi(mo.kind, info.MI_DEATHSTATE));
+
+    mo.tics = mo.tics - (defs.p_random(g) & 3);
+    if (mo.tics < 1) { mo.tics = 1; }
+
+    mo.flags = mo.flags & ~defs.MF_MISSILE;
+
+    if (info.mi(mo.kind, info.MI_DEATHSOUND) != 0) { defs.sound(g, mo, info.mi(mo.kind, info.MI_DEATHSOUND)); }
+}
+
+# P_XYMovement
+fun xy_movement(g: *Game, mo: *Mobj) {
+    if (mo.momx == 0 && mo.momy == 0) {
+        if ((mo.flags & defs.MF_SKULLFLY) != 0) {
+            # the skull slammed into something
+            mo.flags = mo.flags & ~defs.MF_SKULLFLY;
+            mo.momx  = 0;
+            mo.momy  = 0;
+            mo.momz  = 0;
+            set_mobj_state(g, mo, info.mi(mo.kind, info.MI_SPAWNSTATE));
+        }
+        ret;
+    }
+
+    val player: *Player = mo.player;
+
+    if (mo.momx > defs.MAXMOVE) {
+        mo.momx = defs.MAXMOVE;
+    }
+    or (mo.momx < 0 - defs.MAXMOVE) {
+        mo.momx = 0 - defs.MAXMOVE;
+    }
+
+    if (mo.momy > defs.MAXMOVE) {
+        mo.momy = defs.MAXMOVE;
+    }
+    or (mo.momy < 0 - defs.MAXMOVE) {
+        mo.momy = 0 - defs.MAXMOVE;
+    }
+
+    var xmove: Fixed = mo.momx;
+    var ymove: Fixed = mo.momy;
+
+    for {
+        var ptryx: Fixed = 0;
+        var ptryy: Fixed = 0;
+        if (xmove > defs.MAXMOVE / 2 || ymove > defs.MAXMOVE / 2) {
+            ptryx = mo.x + xmove / 2;
+            ptryy = mo.y + ymove / 2;
+            xmove = xmove >> 1;
+            ymove = ymove >> 1;
+        }
+        or {
+            ptryx = mo.x + xmove;
+            ptryy = mo.y + ymove;
+            xmove = 0;
+            ymove = 0;
+        }
+
+        if (!try_move(g, mo, ptryx, ptryy)) {
+            # blocked move
+            if (mo.player != nil) {
+                # try to slide along it
+                slide_move(g, mo);
+            }
+            or ((mo.flags & defs.MF_MISSILE) != 0) {
+                # explode a missile
+                if (g.ceilingline != level.NONE) {
+                    val back: i32 = g.lv.lines[g.ceilingline].backsector;
+                    if (back != level.NONE && g.lv.sectors[back].ceilingflat == g.skyflatnum) {
+                        # hack to prevent missiles exploding against the sky.
+                        # does not handle sky floors.
+                        remove_mobj(g, mo);
+                        ret;
+                    }
+                }
+                explode_missile(g, mo);
+            }
+            or {
+                mo.momx = 0;
+                mo.momy = 0;
+            }
+        }
+        if (xmove == 0 && ymove == 0) { brk; }
+    }
+
+    # slow down
+    if (player != nil && (player.cheats & defs.CF_NOMOMENTUM) != 0) {
+        # debug option for no sliding at all
+        mo.momx = 0;
+        mo.momy = 0;
+        ret;
+    }
+
+    # no friction for missiles ever
+    if ((mo.flags & (defs.MF_MISSILE | defs.MF_SKULLFLY)) != 0) { ret; }
+
+    # no friction when airborne
+    if (mo.z > mo.floorz) { ret; }
+
+    if ((mo.flags & defs.MF_CORPSE) != 0) {
+        # do not stop sliding if halfway off a step with some momentum
+        if (mo.momx > 65536 / 4 || mo.momx < 0 - 65536 / 4 || mo.momy > 65536 / 4 || mo.momy < 0 - 65536 / 4) {
+            if (mo.floorz != defs.sector_of(g, mo).floorheight) { ret; }
+        }
+    }
+
+    if (mo.momx > 0 - STOPSPEED && mo.momx < STOPSPEED && mo.momy > 0 - STOPSPEED && mo.momy < STOPSPEED &&
+        (player == nil || (player.cmd.forwardmove == 0 && player.cmd.sidemove == 0))) {
+        # if in a walking frame, stop moving
+        if (player != nil && (player.mo.state - info.S_PLAY_RUN1):~u32 < 4) {
+            set_mobj_state(g, player.mo, info.S_PLAY);
+        }
+        mo.momx = 0;
+        mo.momy = 0;
+    }
+    or {
+        mo.momx = fixed.mul(mo.momx, FRICTION);
+        mo.momy = fixed.mul(mo.momy, FRICTION);
+    }
+}
+
+# P_ZMovement
+fun z_movement(g: *Game, mo: *Mobj) {
+    # check for smooth step up
+    if (mo.player != nil && mo.z < mo.floorz) {
+        mo.player.viewheight      = mo.player.viewheight - (mo.floorz - mo.z);
+        mo.player.deltaviewheight = (defs.VIEWHEIGHT - mo.player.viewheight) >> 3;
+    }
+
+    # adjust height
+    mo.z = mo.z + mo.momz;
+
+    if ((mo.flags & defs.MF_FLOAT) != 0 && mo.target != nil) {
+        # float down towards target if too close
+        if ((mo.flags & defs.MF_SKULLFLY) == 0 && (mo.flags & defs.MF_INFLOAT) == 0) {
+            val dist:  Fixed = maputl.aprox_distance(mo.x - mo.target.x, mo.y - mo.target.y);
+            val delta: Fixed = (mo.target.z + (mo.height >> 1)) - mo.z;
+
+            if (delta < 0 && dist < 0 - (delta * 3)) {
+                mo.z = mo.z - defs.FLOATSPEED;
+            }
+            or (delta > 0 && dist < (delta * 3)) {
+                mo.z = mo.z + defs.FLOATSPEED;
+            }
+        }
+    }
+
+    # clip movement
+    if (mo.z <= mo.floorz) {
+        # hit the floor
+
+        # the skull-fly momentum flip was meant to bounce lost souls off
+        # floors; done before the momentum is zeroed, as the DOS version does
+        if ((mo.flags & defs.MF_SKULLFLY) != 0) {
+            # the skull slammed into something
+            mo.momz = 0 - mo.momz;
+        }
+
+        if (mo.momz < 0) {
+            if (mo.player != nil && mo.momz < 0 - defs.GRAVITY * 8) {
+                # squat down. decrease viewheight for a moment after hitting
+                # the ground (hard), and utter appropriate sound.
+                mo.player.deltaviewheight = mo.momz >> 3;
+                defs.sound(g, mo, info.SFX_OOF);
+            }
+            mo.momz = 0;
+        }
+        mo.z = mo.floorz;
+
+        if ((mo.flags & defs.MF_MISSILE) != 0 && (mo.flags & defs.MF_NOCLIP) == 0) {
+            explode_missile(g, mo);
+            ret;
+        }
+    }
+    or ((mo.flags & defs.MF_NOGRAVITY) == 0) {
+        if (mo.momz == 0) {
+            mo.momz = 0 - defs.GRAVITY * 2;
+        }
+        or {
+            mo.momz = mo.momz - defs.GRAVITY;
+        }
+    }
+
+    if (mo.z + mo.height > mo.ceilingz) {
+        # hit the ceiling
+        if (mo.momz > 0) { mo.momz = 0; }
+        mo.z = mo.ceilingz - mo.height;
+
+        if ((mo.flags & defs.MF_SKULLFLY) != 0) {
+            # the skull slammed into something
+            mo.momz = 0 - mo.momz;
+        }
+
+        if ((mo.flags & defs.MF_MISSILE) != 0 && (mo.flags & defs.MF_NOCLIP) == 0) {
+            explode_missile(g, mo);
+            ret;
+        }
+    }
+}
+
+# P_NightmareRespawn
+fun nightmare_respawn(g: *Game, mobj: *Mobj) {
+    val x: Fixed = mobj.spawnpoint.x::i32 << 16;
+    val y: Fixed = mobj.spawnpoint.y::i32 << 16;
+
+    # something is occupying its position?
+    if (!check_position(g, mobj, x, y)) {
+        # no respawn
+        ret;
+    }
+
+    # spawn a teleport fog at the old spot, because of removal of the body?
+    var mo: *Mobj = spawn_mobj(g, mobj.x, mobj.y, defs.sector_of(g, mobj).floorheight, info.MT_TFOG);
+    # initiate teleport sound
+    defs.sound(g, mo, info.SFX_TELEPT);
+
+    # spawn a teleport fog at the new spot
+    val ss: i32 = render.point_in_subsector(g.lv, x, y);
+    mo = spawn_mobj(g, x, y, g.lv.sectors[g.lv.subsectors[ss].sector].floorheight, info.MT_TFOG);
+    defs.sound(g, mo, info.SFX_TELEPT);
+
+    # spawn the new monster; spawn it at the ceiling or the floor
+    var z: Fixed = defs.ONFLOORZ;
+    if ((info.mi(mobj.kind, info.MI_FLAGS) & defs.MF_SPAWNCEILING) != 0) { z = defs.ONCEILINGZ; }
+
+    # inherit attributes from deceased one
+    mo            = spawn_mobj(g, x, y, z, mobj.kind);
+    mo.spawnpoint = mobj.spawnpoint;
+    mo.angle      = t.ANG45 * (mobj.spawnpoint.angle::i32 / 45):~u32;
+
+    if ((mobj.spawnpoint.options::i32 & defs.MTF_AMBUSH) != 0) { mo.flags = mo.flags | defs.MF_AMBUSH; }
+
+    mo.reactiontime = 18;
+
+    # remove the old monster
+    remove_mobj(g, mobj);
+}
+
+# P_MobjThinker
+pub fun mobj_thinker(g: *Game, mobj: *Mobj) {
+    # momentum movement
+    if (mobj.momx != 0 || mobj.momy != 0 || (mobj.flags & defs.MF_SKULLFLY) != 0) {
+        xy_movement(g, mobj);
+        if (mobj.thinker.kind == defs.TH_REMOVED) {
+            # mobj was removed
+            ret;
+        }
+    }
+    if (mobj.z != mobj.floorz || mobj.momz != 0) {
+        z_movement(g, mobj);
+        if (mobj.thinker.kind == defs.TH_REMOVED) {
+            # mobj was removed
+            ret;
+        }
+    }
+
+    # cycle through states, calling action functions at transitions
+    if (mobj.tics != -1) {
+        mobj.tics = mobj.tics - 1;
+
+        # you can cycle through multiple states in a tic
+        if (mobj.tics == 0) { set_mobj_state(g, mobj, info.st_next(mobj.state)); }
+    }
+    or {
+        # check for nightmare respawn
+        if ((mobj.flags & defs.MF_COUNTKILL) == 0) { ret; }
+        if (!g.respawnmonsters)                    { ret; }
+
+        mobj.movecount = mobj.movecount + 1;
+        if (mobj.movecount < 12 * 35) { ret; }
+        if ((g.leveltime & 31) != 0)  { ret; }
+        if (defs.p_random(g) > 4)     { ret; }
+
+        nightmare_respawn(g, mobj);
+    }
+}
+
+# P_SpawnMobj
+pub fun spawn_mobj(g: *Game, x: Fixed, y: Fixed, z: Fixed, kind: i32) *Mobj {
+    val mobj: *Mobj = defs.alloc(g, $size_of(Mobj)):~*Mobj;
+
+    mobj.kind   = kind;
+    mobj.x      = x;
+    mobj.y      = y;
+    mobj.radius = info.mi(kind, info.MI_RADIUS);
+    mobj.height = info.mi(kind, info.MI_HEIGHT);
+    mobj.flags  = info.mi(kind, info.MI_FLAGS);
+    mobj.health = info.mi(kind, info.MI_SPAWNHEALTH);
+
+    if (g.gameskill != defs.SK_NIGHTMARE) { mobj.reactiontime = info.mi(kind, info.MI_REACTIONTIME); }
+
+    mobj.lastlook = defs.p_random(g) % defs.MAXPLAYERS;
+
+    # do not set the state with P_SetMobjState, because action routines can
+    # not be called yet
+    val st: i32 = info.mi(kind, info.MI_SPAWNSTATE);
+    mobj.state  = st;
+    mobj.tics   = info.st_tics(st);
+    mobj.sprite = info.st_sprite(st);
+    mobj.frame  = info.st_frame(st);
+
+    # set subsector and/or block links
+    maputl.set_thing_position(g, mobj);
+
+    mobj.floorz   = defs.sector_of(g, mobj).floorheight;
+    mobj.ceilingz = defs.sector_of(g, mobj).ceilingheight;
+
+    if (z == defs.ONFLOORZ) {
+        mobj.z = mobj.floorz;
+    }
+    or (z == defs.ONCEILINGZ) {
+        mobj.z = mobj.ceilingz - info.mi(kind, info.MI_HEIGHT);
+    }
+    or {
+        mobj.z = z;
+    }
+
+    mobj.thinker.kind = defs.TH_MOBJ;
+    add_thinker(g, ?mobj.thinker);
+    ret mobj;
+}
+
+# P_RemoveMobj
+pub fun remove_mobj(g: *Game, mobj: *Mobj) {
+    if ((mobj.flags & defs.MF_SPECIAL) != 0 && (mobj.flags & defs.MF_DROPPED) == 0 && mobj.kind != info.MT_INV &&
+        mobj.kind != info.MT_INS) {
+        g.itemrespawnque[g.iquehead]  = mobj.spawnpoint;
+        g.itemrespawntime[g.iquehead] = g.leveltime;
+        g.iquehead                    = (g.iquehead + 1) & (defs.ITEMQUESIZE - 1);
+
+        # lose one off the end?
+        if (g.iquehead == g.iquetail) { g.iquetail = (g.iquetail + 1) & (defs.ITEMQUESIZE - 1); }
+    }
+
+    # unlink from sector and block lists
+    maputl.unset_thing_position(g, mobj);
+
+    # free block
+    remove_thinker(?mobj.thinker);
+}
+
+# G_PlayerReborn: called after a player dies; almost everything is cleared
+# and initialized
+pub fun player_reborn(g: *Game, player: i32) {
+    val p:           *Player = ?g.players[player];
+    val killcount:   i32     = p.killcount;
+    val itemcount:   i32     = p.itemcount;
+    val secretcount: i32     = p.secretcount;
+
+    var blank: Player;
+    @p = blank;
+
+    p.killcount   = killcount;
+    p.itemcount   = itemcount;
+    p.secretcount = secretcount;
+
+    # don't do anything immediately
+    p.usedown                     = 1;
+    p.attackdown                  = 1;
+    p.playerstate                 = defs.PST_LIVE;
+    p.health                      = defs.MAXHEALTH;
+    p.readyweapon                 = defs.WP_PISTOL;
+    p.pendingweapon               = defs.WP_PISTOL;
+    p.weaponowned[defs.WP_FIST]   = 1;
+    p.weaponowned[defs.WP_PISTOL] = 1;
+    p.ammo[defs.AM_CLIP]          = 50;
+
+    var i: i32 = 0;
+    for (i < defs.NUMAMMO) {
+        p.maxammo[i] = MAXAMMO[i];
+        i            = i + 1;
+    }
+}
+
+# P_SpawnPlayer: called when a player is spawned on the level. most of the
+# player structure stays unchanged between levels.
+pub fun spawn_player(g: *Game, mthing: *level.Thing) {
+    val num: i32 = mthing.kind::i32 - 1;
+
+    # not playing?
+    if (!g.playeringame[num]) { ret; }
+
+    val p: *Player = ?g.players[num];
+    if (p.playerstate == defs.PST_REBORN) { player_reborn(g, num); }
+
+    val x:    Fixed = mthing.x::i32 << 16;
+    val y:    Fixed = mthing.y::i32 << 16;
+    val mobj: *Mobj = spawn_mobj(g, x, y, defs.ONFLOORZ, info.MT_PLAYER);
+
+    # set color translations for player sprites
+    if (mthing.kind > 1) { mobj.flags = mobj.flags | (num << defs.MF_TRANSSHIFT); }
+
+    mobj.angle  = t.ANG45 * (mthing.angle::i32 / 45):~u32;
+    mobj.player = p;
+    mobj.health = p.health;
+
+    p.mo            = mobj;
+    p.playerstate   = defs.PST_LIVE;
+    p.refire        = 0;
+    p.message       = nil;
+    p.damagecount   = 0;
+    p.bonuscount    = 0;
+    p.extralight    = 0;
+    p.fixedcolormap = 0;
+    p.viewheight    = defs.VIEWHEIGHT;
+
+    # setup gun psprite
+    setup_psprites(g, p);
+}
+
+# P_SpawnMapThing
+pub fun spawn_map_thing(g: *Game, mthing: *level.Thing) {
+    val kind: i32 = mthing.kind::i32;
+
+    # count deathmatch start positions
+    if (kind == 11) { ret; }
+
+    # check for players specially
+    if (kind <= 4) {
+        if (kind < 1) { ret; }
+        # save spots for respawning in network games
+        g.playerstarts[kind - 1] = @mthing;
+        if (g.deathmatch == 0) { spawn_player(g, mthing); }
+        ret;
+    }
+
+    # check for appropriate skill level
+    if (!g.netgame && (mthing.options::i32 & 16) != 0) { ret; }
+
+    var bit: i32 = 1 << (g.gameskill - 1);
+    if (g.gameskill == defs.SK_BABY) {
+        bit = 1;
+    }
+    or (g.gameskill == defs.SK_NIGHTMARE) {
+        bit = 4;
+    }
+
+    if ((mthing.options::i32 & bit) == 0) { ret; }
+
+    # find which type to spawn
+    var i: i32 = 0;
+    for (i < info.NUMMOBJTYPES) {
+        if (kind == info.mi(i, info.MI_DOOMEDNUM)) { brk; }
+        i = i + 1;
+    }
+
+    # the original stops with an error on a type it does not know
+    if (i == info.NUMMOBJTYPES) { ret; }
+
+    # don't spawn keycards and players in deathmatch
+    if (g.deathmatch != 0 && (info.mi(i, info.MI_FLAGS) & defs.MF_NOTDMATCH) != 0) { ret; }
+
+    # don't spawn any monsters if -nomonsters
+    if (g.nomonsters && (i == info.MT_SKULL || (info.mi(i, info.MI_FLAGS) & defs.MF_COUNTKILL) != 0)) { ret; }
+
+    # spawn it
+    val x: Fixed = mthing.x::i32 << 16;
+    val y: Fixed = mthing.y::i32 << 16;
+    var z: Fixed = defs.ONFLOORZ;
+    if ((info.mi(i, info.MI_FLAGS) & defs.MF_SPAWNCEILING) != 0) { z = defs.ONCEILINGZ; }
+
+    val mobj: *Mobj = spawn_mobj(g, x, y, z, i);
+    mobj.spawnpoint = @mthing;
+
+    if (mobj.tics > 0)                         { mobj.tics = 1 + (defs.p_random(g) % mobj.tics); }
+    if ((mobj.flags & defs.MF_COUNTKILL) != 0) { g.totalkills = g.totalkills + 1; }
+    if ((mobj.flags & defs.MF_COUNTITEM) != 0) { g.totalitems = g.totalitems + 1; }
+
+    mobj.angle = t.ANG45 * (mthing.angle::i32 / 45):~u32;
+    if ((mthing.options::i32 & defs.MTF_AMBUSH) != 0) { mobj.flags = mobj.flags | defs.MF_AMBUSH; }
+}
+
+# P_SpawnPuff
+pub fun spawn_puff(g: *Game, x: Fixed, y: Fixed, z_in: Fixed) {
+    val z:  Fixed = z_in + (sub_random(g) << 10);
+    val th: *Mobj = spawn_mobj(g, x, y, z, info.MT_PUFF);
+    th.momz = 65536;
+    th.tics = th.tics - (defs.p_random(g) & 3);
+    if (th.tics < 1) { th.tics = 1; }
+
+    # don't make punches spark on the wall
+    if (g.attackrange == defs.MELEERANGE) { set_mobj_state(g, th, info.S_PUFF3); }
+}
+
+# P_SpawnBlood
+pub fun spawn_blood(g: *Game, x: Fixed, y: Fixed, z_in: Fixed, damage: i32) {
+    val z:  Fixed = z_in + (sub_random(g) << 10);
+    val th: *Mobj = spawn_mobj(g, x, y, z, info.MT_BLOOD);
+    th.momz = 65536 * 2;
+    th.tics = th.tics - (defs.p_random(g) & 3);
+    if (th.tics < 1) { th.tics = 1; }
+
+    if (damage <= 12 && damage >= 9) {
+        set_mobj_state(g, th, info.S_BLOOD2);
+    }
+    or (damage < 9) {
+        set_mobj_state(g, th, info.S_BLOOD3);
+    }
+}
+
+# P_CheckMissileSpawn: moves the missile forward a bit and possibly explodes
+# it right there
+fun check_missile_spawn(g: *Game, th: *Mobj) {
+    th.tics = th.tics - (defs.p_random(g) & 3);
+    if (th.tics < 1) { th.tics = 1; }
+
+    # move a little forward so an angle can be computed if it immediately
+    # explodes
+    th.x = th.x + (th.momx >> 1);
+    th.y = th.y + (th.momy >> 1);
+    th.z = th.z + (th.momz >> 1);
+
+    if (!try_move(g, th, th.x, th.y)) { explode_missile(g, th); }
+}
+
+# P_SpawnMissile
+pub fun spawn_missile(g: *Game, source: *Mobj, dest: *Mobj, kind: i32) *Mobj {
+    val th:    *Mobj = spawn_mobj(g, source.x, source.y, source.z + 4 * 8 * 65536, kind);
+    val speed: Fixed = info.mi(kind, info.MI_SPEED);
+
+    if (info.mi(kind, info.MI_SEESOUND) != 0) { defs.sound(g, th, info.mi(kind, info.MI_SEESOUND)); }
+
+    # where it came from
+    th.target = source;
+    var an: u32 = point_to_angle2(source.x, source.y, dest.x, dest.y);
+
+    # fuzzy player
+    if ((dest.flags & defs.MF_SHADOW) != 0) { an = an + (sub_random(g) << 20):~u32; }
+
+    th.angle = an;
+    an       = an >> t.ANGLETOFINESHIFT;
+    th.momx  = fixed.mul(speed, cosine(an));
+    th.momy  = fixed.mul(speed, sine(an));
+
+    var dist: i32 = maputl.aprox_distance(dest.x - source.x, dest.y - source.y);
+    dist = dist / speed;
+    if (dist < 1) { dist = 1; }
+
+    th.momz = (dest.z - source.z) / dist;
+    check_missile_spawn(g, th);
+    ret th;
+}
+
+# P_SpawnPlayerMissile: tries to aim at a nearby monster
+pub fun spawn_player_missile(g: *Game, source: *Mobj, kind: i32) {
+    # see which target is to be aimed at
+    var an:    u32   = source.angle;
+    var slope: Fixed = aim_line_attack(g, source, an, 16 * 64 * 65536);
+
+    if (g.linetarget == nil) {
+        an    = an + (1 << 26);
+        slope = aim_line_attack(g, source, an, 16 * 64 * 65536);
+
+        if (g.linetarget == nil) {
+            an    = an - (2 << 26);
+            slope = aim_line_attack(g, source, an, 16 * 64 * 65536);
+        }
+
+        if (g.linetarget == nil) {
+            an    = source.angle;
+            slope = 0;
+        }
+    }
+
+    val th:    *Mobj = spawn_mobj(g, source.x, source.y, source.z + 4 * 8 * 65536, kind);
+    val speed: Fixed = info.mi(kind, info.MI_SPEED);
+
+    if (info.mi(kind, info.MI_SEESOUND) != 0) { defs.sound(g, th, info.mi(kind, info.MI_SEESOUND)); }
+
+    th.target = source;
+    th.angle  = an;
+    th.momx   = fixed.mul(speed, cosine(an >> t.ANGLETOFINESHIFT));
+    th.momy   = fixed.mul(speed, sine(an >> t.ANGLETOFINESHIFT));
+    th.momz   = fixed.mul(speed, slope);
+
+    check_missile_spawn(g, th);
+}
+
+# ----------------------------------------------------------------- p_pspr.c
+
+# P_SetPsprite
+pub fun set_psprite(g: *Game, player: *Player, position: i32, stnum_in: i32) {
+    val psp:   *Pspdef = ?player.psprites[position];
+    var stnum: i32     = stnum_in;
+
+    for {
+        if (stnum == info.S_NULL) {
+            # object removed itself
+            psp.state = info.S_NULL;
+            brk;
+        }
+
+        psp.state = stnum;
+        # could be 0
+        psp.tics = info.st_tics(stnum);
+
+        if (info.st_misc1(stnum) != 0) {
+            # coordinate set
+            psp.sx = info.st_misc1(stnum) << 16;
+            psp.sy = info.st_misc2(stnum) << 16;
+        }
+
+        # call the action routine. modified handling.
+        val action: i32 = info.st_action(stnum);
+        if (action != info.A_NULL) {
+            g.run_action(g, nil, player, psp, action);
+            if (psp.state == info.S_NULL) { brk; }
+        }
+
+        stnum = info.st_next(psp.state);
+
+        # an initial state of 0 could cycle through
+        if (psp.tics != 0) { brk; }
+    }
+}
+
+# P_BringUpWeapon: starts bringing the pending weapon up from the bottom of
+# the screen. uses player.
+pub fun bring_up_weapon(g: *Game, player: *Player) {
+    if (player.pendingweapon == defs.WP_NOCHANGE) { player.pendingweapon = player.readyweapon; }
+    if (player.pendingweapon == defs.WP_CHAINSAW) { defs.sound(g, player.mo, info.SFX_SAWUP); }
+
+    val newstate: i32 = weaponinfo(player.pendingweapon, WI_UP);
+
+    player.pendingweapon               = defs.WP_NOCHANGE;
+    player.psprites[defs.PS_WEAPON].sy = WEAPONBOTTOM;
+    set_psprite(g, player, defs.PS_WEAPON, newstate);
+}
+
+# P_CheckAmmo
+# ---
+# ret: true if there is enough ammo to shoot; if not, selects the next weapon
+#      to use
+pub fun check_ammo(g: *Game, player: *Player) bool {
+    val ammo: i32 = weaponinfo(player.readyweapon, WI_AMMO);
+
+    # minimal amount for one shot varies
+    var count: i32 = 1;
+    if (player.readyweapon == defs.WP_BFG) {
+        count = BFGCELLS;
+    }
+    or (player.readyweapon == defs.WP_SUPERSHOTGUN) {
+        # double barrel
+        count = 2;
+    }
+
+    # some do not need ammunition anyway; return if current ammunition
+    # sufficient
+    if (ammo == defs.AM_NOAMMO || player.ammo[ammo] >= count) { ret 1; }
+
+    # out of ammo, pick a weapon to change to. preferences are set here.
+    if (player.weaponowned[defs.WP_PLASMA] && player.ammo[defs.AM_CELL] != 0 && !g.shareware) {
+        player.pendingweapon = defs.WP_PLASMA;
+    }
+    or (player.weaponowned[defs.WP_CHAINGUN] && player.ammo[defs.AM_CLIP] != 0) {
+        player.pendingweapon = defs.WP_CHAINGUN;
+    }
+    or (player.weaponowned[defs.WP_SHOTGUN] && player.ammo[defs.AM_SHELL] != 0) {
+        player.pendingweapon = defs.WP_SHOTGUN;
+    }
+    or (player.ammo[defs.AM_CLIP] != 0) {
+        player.pendingweapon = defs.WP_PISTOL;
+    }
+    or (player.weaponowned[defs.WP_CHAINSAW]) {
+        player.pendingweapon = defs.WP_CHAINSAW;
+    }
+    or (player.weaponowned[defs.WP_MISSILE] && player.ammo[defs.AM_MISL] != 0) {
+        player.pendingweapon = defs.WP_MISSILE;
+    }
+    or (player.weaponowned[defs.WP_BFG] && player.ammo[defs.AM_CELL] > 40 && !g.shareware) {
+        player.pendingweapon = defs.WP_BFG;
+    }
+    or {
+        # if everything fails
+        player.pendingweapon = defs.WP_FIST;
+    }
+
+    # now set appropriate weapon overlay
+    set_psprite(g, player, defs.PS_WEAPON, weaponinfo(player.readyweapon, WI_DOWN));
+    ret 0;
+}
+
+# P_FireWeapon
+pub fun fire_weapon(g: *Game, player: *Player) {
+    if (!check_ammo(g, player)) { ret; }
+
+    set_mobj_state(g, player.mo, info.S_PLAY_ATK1);
+    set_psprite(g, player, defs.PS_WEAPON, weaponinfo(player.readyweapon, WI_ATK));
+    noise_alert(g, player.mo, player.mo);
+}
+
+# P_DropWeapon: player died, so put the weapon away
+pub fun drop_weapon(g: *Game, player: *Player) {
+    set_psprite(g, player, defs.PS_WEAPON, weaponinfo(player.readyweapon, WI_DOWN));
+}
+
+# P_SetupPsprites: called at start of level for each player
+pub fun setup_psprites(g: *Game, player: *Player) {
+    # remove all psprites
+    var i: i32 = 0;
+    for (i < defs.NUMPSPRITES) {
+        player.psprites[i].state = info.S_NULL;
+        i                        = i + 1;
+    }
+
+    # spawn the gun
+    player.pendingweapon = player.readyweapon;
+    bring_up_weapon(g, player);
+}
+
+# P_MovePsprites: called every tic by player thinking routine
+pub fun move_psprites(g: *Game, player: *Player) {
+    var i: i32 = 0;
+    for (i < defs.NUMPSPRITES) {
+        val psp: *Pspdef = ?player.psprites[i];
+        # a null state means not active
+        if (psp.state != info.S_NULL) {
+            # drop tic count and possibly change state; a -1 tic count never
+            # changes
+            if (psp.tics != -1) {
+                psp.tics = psp.tics - 1;
+                if (psp.tics == 0) { set_psprite(g, player, i, info.st_next(psp.state)); }
+            }
+        }
+        i = i + 1;
+    }
+
+    player.psprites[defs.PS_FLASH].sx = player.psprites[defs.PS_WEAPON].sx;
+    player.psprites[defs.PS_FLASH].sy = player.psprites[defs.PS_WEAPON].sy;
+}
+
+# ---------------------------------------------------------------- p_enemy.c
+
+# P_RecursiveSound: called by P_NoiseAlert. recursively traverse adjacent
+# sectors; sound blocking lines cut off traversal.
+fun recursive_sound(g: *Game, secnum: i32, soundblocks: i32) {
+    val sec: *level.Sector = ?g.lv.sectors[secnum];
+
+    # wake up all monsters in this sector
+    if (sec.validcount == g.validcount && sec.soundtraversed <= soundblocks + 1) {
+        # already flooded
+        ret;
+    }
+
+    sec.validcount     = g.validcount;
+    sec.soundtraversed = soundblocks + 1;
+    sec.soundtarget    = g.soundtarget:~ptr;
+
+    var i: i32 = 0;
+    for (i < sec.linecount) {
+        val linenum: i32         = g.lv.sector_lines[sec.firstline + i];
+        val check:   *level.Line = ?g.lv.lines[linenum];
+        i = i + 1;
+        if ((check.flags::i32 & defs.ML_TWOSIDED) == 0) { cnt; }
+
+        maputl.line_opening(g, linenum);
+        if (g.openrange <= 0) {
+            # closed door
+            cnt;
+        }
+
+        var other: i32 = g.lv.sides[check.sidenum[0]].sector;
+        if (other == secnum) { other = g.lv.sides[check.sidenum[1]].sector; }
+
+        if ((check.flags::i32 & defs.ML_SOUNDBLOCK) != 0) {
+            if (soundblocks == 0) { recursive_sound(g, other, 1); }
+        }
+        or {
+            recursive_sound(g, other, soundblocks);
+        }
+    }
+}
+
+# P_NoiseAlert: if a monster yells at a player, it will alert other monsters
+# to the player
+pub fun noise_alert(g: *Game, target: *Mobj, emmiter: *Mobj) {
+    g.soundtarget = target;
+    g.validcount  = g.validcount + 1;
+    recursive_sound(g, g.lv.subsectors[emmiter.subsector].sector, 0);
+}
+
+# ----------------------------------------------------------------- p_inter.c
+
+# P_GiveAmmo
+# ---
+# num_in: number of clip loads, not the individual count (0 = 1/2 clip)
+# ret:    false if the ammo can't be picked up at all
+pub fun give_ammo(g: *Game, player: *Player, ammo: i32, num_in: i32) bool {
+    if (ammo == defs.AM_NOAMMO)                    { ret 0; }
+    if (ammo < 0 || ammo >= defs.NUMAMMO)          { ret 0; }
+    if (player.ammo[ammo] == player.maxammo[ammo]) { ret 0; }
+
+    var num: i32 = CLIPAMMO[ammo] / 2;
+    if (num_in != 0) { num = num_in * CLIPAMMO[ammo]; }
+
+    if (g.gameskill == defs.SK_BABY || g.gameskill == defs.SK_NIGHTMARE) {
+        # give double ammo in trainer mode, you'll need it in nightmare
+        num = num << 1;
+    }
+
+    val oldammo: i32 = player.ammo[ammo];
+    player.ammo[ammo] = player.ammo[ammo] + num;
+    if (player.ammo[ammo] > player.maxammo[ammo]) { player.ammo[ammo] = player.maxammo[ammo]; }
+
+    # if non zero ammo, don't change up weapons, player was lower on purpose
+    if (oldammo != 0) { ret 1; }
+
+    # we were down to zero, so select a new weapon. preferences are not user
+    # selectable.
+    if (ammo == defs.AM_CLIP) {
+        if (player.readyweapon == defs.WP_FIST) {
+            if (player.weaponowned[defs.WP_CHAINGUN]) {
+                player.pendingweapon = defs.WP_CHAINGUN;
+            }
+            or {
+                player.pendingweapon = defs.WP_PISTOL;
+            }
+        }
+    }
+    or (ammo == defs.AM_SHELL) {
+        if (player.readyweapon == defs.WP_FIST || player.readyweapon == defs.WP_PISTOL) {
+            if (player.weaponowned[defs.WP_SHOTGUN]) { player.pendingweapon = defs.WP_SHOTGUN; }
+        }
+    }
+    or (ammo == defs.AM_CELL) {
+        if (player.readyweapon == defs.WP_FIST || player.readyweapon == defs.WP_PISTOL) {
+            if (player.weaponowned[defs.WP_PLASMA]) { player.pendingweapon = defs.WP_PLASMA; }
+        }
+    }
+    or (ammo == defs.AM_MISL) {
+        if (player.readyweapon == defs.WP_FIST) {
+            if (player.weaponowned[defs.WP_MISSILE]) { player.pendingweapon = defs.WP_MISSILE; }
+        }
+    }
+    ret 1;
+}
+
+# P_GiveWeapon: the weapon name may have a MF_DROPPED flag ored in
+fun give_weapon(g: *Game, player: *Player, weapon: i32, dropped: bool) bool {
+    var gaveammo: bool = 0;
+    if (weaponinfo(weapon, WI_AMMO) != defs.AM_NOAMMO) {
+        # give one clip with a dropped weapon, two clips with a found weapon
+        if (dropped) {
+            gaveammo = give_ammo(g, player, weaponinfo(weapon, WI_AMMO), 1);
+        }
+        or {
+            gaveammo = give_ammo(g, player, weaponinfo(weapon, WI_AMMO), 2);
+        }
+    }
+
+    var gaveweapon: bool = 0;
+    if (!player.weaponowned[weapon]) {
+        gaveweapon                 = 1;
+        player.weaponowned[weapon] = 1;
+        player.pendingweapon       = weapon;
+    }
+    ret gaveweapon || gaveammo;
+}
+
+# P_GiveBody
+# ---
+# ret: false if the body isn't needed at all
+pub fun give_body(player: *Player, num: i32) bool {
+    if (player.health >= defs.MAXHEALTH) { ret 0; }
+
+    player.health = player.health + num;
+    if (player.health > defs.MAXHEALTH) { player.health = defs.MAXHEALTH; }
+    player.mo.health = player.health;
+    ret 1;
+}
+
+# P_GiveArmor
+# ---
+# ret: false if the armor is worse than the current armor
+fun give_armor(player: *Player, armortype: i32) bool {
+    val hits: i32 = armortype * 100;
+    if (player.armorpoints >= hits) {
+        # don't pick up
+        ret 0;
+    }
+    player.armortype   = armortype;
+    player.armorpoints = hits;
+    ret 1;
+}
+
+# P_GiveCard
+fun give_card(player: *Player, card: i32, message: str) {
+    if (player.cards[card]) { ret; }
+    player.message     = message;
+    player.bonuscount  = BONUSADD;
+    player.cards[card] = 1;
+}
+
+# P_GivePower
+pub fun give_power(player: *Player, power: i32) bool {
+    if (power == defs.PW_INVULNERABILITY) {
+        player.powers[power] = defs.INVULNTICS;
+        ret 1;
+    }
+    if (power == defs.PW_INVISIBILITY) {
+        player.powers[power] = defs.INVISTICS;
+        player.mo.flags      = player.mo.flags | defs.MF_SHADOW;
+        ret 1;
+    }
+    if (power == defs.PW_INFRARED) {
+        player.powers[power] = defs.INFRATICS;
+        ret 1;
+    }
+    if (power == defs.PW_IRONFEET) {
+        player.powers[power] = defs.IRONTICS;
+        ret 1;
+    }
+    if (power == defs.PW_STRENGTH) {
+        give_body(player, 100);
+        player.powers[power] = 1;
+        ret 1;
+    }
+    if (player.powers[power] != 0) {
+        # already got it
+        ret 0;
+    }
+    player.powers[power] = 1;
+    ret 1;
+}
+
+# P_TouchSpecialThing
+fun touch_special_thing(g: *Game, special: *Mobj, toucher: *Mobj) {
+    val delta: Fixed = special.z - toucher.z;
+    if (delta > toucher.height || delta < 0 - 8 * 65536) {
+        # out of reach
+        ret;
+    }
+
+    var sound:  i32     = info.SFX_ITEMUP;
+    val player: *Player = toucher.player;
+
+    # dead thing touching. can happen with a sliding player corpse.
+    if (toucher.health <= 0) { ret; }
+
+    val dropped: bool = (special.flags & defs.MF_DROPPED) != 0;
+    val sprite:  i32  = special.sprite;
+
+    # identify by sprite
+    if (sprite == info.SPR_ARM1) {
+        # armor
+        if (!give_armor(player, 1)) { ret; }
+        player.message = "Picked up the armor.";
+    }
+    or (sprite == info.SPR_ARM2) {
+        if (!give_armor(player, 2)) { ret; }
+        player.message = "Picked up the MegaArmor!";
+    }
+    or (sprite == info.SPR_BON1) {
+        # bonus items; can go over 100%
+        player.health = player.health + 1;
+        if (player.health > 200) { player.health = 200; }
+        player.mo.health = player.health;
+        player.message   = "Picked up a health bonus.";
+    }
+    or (sprite == info.SPR_BON2) {
+        # can go over 100%
+        player.armorpoints = player.armorpoints + 1;
+        if (player.armorpoints > 200) { player.armorpoints = 200; }
+        if (player.armortype == 0)    { player.armortype = 1; }
+        player.message = "Picked up an armor bonus.";
+    }
+    or (sprite == info.SPR_SOUL) {
+        player.health = player.health + 100;
+        if (player.health > 200) { player.health = 200; }
+        player.mo.health = player.health;
+        player.message   = "Supercharge!";
+        sound            = info.SFX_GETPOW;
+    }
+    or (sprite == info.SPR_MEGA) {
+        # only in the second game
+        ret;
+    }
+    or (sprite == info.SPR_BKEY) {
+        # cards; leave cards for everyone
+        give_card(player, defs.IT_BLUECARD, "Picked up a blue keycard.");
+    }
+    or (sprite == info.SPR_YKEY) {
+        give_card(player, defs.IT_YELLOWCARD, "Picked up a yellow keycard.");
+    }
+    or (sprite == info.SPR_RKEY) {
+        give_card(player, defs.IT_REDCARD, "Picked up a red keycard.");
+    }
+    or (sprite == info.SPR_BSKU) {
+        give_card(player, defs.IT_BLUESKULL, "Picked up a blue skull key.");
+    }
+    or (sprite == info.SPR_YSKU) {
+        give_card(player, defs.IT_YELLOWSKULL, "Picked up a yellow skull key.");
+    }
+    or (sprite == info.SPR_RSKU) {
+        give_card(player, defs.IT_REDSKULL, "Picked up a red skull key.");
+    }
+    or (sprite == info.SPR_STIM) {
+        # medikits, heals
+        if (!give_body(player, 10)) { ret; }
+        player.message = "Picked up a stimpack.";
+    }
+    or (sprite == info.SPR_MEDI) {
+        if (!give_body(player, 25)) { ret; }
+        # the health was just raised, so the "really need" text never shows;
+        # the original has the same slip
+        if (player.health < 25) {
+            player.message = "Picked up a medikit that you REALLY need!";
+        }
+        or {
+            player.message = "Picked up a medikit.";
+        }
+    }
+    or (sprite == info.SPR_PINV) {
+        # power ups
+        if (!give_power(player, defs.PW_INVULNERABILITY)) { ret; }
+        player.message = "Invulnerability!";
+        sound          = info.SFX_GETPOW;
+    }
+    or (sprite == info.SPR_PSTR) {
+        if (!give_power(player, defs.PW_STRENGTH)) { ret; }
+        player.message = "Berserk!";
+        if (player.readyweapon != defs.WP_FIST) { player.pendingweapon = defs.WP_FIST; }
+        sound = info.SFX_GETPOW;
+    }
+    or (sprite == info.SPR_PINS) {
+        if (!give_power(player, defs.PW_INVISIBILITY)) { ret; }
+        player.message = "Partial Invisibility";
+        sound          = info.SFX_GETPOW;
+    }
+    or (sprite == info.SPR_SUIT) {
+        if (!give_power(player, defs.PW_IRONFEET)) { ret; }
+        player.message = "Radiation Shielding Suit";
+        sound          = info.SFX_GETPOW;
+    }
+    or (sprite == info.SPR_PMAP) {
+        if (!give_power(player, defs.PW_ALLMAP)) { ret; }
+        player.message = "Computer Area Map";
+        sound          = info.SFX_GETPOW;
+    }
+    or (sprite == info.SPR_PVIS) {
+        if (!give_power(player, defs.PW_INFRARED)) { ret; }
+        player.message = "Light Amplification Visor";
+        sound          = info.SFX_GETPOW;
+    }
+    or (sprite == info.SPR_CLIP) {
+        # ammo
+        if (dropped) {
+            if (!give_ammo(g, player, defs.AM_CLIP, 0)) { ret; }
+        }
+        or {
+            if (!give_ammo(g, player, defs.AM_CLIP, 1)) { ret; }
+        }
+        player.message = "Picked up a clip.";
+    }
+    or (sprite == info.SPR_AMMO) {
+        if (!give_ammo(g, player, defs.AM_CLIP, 5)) { ret; }
+        player.message = "Picked up a box of bullets.";
+    }
+    or (sprite == info.SPR_ROCK) {
+        if (!give_ammo(g, player, defs.AM_MISL, 1)) { ret; }
+        player.message = "Picked up a rocket.";
+    }
+    or (sprite == info.SPR_BROK) {
+        if (!give_ammo(g, player, defs.AM_MISL, 5)) { ret; }
+        player.message = "Picked up a box of rockets.";
+    }
+    or (sprite == info.SPR_CELL) {
+        if (!give_ammo(g, player, defs.AM_CELL, 1)) { ret; }
+        player.message = "Picked up an energy cell.";
+    }
+    or (sprite == info.SPR_CELP) {
+        if (!give_ammo(g, player, defs.AM_CELL, 5)) { ret; }
+        player.message = "Picked up an energy cell pack.";
+    }
+    or (sprite == info.SPR_SHEL) {
+        if (!give_ammo(g, player, defs.AM_SHELL, 1)) { ret; }
+        player.message = "Picked up 4 shotgun shells.";
+    }
+    or (sprite == info.SPR_SBOX) {
+        if (!give_ammo(g, player, defs.AM_SHELL, 5)) { ret; }
+        player.message = "Picked up a box of shotgun shells.";
+    }
+    or (sprite == info.SPR_BPAK) {
+        var i: i32 = 0;
+        if (!player.backpack) {
+            for (i < defs.NUMAMMO) {
+                player.maxammo[i] = player.maxammo[i] * 2;
+                i                 = i + 1;
+            }
+            player.backpack = 1;
+        }
+        i = 0;
+        for (i < defs.NUMAMMO) {
+            give_ammo(g, player, i, 1);
+            i = i + 1;
+        }
+        player.message = "Picked up a backpack full of ammo!";
+    }
+    or (sprite == info.SPR_BFUG) {
+        # weapons
+        if (!give_weapon(g, player, defs.WP_BFG, 0)) { ret; }
+        player.message = "You got the BFG9000!  Oh, yes.";
+        sound          = info.SFX_WPNUP;
+    }
+    or (sprite == info.SPR_MGUN) {
+        if (!give_weapon(g, player, defs.WP_CHAINGUN, dropped)) { ret; }
+        player.message = "You got the chaingun!";
+        sound          = info.SFX_WPNUP;
+    }
+    or (sprite == info.SPR_CSAW) {
+        if (!give_weapon(g, player, defs.WP_CHAINSAW, 0)) { ret; }
+        player.message = "A chainsaw!  Find some meat!";
+        sound          = info.SFX_WPNUP;
+    }
+    or (sprite == info.SPR_LAUN) {
+        if (!give_weapon(g, player, defs.WP_MISSILE, 0)) { ret; }
+        player.message = "You got the rocket launcher!";
+        sound          = info.SFX_WPNUP;
+    }
+    or (sprite == info.SPR_PLAS) {
+        if (!give_weapon(g, player, defs.WP_PLASMA, 0)) { ret; }
+        player.message = "You got the plasma gun!";
+        sound          = info.SFX_WPNUP;
+    }
+    or (sprite == info.SPR_SHOT) {
+        if (!give_weapon(g, player, defs.WP_SHOTGUN, dropped)) { ret; }
+        player.message = "You got the shotgun!";
+        sound          = info.SFX_WPNUP;
+    }
+    or {
+        # not something the first game lets a player pick up
+        ret;
+    }
+
+    if ((special.flags & defs.MF_COUNTITEM) != 0) { player.itemcount = player.itemcount + 1; }
+    remove_mobj(g, special);
+    player.bonuscount = player.bonuscount + BONUSADD;
+    if (player == ?g.players[g.consoleplayer]) { defs.sound(g, nil, sound); }
+}
+
+# P_KillMobj
+fun kill_mobj(g: *Game, source: *Mobj, target: *Mobj) {
+    target.flags = target.flags & ~(defs.MF_SHOOTABLE | defs.MF_FLOAT | defs.MF_SKULLFLY);
+
+    if (target.kind != info.MT_SKULL) { target.flags = target.flags & ~defs.MF_NOGRAVITY; }
+
+    target.flags  = target.flags | defs.MF_CORPSE | defs.MF_DROPOFF;
+    target.height = target.height >> 2;
+
+    if (source != nil && source.player != nil) {
+        # count for intermission
+        if ((target.flags & defs.MF_COUNTKILL) != 0) { source.player.killcount = source.player.killcount + 1; }
+    }
+    or (!g.netgame && (target.flags & defs.MF_COUNTKILL) != 0) {
+        # count all monster deaths, even those caused by other monsters
+        g.players[0].killcount = g.players[0].killcount + 1;
+    }
+
+    if (target.player != nil) {
+        target.flags              = target.flags & ~defs.MF_SOLID;
+        target.player.playerstate = defs.PST_DEAD;
+        drop_weapon(g, target.player);
+    }
+
+    if (target.health < 0 - info.mi(target.kind, info.MI_SPAWNHEALTH) && info.mi(target.kind, info.MI_XDEATHSTATE) != 0) {
+        set_mobj_state(g, target, info.mi(target.kind, info.MI_XDEATHSTATE));
+    }
+    or {
+        set_mobj_state(g, target, info.mi(target.kind, info.MI_DEATHSTATE));
+    }
+    target.tics = target.tics - (defs.p_random(g) & 3);
+    if (target.tics < 1) { target.tics = 1; }
+
+    # drop stuff. this determines the kind of object spawned during the death
+    # frame of a thing.
+    var item: i32 = 0;
+    if (target.kind == info.MT_WOLFSS || target.kind == info.MT_POSSESSED) {
+        item = info.MT_CLIP;
+    }
+    or (target.kind == info.MT_SHOTGUY) {
+        item = info.MT_SHOTGUN;
+    }
+    or (target.kind == info.MT_CHAINGUY) {
+        item = info.MT_CHAINGUN;
+    }
+    or {
+        ret;
+    }
+
+    val mo: *Mobj = spawn_mobj(g, target.x, target.y, defs.ONFLOORZ, item);
+    # special versions of items
+    mo.flags = mo.flags | defs.MF_DROPPED;
+}
+
+# P_DamageMobj: damages both enemies and players
+# ---
+# target:    the thing hurt
+# inflictor: the thing that caused the damage (creature or missile); can be
+#            nil (slime, etc)
+# source:    the thing to target after taking damage (creature or nil). source
+#            and inflictor are the same for melee attacks; source can be nil
+#            for slime, barrel explosions and other environmental stuff.
+pub fun damage_mobj(g: *Game, target: *Mobj, inflictor: *Mobj, source: *Mobj, damage_in: i32) {
+    var damage: i32 = damage_in;
+
+    if ((target.flags & defs.MF_SHOOTABLE) == 0) {
+        # shouldn't happen...
+        ret;
+    }
+    if (target.health <= 0) { ret; }
+
+    if ((target.flags & defs.MF_SKULLFLY) != 0) {
+        target.momx = 0;
+        target.momy = 0;
+        target.momz = 0;
+    }
+
+    val player: *Player = target.player;
+    if (player != nil && g.gameskill == defs.SK_BABY) {
+        # take half damage in trainer mode
+        damage = damage >> 1;
+    }
+
+    # some close combat weapons should not inflict thrust and push the victim
+    # out of reach, thus kick away unless using the chainsaw
+    if (inflictor != nil && (target.flags & defs.MF_NOCLIP) == 0 &&
+        (source == nil || source.player == nil || source.player.readyweapon != defs.WP_CHAINSAW)) {
+        var ang:    u32   = point_to_angle2(inflictor.x, inflictor.y, target.x, target.y);
+        var thrust: Fixed = damage * (65536 >> 3) * 100 / info.mi(target.kind, info.MI_MASS);
+
+        # make fall forwards sometimes
+        if (damage < 40 && damage > target.health && target.z - inflictor.z > 64 * 65536 && (defs.p_random(g) & 1) != 0) {
+            ang    = ang + t.ANG180;
+            thrust = thrust * 4;
+        }
+
+        ang         = ang >> t.ANGLETOFINESHIFT;
+        target.momx = target.momx + fixed.mul(thrust, cosine(ang));
+        target.momy = target.momy + fixed.mul(thrust, sine(ang));
+    }
+
+    # player specific
+    if (player != nil) {
+        # end of game hell hack
+        if (defs.sector_of(g, target).special == 11 && damage >= target.health) { damage = target.health - 1; }
+
+        # below certain threshold, ignore damage in GOD mode, or with INVUL
+        # power
+        if (damage < 1000 && ((player.cheats & defs.CF_GODMODE) != 0 || player.powers[defs.PW_INVULNERABILITY] != 0)) {
+            ret;
+        }
+
+        if (player.armortype != 0) {
+            var saved: i32 = damage / 2;
+            if (player.armortype == 1) { saved = damage / 3; }
+
+            if (player.armorpoints <= saved) {
+                # armor is used up
+                saved            = player.armorpoints;
+                player.armortype = 0;
+            }
+            player.armorpoints = player.armorpoints - saved;
+            damage             = damage - saved;
+        }
+
+        # mirror mobj health here for Dave
+        player.health = player.health - damage;
+        if (player.health < 0) { player.health = 0; }
+
+        player.attacker = source;
+        # add damage after armor / invuln
+        player.damagecount = player.damagecount + damage;
+        if (player.damagecount > 100) {
+            # teleport stomp does 10k points...
+            player.damagecount = 100;
+        }
+    }
+
+    # do the damage
+    target.health = target.health - damage;
+    if (target.health <= 0) {
+        kill_mobj(g, source, target);
+        ret;
+    }
+
+    if (defs.p_random(g) < info.mi(target.kind, info.MI_PAINCHANCE) && (target.flags & defs.MF_SKULLFLY) == 0) {
+        # fight back!
+        target.flags = target.flags | defs.MF_JUSTHIT;
+        set_mobj_state(g, target, info.mi(target.kind, info.MI_PAINSTATE));
+    }
+
+    # we're awake now...
+    target.reactiontime = 0;
+
+    if ((target.threshold == 0 || target.kind == info.MT_VILE) && source != nil && source != target &&
+        source.kind != info.MT_VILE) {
+        # if not intent on another player, chase after this one
+        target.target    = source;
+        target.threshold = defs.BASETHRESHOLD;
+        if (target.state == info.mi(target.kind, info.MI_SPAWNSTATE) && info.mi(target.kind, info.MI_SEESTATE) != info.S_NULL) {
+            set_mobj_state(g, target, info.mi(target.kind, info.MI_SEESTATE));
+        }
+    }
+}
+
+# ------------------------------------------------------------------ p_map.c
+
+# PIT_StompThing
+fun stomp_thing(g: *Game, thing: *Mobj) bool {
+    if ((thing.flags & defs.MF_SHOOTABLE) == 0) { ret 1; }
+
+    val blockdist: Fixed = thing.radius + g.tmthing.radius;
+    if (abs32(thing.x - g.tmx) >= blockdist || abs32(thing.y - g.tmy) >= blockdist) {
+        # didn't hit it
+        ret 1;
+    }
+
+    # don't clip against self
+    if (thing == g.tmthing) { ret 1; }
+
+    # monsters don't stomp things except on boss level
+    if (g.tmthing.player == nil && g.gamemap != 30) { ret 0; }
+
+    damage_mobj(g, thing, g.tmthing, g.tmthing, 10000);
+    ret 1;
+}
+
+# set up the globals a position check works from
+fun begin_check(g: *Game, thing: *Mobj, x: Fixed, y: Fixed) {
+    g.tmthing = thing;
+    g.tmflags = thing.flags;
+    g.tmx     = x;
+    g.tmy     = y;
+
+    g.tmbbox[level.BOXTOP]    = y + thing.radius;
+    g.tmbbox[level.BOXBOTTOM] = y - thing.radius;
+    g.tmbbox[level.BOXRIGHT]  = x + thing.radius;
+    g.tmbbox[level.BOXLEFT]   = x - thing.radius;
+
+    val newsubsec: i32           = render.point_in_subsector(g.lv, x, y);
+    val sec:       *level.Sector = ?g.lv.sectors[g.lv.subsectors[newsubsec].sector];
+    g.ceilingline = level.NONE;
+
+    # the base floor / ceiling is from the subsector that contains the point.
+    # any contacted lines the step closer together will adjust them.
+    g.tmfloorz   = sec.floorheight;
+    g.tmdropoffz = sec.floorheight;
+    g.tmceilingz = sec.ceilingheight;
+
+    g.validcount = g.validcount + 1;
+    g.numspechit = 0;
+}
+
+# P_TeleportMove
+pub fun teleport_move(g: *Game, thing: *Mobj, x: Fixed, y: Fixed) bool {
+    # kill anything occupying the position
+    begin_check(g, thing, x, y);
+
+    # stomp on any things contacted
+    val xl: i32 = (g.tmbbox[level.BOXLEFT] - g.lv.bmaporgx - defs.MAXRADIUS) >> defs.MAPBLOCKSHIFT;
+    val xh: i32 = (g.tmbbox[level.BOXRIGHT] - g.lv.bmaporgx + defs.MAXRADIUS) >> defs.MAPBLOCKSHIFT;
+    val yl: i32 = (g.tmbbox[level.BOXBOTTOM] - g.lv.bmaporgy - defs.MAXRADIUS) >> defs.MAPBLOCKSHIFT;
+    val yh: i32 = (g.tmbbox[level.BOXTOP] - g.lv.bmaporgy + defs.MAXRADIUS) >> defs.MAPBLOCKSHIFT;
+
+    var bx: i32 = xl;
+    for (bx <= xh) {
+        var by: i32 = yl;
+        for (by <= yh) {
+            if (!maputl.block_things_iterator(g, bx, by, stomp_thing)) { ret 0; }
+            by = by + 1;
+        }
+        bx = bx + 1;
+    }
+
+    # the move is ok, so link the thing into its new position
+    maputl.unset_thing_position(g, thing);
+
+    thing.floorz   = g.tmfloorz;
+    thing.ceilingz = g.tmceilingz;
+    thing.x        = x;
+    thing.y        = y;
+
+    maputl.set_thing_position(g, thing);
+    ret 1;
+}
+
+# PIT_CheckLine: adjusts tmfloorz and tmceilingz as lines are contacted
+fun check_line(g: *Game, linenum: i32) bool {
+    val ld: *level.Line = ?g.lv.lines[linenum];
+
+    if (g.tmbbox[level.BOXRIGHT] <= ld.bbox[level.BOXLEFT] || g.tmbbox[level.BOXLEFT] >= ld.bbox[level.BOXRIGHT] ||
+        g.tmbbox[level.BOXTOP] <= ld.bbox[level.BOXBOTTOM] || g.tmbbox[level.BOXBOTTOM] >= ld.bbox[level.BOXTOP]) {
+        ret 1;
+    }
+
+    if (maputl.box_on_line_side(g, ?g.tmbbox[0], linenum) != -1) { ret 1; }
+
+    # a line has been hit. the moving thing's destination position will cross
+    # the given line. if this should not be allowed, return false. if the
+    # line is special, keep track of it to process later if the move is
+    # proven ok.
+    if (ld.backsector == level.NONE) {
+        # one sided line
+        ret 0;
+    }
+
+    if ((g.tmthing.flags & defs.MF_MISSILE) == 0) {
+        if ((ld.flags::i32 & defs.ML_BLOCKING) != 0) {
+            # explicitly blocking everything
+            ret 0;
+        }
+        if (g.tmthing.player == nil && (ld.flags::i32 & defs.ML_BLOCKMONSTERS) != 0) {
+            # block monsters only
+            ret 0;
+        }
+    }
+
+    # set openrange, opentop, openbottom
+    maputl.line_opening(g, linenum);
+
+    # adjust floor / ceiling heights
+    if (g.opentop < g.tmceilingz) {
+        g.tmceilingz  = g.opentop;
+        g.ceilingline = linenum;
+    }
+
+    if (g.openbottom > g.tmfloorz) { g.tmfloorz = g.openbottom; }
+    if (g.lowfloor < g.tmdropoffz) { g.tmdropoffz = g.lowfloor; }
+
+    # if contacted a special line, add it to the list. the original has room
+    # for eight and writes past the end on a ninth.
+    if (ld.special != 0 && g.numspechit < 8) {
+        g.spechit[g.numspechit] = linenum;
+        g.numspechit            = g.numspechit + 1;
+    }
+    ret 1;
+}
+
+# PIT_CheckThing
+fun check_thing(g: *Game, thing: *Mobj) bool {
+    val tmthing: *Mobj = g.tmthing;
+
+    if ((thing.flags & (defs.MF_SOLID | defs.MF_SPECIAL | defs.MF_SHOOTABLE)) == 0) { ret 1; }
+
+    val blockdist: Fixed = thing.radius + tmthing.radius;
+    if (abs32(thing.x - g.tmx) >= blockdist || abs32(thing.y - g.tmy) >= blockdist) {
+        # didn't hit it
+        ret 1;
+    }
+
+    # don't clip against self
+    if (thing == tmthing) { ret 1; }
+
+    # check for skulls slamming into things
+    if ((tmthing.flags & defs.MF_SKULLFLY) != 0) {
+        val damage: i32 = ((defs.p_random(g) % 8) + 1) * info.mi(tmthing.kind, info.MI_DAMAGE);
+        damage_mobj(g, thing, tmthing, tmthing, damage);
+
+        tmthing.flags = tmthing.flags & ~defs.MF_SKULLFLY;
+        tmthing.momx  = 0;
+        tmthing.momy  = 0;
+        tmthing.momz  = 0;
+
+        set_mobj_state(g, tmthing, info.mi(tmthing.kind, info.MI_SPAWNSTATE));
+
+        # stop moving
+        ret 0;
+    }
+
+    # missiles can hit other things
+    if ((tmthing.flags & defs.MF_MISSILE) != 0) {
+        # see if it went over / under
+        if (tmthing.z > thing.z + thing.height) {
+            # overhead
+            ret 1;
+        }
+        if (tmthing.z + tmthing.height < thing.z) {
+            # underneath
+            ret 1;
+        }
+
+        if (tmthing.target != nil &&
+            (tmthing.target.kind == thing.kind ||
+            (tmthing.target.kind == info.MT_KNIGHT && thing.kind == info.MT_BRUISER) ||
+            (tmthing.target.kind == info.MT_BRUISER && thing.kind == info.MT_KNIGHT))) {
+            # don't hit same species as originator
+            if (thing == tmthing.target) { ret 1; }
+
+            if (thing.kind != info.MT_PLAYER) {
+                # explode, but do no damage. let players missile other
+                # players.
+                ret 0;
+            }
+        }
+
+        if ((thing.flags & defs.MF_SHOOTABLE) == 0) {
+            # didn't do any damage
+            ret (thing.flags & defs.MF_SOLID) == 0;
+        }
+
+        # damage / explode
+        val damage: i32 = ((defs.p_random(g) % 8) + 1) * info.mi(tmthing.kind, info.MI_DAMAGE);
+        damage_mobj(g, thing, tmthing, tmthing.target, damage);
+
+        # don't traverse any more
+        ret 0;
+    }
+
+    # check for special pickup
+    if ((thing.flags & defs.MF_SPECIAL) != 0) {
+        val solid: bool = (thing.flags & defs.MF_SOLID) != 0;
+        if ((g.tmflags & defs.MF_PICKUP) != 0) {
+            # can remove thing
+            touch_special_thing(g, thing, tmthing);
+        }
+        ret !solid;
+    }
+
+    ret (thing.flags & defs.MF_SOLID) == 0;
+}
+
+# P_CheckPosition: this is purely informative, nothing is modified (except
+# things picked up).
+#
+# in: a mobj (can be valid or invalid), a position to be checked (doesn't
+#     need to be related to the mobj's x,y)
+#
+# during: special things are touched if MF_PICKUP, early out on solid lines?
+#
+# out: g.tmfloorz, g.tmceilingz, g.tmdropoffz (the lowest point contacted;
+#      monsters won't move to a dropoff), g.spechit[], g.numspechit
+pub fun check_position(g: *Game, thing: *Mobj, x: Fixed, y: Fixed) bool {
+    begin_check(g, thing, x, y);
+
+    if ((g.tmflags & defs.MF_NOCLIP) != 0) { ret 1; }
+
+    # check things first, possibly picking things up. the bounding box is
+    # extended by MAXRADIUS because mobjs are grouped into mapblocks based on
+    # their origin point, and can overlap into adjacent blocks by up to
+    # MAXRADIUS units.
+    var xl: i32 = (g.tmbbox[level.BOXLEFT] - g.lv.bmaporgx - defs.MAXRADIUS) >> defs.MAPBLOCKSHIFT;
+    var xh: i32 = (g.tmbbox[level.BOXRIGHT] - g.lv.bmaporgx + defs.MAXRADIUS) >> defs.MAPBLOCKSHIFT;
+    var yl: i32 = (g.tmbbox[level.BOXBOTTOM] - g.lv.bmaporgy - defs.MAXRADIUS) >> defs.MAPBLOCKSHIFT;
+    var yh: i32 = (g.tmbbox[level.BOXTOP] - g.lv.bmaporgy + defs.MAXRADIUS) >> defs.MAPBLOCKSHIFT;
+
+    var bx: i32 = xl;
+    for (bx <= xh) {
+        var by: i32 = yl;
+        for (by <= yh) {
+            if (!maputl.block_things_iterator(g, bx, by, check_thing)) { ret 0; }
+            by = by + 1;
+        }
+        bx = bx + 1;
+    }
+
+    # check lines
+    xl = (g.tmbbox[level.BOXLEFT] - g.lv.bmaporgx) >> defs.MAPBLOCKSHIFT;
+    xh = (g.tmbbox[level.BOXRIGHT] - g.lv.bmaporgx) >> defs.MAPBLOCKSHIFT;
+    yl = (g.tmbbox[level.BOXBOTTOM] - g.lv.bmaporgy) >> defs.MAPBLOCKSHIFT;
+    yh = (g.tmbbox[level.BOXTOP] - g.lv.bmaporgy) >> defs.MAPBLOCKSHIFT;
+
+    bx = xl;
+    for (bx <= xh) {
+        var by: i32 = yl;
+        for (by <= yh) {
+            if (!maputl.block_lines_iterator(g, bx, by, check_line)) { ret 0; }
+            by = by + 1;
+        }
+        bx = bx + 1;
+    }
+    ret 1;
+}
+
+# P_TryMove: attempt to move to a new position, crossing special lines unless
+# MF_TELEPORT is set
+pub fun try_move(g: *Game, thing: *Mobj, x: Fixed, y: Fixed) bool {
+    g.floatok = 0;
+    if (!check_position(g, thing, x, y)) {
+        # solid wall or thing
+        ret 0;
+    }
+
+    if ((thing.flags & defs.MF_NOCLIP) == 0) {
+        if (g.tmceilingz - g.tmfloorz < thing.height) {
+            # doesn't fit
+            ret 0;
+        }
+
+        g.floatok = 1;
+
+        if ((thing.flags & defs.MF_TELEPORT) == 0 && g.tmceilingz - thing.z < thing.height) {
+            # mobj must lower itself to fit
+            ret 0;
+        }
+        if ((thing.flags & defs.MF_TELEPORT) == 0 && g.tmfloorz - thing.z > 24 * 65536) {
+            # too big a step up
+            ret 0;
+        }
+        if ((thing.flags & (defs.MF_DROPOFF | defs.MF_FLOAT)) == 0 && g.tmfloorz - g.tmdropoffz > 24 * 65536) {
+            # don't stand over a dropoff
+            ret 0;
+        }
+    }
+
+    # the move is ok, so link the thing into its new position
+    maputl.unset_thing_position(g, thing);
+
+    val oldx: Fixed = thing.x;
+    val oldy: Fixed = thing.y;
+    thing.floorz   = g.tmfloorz;
+    thing.ceilingz = g.tmceilingz;
+    thing.x        = x;
+    thing.y        = y;
+
+    maputl.set_thing_position(g, thing);
+
+    # if any special lines were hit, do the effect
+    if ((thing.flags & (defs.MF_TELEPORT | defs.MF_NOCLIP)) == 0) {
+        for (g.numspechit > 0) {
+            g.numspechit = g.numspechit - 1;
+            # see if the line was crossed
+            val ld:      i32 = g.spechit[g.numspechit];
+            val side:    i32 = maputl.point_on_line_side(g, thing.x, thing.y, ld);
+            val oldside: i32 = maputl.point_on_line_side(g, oldx, oldy, ld);
+            if (side != oldside) {
+                if (g.lv.lines[ld].special != 0) { g.line_special(g, defs.TRIGGER_CROSS, ld, oldside, thing); }
+            }
+        }
+        # the original's loop leaves the count at -1
+        g.numspechit = -1;
+    }
+    ret 1;
+}
+
+# P_ThingHeightClip: takes a valid thing and adjusts the thing's floorz,
+# ceilingz, and possibly z. this is called for all nearby monsters whenever a
+# sector changes height. if the thing doesn't fit, the z will be set to the
+# lowest value and false will be returned.
+fun thing_height_clip(g: *Game, thing: *Mobj) bool {
+    val onfloor: bool = thing.z == thing.floorz;
+
+    check_position(g, thing, thing.x, thing.y);
+    # what about stranding a monster partially off an edge?
+
+    thing.floorz   = g.tmfloorz;
+    thing.ceilingz = g.tmceilingz;
+
+    if (onfloor) {
+        # walking monsters rise and fall with the floor
+        thing.z = thing.floorz;
+    }
+    or {
+        # don't adjust a floating monster unless forced to
+        if (thing.z + thing.height > thing.ceilingz) { thing.z = thing.ceilingz - thing.height; }
+    }
+
+    if (thing.ceilingz - thing.floorz < thing.height) { ret 0; }
+    ret 1;
+}
+
+# P_HitSlideLine: adjusts the xmove / ymove so that the next move will slide
+# along the wall
+fun hit_slide_line(g: *Game, linenum: i32) {
+    val ld: *level.Line = ?g.lv.lines[linenum];
+
+    if (ld.slopetype == level.ST_HORIZONTAL) {
+        g.tmymove = 0;
+        ret;
+    }
+    if (ld.slopetype == level.ST_VERTICAL) {
+        g.tmxmove = 0;
+        ret;
+    }
+
+    val side: i32 = maputl.point_on_line_side(g, g.slidemo.x, g.slidemo.y, linenum);
+
+    var lineangle: u32 = point_to_angle2(0, 0, ld.dx, ld.dy);
+    if (side == 1) { lineangle = lineangle + t.ANG180; }
+
+    val moveangle:  u32 = point_to_angle2(0, 0, g.tmxmove, g.tmymove);
+    var deltaangle: u32 = moveangle - lineangle;
+    if (deltaangle > t.ANG180) { deltaangle = deltaangle + t.ANG180; }
+
+    lineangle  = lineangle >> t.ANGLETOFINESHIFT;
+    deltaangle = deltaangle >> t.ANGLETOFINESHIFT;
+
+    val movelen: Fixed = maputl.aprox_distance(g.tmxmove, g.tmymove);
+    val newlen:  Fixed = fixed.mul(movelen, cosine(deltaangle));
+
+    g.tmxmove = fixed.mul(newlen, cosine(lineangle));
+    g.tmymove = fixed.mul(newlen, sine(lineangle));
+}
+
+# PTR_SlideTraverse
+fun slide_traverse(g: *Game, in: *Intercept) bool {
+    val li:       i32  = in.line;
+    var blocking: bool = 0;
+
+    if ((g.lv.lines[li].flags::i32 & defs.ML_TWOSIDED) == 0) {
+        if (maputl.point_on_line_side(g, g.slidemo.x, g.slidemo.y, li) != 0) {
+            # don't hit the back side
+            ret 1;
+        }
+        blocking = 1;
+    }
+    or {
+        # set openrange, opentop, openbottom
+        maputl.line_opening(g, li);
+
+        if (g.openrange < g.slidemo.height) {
+            # doesn't fit
+            blocking = 1;
+        }
+        or (g.opentop - g.slidemo.z < g.slidemo.height) {
+            # mobj is too high
+            blocking = 1;
+        }
+        or (g.openbottom - g.slidemo.z > 24 * 65536) {
+            # too big a step up
+            blocking = 1;
+        }
+    }
+
+    if (!blocking) {
+        # this line doesn't block movement
+        ret 1;
+    }
+
+    # the line does block movement; see if it is closer than best so far
+    if (in.frac < g.bestslidefrac) {
+        g.secondslidefrac = g.bestslidefrac;
+        g.secondslideline = g.bestslideline;
+        g.bestslidefrac   = in.frac;
+        g.bestslideline   = li;
+    }
+    # stop
+    ret 0;
+}
+
+fun stairstep(g: *Game, mo: *Mobj) {
+    if (!try_move(g, mo, mo.x, mo.y + mo.momy)) { try_move(g, mo, mo.x + mo.momx, mo.y); }
+}
+
+# P_SlideMove: the momx / momy move is bad, so try to slide along a wall.
+# find the first line hit, move flush to it, and slide along it. this is a
+# kludgy mess.
+fun slide_move(g: *Game, mo: *Mobj) {
+    g.slidemo = mo;
+    var hitcount: i32 = 0;
+
+    for {
+        hitcount = hitcount + 1;
+        if (hitcount == 3) {
+            # don't loop forever
+            stairstep(g, mo);
+            ret;
+        }
+
+        # trace along the three leading corners
+        var leadx:  Fixed = mo.x - mo.radius;
+        var trailx: Fixed = mo.x + mo.radius;
+        if (mo.momx > 0) {
+            leadx  = mo.x + mo.radius;
+            trailx = mo.x - mo.radius;
+        }
+
+        var leady:  Fixed = mo.y - mo.radius;
+        var traily: Fixed = mo.y + mo.radius;
+        if (mo.momy > 0) {
+            leady  = mo.y + mo.radius;
+            traily = mo.y - mo.radius;
+        }
+
+        g.bestslidefrac = 65536 + 1;
+
+        maputl.path_traverse(g, leadx, leady, leadx + mo.momx, leady + mo.momy, defs.PT_ADDLINES, slide_traverse);
+        maputl.path_traverse(g, trailx, leady, trailx + mo.momx, leady + mo.momy, defs.PT_ADDLINES, slide_traverse);
+        maputl.path_traverse(g, leadx, traily, leadx + mo.momx, traily + mo.momy, defs.PT_ADDLINES, slide_traverse);
+
+        # move up to the wall
+        if (g.bestslidefrac == 65536 + 1) {
+            # the move must have hit the middle, so stairstep
+            stairstep(g, mo);
+            ret;
+        }
+
+        # fudge a bit to make sure it doesn't hit
+        g.bestslidefrac = g.bestslidefrac - 0x800;
+        if (g.bestslidefrac > 0) {
+            val newx: Fixed = fixed.mul(mo.momx, g.bestslidefrac);
+            val newy: Fixed = fixed.mul(mo.momy, g.bestslidefrac);
+
+            if (!try_move(g, mo, mo.x + newx, mo.y + newy)) {
+                stairstep(g, mo);
+                ret;
+            }
+        }
+
+        # now continue along the wall. first calculate remainder.
+        g.bestslidefrac = 65536 - (g.bestslidefrac + 0x800);
+
+        if (g.bestslidefrac > 65536) { g.bestslidefrac = 65536; }
+        if (g.bestslidefrac <= 0)    { ret; }
+
+        g.tmxmove = fixed.mul(mo.momx, g.bestslidefrac);
+        g.tmymove = fixed.mul(mo.momy, g.bestslidefrac);
+
+        # clip the moves
+        hit_slide_line(g, g.bestslideline);
+
+        mo.momx = g.tmxmove;
+        mo.momy = g.tmymove;
+
+        if (try_move(g, mo, mo.x + g.tmxmove, mo.y + g.tmymove)) { ret; }
+    }
+}
+
+# PTR_AimTraverse: sets linetarget and aimslope when a target is aimed at
+fun aim_traverse(g: *Game, in: *Intercept) bool {
+    if (in.isaline) {
+        val li: *level.Line = ?g.lv.lines[in.line];
+
+        if ((li.flags::i32 & defs.ML_TWOSIDED) == 0) {
+            # stop
+            ret 0;
+        }
+
+        # crosses a two sided line. a possible target might be in front of
+        # the wall.
+        maputl.line_opening(g, in.line);
+
+        if (g.openbottom >= g.opentop) {
+            # stop
+            ret 0;
+        }
+
+        val dist:  Fixed         = fixed.mul(g.attackrange, in.frac);
+        val front: *level.Sector = ?g.lv.sectors[li.frontsector];
+        val back:  *level.Sector = ?g.lv.sectors[li.backsector];
+
+        if (front.floorheight != back.floorheight) {
+            val slope: Fixed = fixed.div(g.openbottom - g.shootz, dist);
+            if (slope > g.bottomslope) { g.bottomslope = slope; }
+        }
+
+        if (front.ceilingheight != back.ceilingheight) {
+            val slope: Fixed = fixed.div(g.opentop - g.shootz, dist);
+            if (slope < g.topslope) { g.topslope = slope; }
+        }
+
+        if (g.topslope <= g.bottomslope) {
+            # stop
+            ret 0;
+        }
+        # shot continues
+        ret 1;
+    }
+
+    # shoot a thing
+    val th: *Mobj = in.thing;
+    if (th == g.shootthing) {
+        # can't shoot self
+        ret 1;
+    }
+    if ((th.flags & defs.MF_SHOOTABLE) == 0) {
+        # corpse or something
+        ret 1;
+    }
+
+    # check angles to see if the thing can be aimed at
+    val dist:          Fixed = fixed.mul(g.attackrange, in.frac);
+    var thingtopslope: Fixed = fixed.div(th.z + th.height - g.shootz, dist);
+
+    if (thingtopslope < g.bottomslope) {
+        # shot over the thing
+        ret 1;
+    }
+
+    var thingbottomslope: Fixed = fixed.div(th.z - g.shootz, dist);
+
+    if (thingbottomslope > g.topslope) {
+        # shot under the thing
+        ret 1;
+    }
+
+    # this thing can be hit!
+    if (thingtopslope > g.topslope)       { thingtopslope = g.topslope; }
+    if (thingbottomslope < g.bottomslope) { thingbottomslope = g.bottomslope; }
+
+    g.aimslope   = (thingtopslope + thingbottomslope) / 2;
+    g.linetarget = th;
+
+    # don't go any farther
+    ret 0;
+}
+
+# where a shot that stops at an intercept leaves its mark
+fun hit_line(g: *Game, in: *Intercept) bool {
+    val li: *level.Line = ?g.lv.lines[in.line];
+
+    # position a bit closer
+    val frac: Fixed = in.frac - fixed.div(4 * 65536, g.attackrange);
+    val x:    Fixed = g.trace.x + fixed.mul(g.trace.dx, frac);
+    val y:    Fixed = g.trace.y + fixed.mul(g.trace.dy, frac);
+    val z:    Fixed = g.shootz + fixed.mul(g.aimslope, fixed.mul(frac, g.attackrange));
+
+    if (g.lv.sectors[li.frontsector].ceilingflat == g.skyflatnum) {
+        # don't shoot the sky!
+        if (z > g.lv.sectors[li.frontsector].ceilingheight) { ret 0; }
+
+        # it's a sky hack wall
+        if (li.backsector != level.NONE && g.lv.sectors[li.backsector].ceilingflat == g.skyflatnum) { ret 0; }
+    }
+
+    # spawn bullet puffs
+    spawn_puff(g, x, y, z);
+
+    # don't go any farther
+    ret 0;
+}
+
+# PTR_ShootTraverse
+fun shoot_traverse(g: *Game, in: *Intercept) bool {
+    if (in.isaline) {
+        val li: *level.Line = ?g.lv.lines[in.line];
+
+        if (li.special != 0) { g.line_special(g, defs.TRIGGER_SHOOT, in.line, 0, g.shootthing); }
+
+        if ((li.flags::i32 & defs.ML_TWOSIDED) == 0) { ret hit_line(g, in); }
+
+        # crosses a two sided line
+        maputl.line_opening(g, in.line);
+
+        val dist:  Fixed         = fixed.mul(g.attackrange, in.frac);
+        val front: *level.Sector = ?g.lv.sectors[li.frontsector];
+        val back:  *level.Sector = ?g.lv.sectors[li.backsector];
+
+        if (front.floorheight != back.floorheight) {
+            val slope: Fixed = fixed.div(g.openbottom - g.shootz, dist);
+            if (slope > g.aimslope) { ret hit_line(g, in); }
+        }
+
+        if (front.ceilingheight != back.ceilingheight) {
+            val slope: Fixed = fixed.div(g.opentop - g.shootz, dist);
+            if (slope < g.aimslope) { ret hit_line(g, in); }
+        }
+
+        # shot continues
+        ret 1;
+    }
+
+    # shoot a thing
+    val th: *Mobj = in.thing;
+    if (th == g.shootthing) {
+        # can't shoot self
+        ret 1;
+    }
+    if ((th.flags & defs.MF_SHOOTABLE) == 0) {
+        # corpse or something
+        ret 1;
+    }
+
+    # check angles to see if the thing can be aimed at
+    val dist:          Fixed = fixed.mul(g.attackrange, in.frac);
+    val thingtopslope: Fixed = fixed.div(th.z + th.height - g.shootz, dist);
+
+    if (thingtopslope < g.aimslope) {
+        # shot over the thing
+        ret 1;
+    }
+
+    val thingbottomslope: Fixed = fixed.div(th.z - g.shootz, dist);
+
+    if (thingbottomslope > g.aimslope) {
+        # shot under the thing
+        ret 1;
+    }
+
+    # hit thing; position a bit closer
+    val frac: Fixed = in.frac - fixed.div(10 * 65536, g.attackrange);
+    val x:    Fixed = g.trace.x + fixed.mul(g.trace.dx, frac);
+    val y:    Fixed = g.trace.y + fixed.mul(g.trace.dy, frac);
+    val z:    Fixed = g.shootz + fixed.mul(g.aimslope, fixed.mul(frac, g.attackrange));
+
+    # spawn bullet puffs or blood spots, depending on target type
+    if ((th.flags & defs.MF_NOBLOOD) != 0) {
+        spawn_puff(g, x, y, z);
+    }
+    or {
+        spawn_blood(g, x, y, z, g.la_damage);
+    }
+
+    if (g.la_damage != 0) { damage_mobj(g, th, g.shootthing, g.shootthing, g.la_damage); }
+
+    # don't go any farther
+    ret 0;
+}
+
+# P_AimLineAttack
+pub fun aim_line_attack(g: *Game, t1: *Mobj, angle_in: u32, distance: Fixed) Fixed {
+    val angle: u32 = angle_in >> t.ANGLETOFINESHIFT;
+    g.shootthing = t1;
+
+    val x2: Fixed = t1.x + (distance >> 16) * cosine(angle);
+    val y2: Fixed = t1.y + (distance >> 16) * sine(angle);
+    g.shootz = t1.z + (t1.height >> 1) + 8 * 65536;
+
+    # can't shoot outside view angles
+    g.topslope    = 100 * 65536 / 160;
+    g.bottomslope = 0 - 100 * 65536 / 160;
+
+    g.attackrange = distance;
+    g.linetarget  = nil;
+
+    maputl.path_traverse(g, t1.x, t1.y, x2, y2, defs.PT_ADDLINES | defs.PT_ADDTHINGS, aim_traverse);
+
+    if (g.linetarget != nil) { ret g.aimslope; }
+    ret 0;
+}
+
+# P_LineAttack: if damage == 0, it is just a test trace that will leave
+# linetarget set
+pub fun line_attack(g: *Game, t1: *Mobj, angle_in: u32, distance: Fixed, slope: Fixed, damage: i32) {
+    val angle: u32 = angle_in >> t.ANGLETOFINESHIFT;
+    g.shootthing = t1;
+    g.la_damage  = damage;
+
+    val x2: Fixed = t1.x + (distance >> 16) * cosine(angle);
+    val y2: Fixed = t1.y + (distance >> 16) * sine(angle);
+    g.shootz      = t1.z + (t1.height >> 1) + 8 * 65536;
+    g.attackrange = distance;
+    g.aimslope    = slope;
+
+    maputl.path_traverse(g, t1.x, t1.y, x2, y2, defs.PT_ADDLINES | defs.PT_ADDTHINGS, shoot_traverse);
+}
+
+# PTR_UseTraverse
+fun use_traverse(g: *Game, in: *Intercept) bool {
+    if (g.lv.lines[in.line].special == 0) {
+        maputl.line_opening(g, in.line);
+        if (g.openrange <= 0) {
+            defs.sound(g, g.usething, info.SFX_NOWAY);
+            # can't use through a wall
+            ret 0;
+        }
+        # not a special line, but keep checking
+        ret 1;
+    }
+
+    var side: i32 = 0;
+    if (maputl.point_on_line_side(g, g.usething.x, g.usething.y, in.line) == 1) { side = 1; }
+
+    g.line_special(g, defs.TRIGGER_USE, in.line, side, g.usething);
+
+    # can't use more than one special line in a row
+    ret 0;
+}
+
+# P_UseLines: looks for special lines in front of the player to activate
+pub fun use_lines(g: *Game, player: *Player) {
+    g.usething = player.mo;
+
+    val angle: u32   = player.mo.angle >> t.ANGLETOFINESHIFT;
+    val x1:    Fixed = player.mo.x;
+    val y1:    Fixed = player.mo.y;
+    val x2:    Fixed = x1 + (defs.USERANGE >> 16) * cosine(angle);
+    val y2:    Fixed = y1 + (defs.USERANGE >> 16) * sine(angle);
+
+    maputl.path_traverse(g, x1, y1, x2, y2, defs.PT_ADDLINES, use_traverse);
+}
+
+# PIT_RadiusAttack: "bombsource" is the creature that caused the explosion at
+# "bombspot"
+fun radius_attack_thing(g: *Game, thing: *Mobj) bool {
+    if ((thing.flags & defs.MF_SHOOTABLE) == 0) { ret 1; }
+
+    # boss spider and cyborg take no damage from concussion
+    if (thing.kind == info.MT_CYBORG || thing.kind == info.MT_SPIDER) { ret 1; }
+
+    val dx:   Fixed = abs32(thing.x - g.bombspot.x);
+    val dy:   Fixed = abs32(thing.y - g.bombspot.y);
+    var dist: Fixed = dy;
+    if (dx > dy) { dist = dx; }
+    dist = (dist - thing.radius) >> 16;
+
+    if (dist < 0) { dist = 0; }
+    if (dist >= g.bombdamage) {
+        # out of range
+        ret 1;
+    }
+
+    if (maputl.check_sight(g, thing, g.bombspot)) {
+        # must be in direct path
+        damage_mobj(g, thing, g.bombspot, g.bombsource, g.bombdamage - dist);
+    }
+    ret 1;
+}
+
+# P_RadiusAttack: source is the creature that caused the explosion at spot
+pub fun radius_attack(g: *Game, spot: *Mobj, source: *Mobj, damage: i32) {
+    # MAXRADIUS is already 32 map units in fixed point, so adding it and
+    # shifting again overflows it away: the reach is the damage alone. this
+    # is the original's arithmetic, and demos depend on it.
+    val dist: Fixed = (damage + defs.MAXRADIUS) << 16;
+    val yh:   i32   = (spot.y + dist - g.lv.bmaporgy) >> defs.MAPBLOCKSHIFT;
+    val yl:   i32   = (spot.y - dist - g.lv.bmaporgy) >> defs.MAPBLOCKSHIFT;
+    val xh:   i32   = (spot.x + dist - g.lv.bmaporgx) >> defs.MAPBLOCKSHIFT;
+    val xl:   i32   = (spot.x - dist - g.lv.bmaporgx) >> defs.MAPBLOCKSHIFT;
+
+    g.bombspot   = spot;
+    g.bombsource = source;
+    g.bombdamage = damage;
+
+    var y: i32 = yl;
+    for (y <= yh) {
+        var x: i32 = xl;
+        for (x <= xh) {
+            maputl.block_things_iterator(g, x, y, radius_attack_thing);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# PIT_ChangeSector
+fun change_sector_thing(g: *Game, thing: *Mobj) bool {
+    if (thing_height_clip(g, thing)) {
+        # keep checking
+        ret 1;
+    }
+
+    # crunch bodies to giblets
+    if (thing.health <= 0) {
+        set_mobj_state(g, thing, info.S_GIBS);
+
+        thing.flags  = thing.flags & ~defs.MF_SOLID;
+        thing.height = 0;
+        thing.radius = 0;
+
+        # keep checking
+        ret 1;
+    }
+
+    # crunch dropped items
+    if ((thing.flags & defs.MF_DROPPED) != 0) {
+        remove_mobj(g, thing);
+
+        # keep checking
+        ret 1;
+    }
+
+    if ((thing.flags & defs.MF_SHOOTABLE) == 0) {
+        # assume it is bloody gibs or something
+        ret 1;
+    }
+
+    g.nofit = 1;
+
+    if (g.crushchange && (g.leveltime & 3) == 0) {
+        damage_mobj(g, thing, nil, nil, 10);
+
+        # spray blood in a random direction
+        val mo: *Mobj = spawn_mobj(g, thing.x, thing.y, thing.z + thing.height / 2, info.MT_BLOOD);
+        mo.momx = sub_random(g) << 12;
+        mo.momy = sub_random(g) << 12;
+    }
+
+    # keep checking (crush other things)
+    ret 1;
+}
+
+# P_ChangeSector: a sector's floor or ceiling moved; refit everything in it
+# ---
+# ret: true if something no longer fits
+pub fun change_sector(g: *Game, secnum: i32, crunch: bool) bool {
+    val sector: *level.Sector = ?g.lv.sectors[secnum];
+    g.nofit       = 0;
+    g.crushchange = crunch;
+
+    # re-check heights for all things near the moving sector
+    var x: i32 = sector.blockbox[level.BOXLEFT];
+    for (x <= sector.blockbox[level.BOXRIGHT]) {
+        var y: i32 = sector.blockbox[level.BOXBOTTOM];
+        for (y <= sector.blockbox[level.BOXTOP]) {
+            maputl.block_things_iterator(g, x, y, change_sector_thing);
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    ret g.nofit;
+}

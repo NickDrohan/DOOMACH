@@ -1,0 +1,686 @@
+# geometry and the blockmap: which side of a line, where two lines cross,
+# what lies along a path, and where a thing is linked into the map
+#
+# Ported from p_maputl.c and p_sight.c. Both are leaves: they call nothing
+# above them, and what they find they hand to a callback.
+
+use std.types.bool.bool;
+
+use doom.defs;
+use doom.defs.Divline;
+use doom.defs.Game;
+use doom.defs.Intercept;
+use doom.defs.Mobj;
+use doom.fixed;
+use doom.fixed.Fixed;
+use doom.level;
+use doom.render;
+
+pub def LineFunc:  fun(*Game, i32) bool;
+pub def ThingFunc: fun(*Game, *Mobj) bool;
+pub def Traverser: fun(*Game, *Intercept) bool;
+
+fun abs32(x: i32) i32 {
+    if (x < 0) { ret 0 - x; }
+    ret x;
+}
+
+# P_AproxDistance: an estimate of distance that needs no square root
+pub fun aprox_distance(dx_in: Fixed, dy_in: Fixed) Fixed {
+    val dx: Fixed = abs32(dx_in);
+    val dy: Fixed = abs32(dy_in);
+    if (dx < dy) { ret dx + dy - (dx >> 1); }
+    ret dx + dy - (dy >> 1);
+}
+
+# P_PointOnLineSide
+# ---
+# ret: 0 for the front, 1 for the back
+pub fun point_on_line_side(g: *Game, x: Fixed, y: Fixed, linenum: i32) i32 {
+    val line: *level.Line  = ?g.lv.lines[linenum];
+    val v1:   level.Vertex = g.lv.vertexes[line.v1];
+
+    if (line.dx == 0) {
+        if (x <= v1.x) { ret (line.dy > 0)::i32; }
+        ret (line.dy < 0)::i32;
+    }
+    if (line.dy == 0) {
+        if (y <= v1.y) { ret (line.dx < 0)::i32; }
+        ret (line.dx > 0)::i32;
+    }
+
+    val dx:    Fixed = x - v1.x;
+    val dy:    Fixed = y - v1.y;
+    val left:  Fixed = fixed.mul(line.dy >> 16, dx);
+    val right: Fixed = fixed.mul(dy, line.dx >> 16);
+    if (right < left) { ret 0; }
+    ret 1;
+}
+
+# P_BoxOnLineSide: considers the line to be infinite
+# ---
+# ret: 0 or 1 for the side the whole box is on, -1 if the line crosses it
+pub fun box_on_line_side(g: *Game, tmbox: *Fixed, linenum: i32) i32 {
+    val ld: *level.Line  = ?g.lv.lines[linenum];
+    val v1: level.Vertex = g.lv.vertexes[ld.v1];
+    var p1: i32          = 0;
+    var p2: i32          = 0;
+
+    if (ld.slopetype == level.ST_HORIZONTAL) {
+        p1 = (tmbox[level.BOXTOP] > v1.y)::i32;
+        p2 = (tmbox[level.BOXBOTTOM] > v1.y)::i32;
+        if (ld.dx < 0) {
+            p1 = p1 ^ 1;
+            p2 = p2 ^ 1;
+        }
+    }
+    or (ld.slopetype == level.ST_VERTICAL) {
+        p1 = (tmbox[level.BOXRIGHT] < v1.x)::i32;
+        p2 = (tmbox[level.BOXLEFT] < v1.x)::i32;
+        if (ld.dy < 0) {
+            p1 = p1 ^ 1;
+            p2 = p2 ^ 1;
+        }
+    }
+    or (ld.slopetype == level.ST_POSITIVE) {
+        p1 = point_on_line_side(g, tmbox[level.BOXLEFT], tmbox[level.BOXTOP], linenum);
+        p2 = point_on_line_side(g, tmbox[level.BOXRIGHT], tmbox[level.BOXBOTTOM], linenum);
+    }
+    or {
+        p1 = point_on_line_side(g, tmbox[level.BOXRIGHT], tmbox[level.BOXTOP], linenum);
+        p2 = point_on_line_side(g, tmbox[level.BOXLEFT], tmbox[level.BOXBOTTOM], linenum);
+    }
+
+    if (p1 == p2) { ret p1; }
+    ret -1;
+}
+
+# P_PointOnDivlineSide
+pub fun point_on_divline_side(x: Fixed, y: Fixed, line: *Divline) i32 {
+    if (line.dx == 0) {
+        if (x <= line.x) { ret (line.dy > 0)::i32; }
+        ret (line.dy < 0)::i32;
+    }
+    if (line.dy == 0) {
+        if (y <= line.y) { ret (line.dx < 0)::i32; }
+        ret (line.dx > 0)::i32;
+    }
+
+    val dx: Fixed = x - line.x;
+    val dy: Fixed = y - line.y;
+
+    # try to quickly decide by looking at sign bits
+    if ((line.dy ^ line.dx ^ dx ^ dy) < 0) {
+        if ((line.dy ^ dx) < 0) { ret 1; }
+        ret 0;
+    }
+
+    val left:  Fixed = fixed.mul(line.dy >> 8, dx >> 8);
+    val right: Fixed = fixed.mul(dy >> 8, line.dx >> 8);
+    if (right < left) { ret 0; }
+    ret 1;
+}
+
+# P_MakeDivline
+pub fun make_divline(g: *Game, linenum: i32, dl: *Divline) {
+    val li: *level.Line = ?g.lv.lines[linenum];
+    dl.x  = g.lv.vertexes[li.v1].x;
+    dl.y  = g.lv.vertexes[li.v1].y;
+    dl.dx = li.dx;
+    dl.dy = li.dy;
+}
+
+# P_InterceptVector: how far along v2 it crosses v1, as a fraction of v2
+pub fun intercept_vector(v2: *Divline, v1: *Divline) Fixed {
+    val den: Fixed = fixed.mul(v1.dy >> 8, v2.dx) - fixed.mul(v1.dx >> 8, v2.dy);
+    if (den == 0) { ret 0; }
+    val num: Fixed = fixed.mul((v1.x - v2.x) >> 8, v1.dy) + fixed.mul((v2.y - v1.y) >> 8, v1.dx);
+    ret fixed.div(num, den);
+}
+
+# P_LineOpening: the gap a two-sided line leaves between its sectors, left in
+# g.opentop, g.openbottom, g.openrange and g.lowfloor
+pub fun line_opening(g: *Game, linenum: i32) {
+    val linedef: *level.Line = ?g.lv.lines[linenum];
+    if (linedef.sidenum[1] == level.NONE) {
+        # single sided line
+        g.openrange = 0;
+        ret;
+    }
+
+    val front: *level.Sector = ?g.lv.sectors[linedef.frontsector];
+    val back:  *level.Sector = ?g.lv.sectors[linedef.backsector];
+
+    if (front.ceilingheight < back.ceilingheight) {
+        g.opentop = front.ceilingheight;
+    }
+    or {
+        g.opentop = back.ceilingheight;
+    }
+
+    if (front.floorheight > back.floorheight) {
+        g.openbottom = front.floorheight;
+        g.lowfloor   = back.floorheight;
+    }
+    or {
+        g.openbottom = back.floorheight;
+        g.lowfloor   = front.floorheight;
+    }
+
+    g.openrange = g.opentop - g.openbottom;
+}
+
+# P_UnsetThingPosition: unlink a thing from its sector and blockmap cell
+pub fun unset_thing_position(g: *Game, thing: *Mobj) {
+    if ((thing.flags & defs.MF_NOSECTOR) == 0) {
+        # inert things don't need to be in the blockmap; unlink from subsector
+        if (thing.snext != nil) { thing.snext.sprev = thing.sprev; }
+        if (thing.sprev != nil) {
+            thing.sprev.snext = thing.snext;
+        }
+        or {
+            defs.sector_of(g, thing).thinglist = thing.snext:~ptr;
+        }
+    }
+
+    if ((thing.flags & defs.MF_NOBLOCKMAP) == 0) {
+        # inert things don't need to be in the blockmap; unlink from block map
+        if (thing.bnext != nil) { thing.bnext.bprev = thing.bprev; }
+        if (thing.bprev != nil) {
+            thing.bprev.bnext = thing.bnext;
+        }
+        or {
+            val blockx: i32 = (thing.x - g.lv.bmaporgx) >> defs.MAPBLOCKSHIFT;
+            val blocky: i32 = (thing.y - g.lv.bmaporgy) >> defs.MAPBLOCKSHIFT;
+            if (blockx >= 0 && blockx < g.lv.bmapwidth && blocky >= 0 && blocky < g.lv.bmapheight) {
+                g.blocklinks[blocky * g.lv.bmapwidth + blockx] = thing.bnext;
+            }
+        }
+    }
+}
+
+# P_SetThingPosition: link a thing into the sector and blockmap cell that its
+# x and y put it in
+pub fun set_thing_position(g: *Game, thing: *Mobj) {
+    # link into subsector
+    val ss: i32 = render.point_in_subsector(g.lv, thing.x, thing.y);
+    thing.subsector = ss;
+
+    if ((thing.flags & defs.MF_NOSECTOR) == 0) {
+        # invisible things don't go into the sector links
+        val sec: *level.Sector = ?g.lv.sectors[g.lv.subsectors[ss].sector];
+        thing.sprev = nil;
+        thing.snext = sec.thinglist:~*Mobj;
+        if (sec.thinglist != nil) { thing.snext.sprev = thing; }
+        sec.thinglist = thing:~ptr;
+    }
+
+    # link into blockmap
+    if ((thing.flags & defs.MF_NOBLOCKMAP) == 0) {
+        # inert things don't need to be in blockmap
+        val blockx: i32 = (thing.x - g.lv.bmaporgx) >> defs.MAPBLOCKSHIFT;
+        val blocky: i32 = (thing.y - g.lv.bmaporgy) >> defs.MAPBLOCKSHIFT;
+        if (blockx >= 0 && blockx < g.lv.bmapwidth && blocky >= 0 && blocky < g.lv.bmapheight) {
+            val link: **Mobj = ?g.blocklinks[blocky * g.lv.bmapwidth + blockx];
+            thing.bprev = nil;
+            thing.bnext = @link;
+            if (@link != nil) { thing.bnext.bprev = thing; }
+            @link = thing;
+        }
+        or {
+            # thing is off the map
+            thing.bnext = nil;
+            thing.bprev = nil;
+        }
+    }
+}
+
+# P_BlockLinesIterator: call func for each line in a blockmap cell, each line
+# once per validcount, until func says stop
+# ---
+# ret: false if func stopped the scan
+pub fun block_lines_iterator(g: *Game, x: i32, y: i32, func: LineFunc) bool {
+    if (x < 0 || y < 0 || x >= g.lv.bmapwidth || y >= g.lv.bmapheight) { ret 1; }
+
+    # the cell's list starts at the word its entry names and ends at -1
+    var at: i32 = level.blockword(g.lv, 4 + y * g.lv.bmapwidth + x);
+    for {
+        val num: i32 = level.blockword(g.lv, at);
+        if (num == -1) { brk; }
+        at = at + 1;
+        val ld: *level.Line = ?g.lv.lines[num];
+        if (ld.validcount == g.validcount) {
+            # line has already been checked
+            cnt;
+        }
+        ld.validcount = g.validcount;
+        if (!func(g, num)) { ret 0; }
+    }
+    # everything was checked
+    ret 1;
+}
+
+# P_BlockThingsIterator
+# ---
+# ret: false if func stopped the scan
+pub fun block_things_iterator(g: *Game, x: i32, y: i32, func: ThingFunc) bool {
+    if (x < 0 || y < 0 || x >= g.lv.bmapwidth || y >= g.lv.bmapheight) { ret 1; }
+
+    var mobj: *Mobj = g.blocklinks[y * g.lv.bmapwidth + x];
+    for (mobj != nil) {
+        if (!func(g, mobj)) { ret 0; }
+        # read after the call, as the original does: a thing func removed is
+        # unlinked but still holds its old link
+        mobj = mobj.bnext;
+    }
+    ret 1;
+}
+
+# PIT_AddLineIntercepts: looks for lines in the given block that intercept the
+# trace. a line is crossed if its endpoints are on opposite sides of the trace
+fun add_line_intercepts(g: *Game, linenum: i32) bool {
+    val ld: *level.Line  = ?g.lv.lines[linenum];
+    val v1: level.Vertex = g.lv.vertexes[ld.v1];
+    val v2: level.Vertex = g.lv.vertexes[ld.v2];
+    var s1: i32          = 0;
+    var s2: i32          = 0;
+
+    # avoid precision problems with two routines
+    if (g.trace.dx > 65536 * 16 || g.trace.dy > 65536 * 16 || g.trace.dx < 0 - 65536 * 16 || g.trace.dy < 0 - 65536 * 16) {
+        s1 = point_on_divline_side(v1.x, v1.y, ?g.trace);
+        s2 = point_on_divline_side(v2.x, v2.y, ?g.trace);
+    }
+    or {
+        s1 = point_on_line_side(g, g.trace.x, g.trace.y, linenum);
+        s2 = point_on_line_side(g, g.trace.x + g.trace.dx, g.trace.y + g.trace.dy, linenum);
+    }
+
+    # line isn't crossed?
+    if (s1 == s2) { ret 1; }
+
+    # hit the line
+    var dl: Divline;
+    make_divline(g, linenum, ?dl);
+    val frac: Fixed = intercept_vector(?g.trace, ?dl);
+
+    # behind source?
+    if (frac < 0) { ret 1; }
+
+    # try to early out the check
+    if (g.earlyout && frac < 65536 && ld.backsector == level.NONE) {
+        # stop checking
+        ret 0;
+    }
+
+    if (g.intercept_p < defs.MAXINTERCEPTS) {
+        val in: *Intercept = ?g.intercepts[g.intercept_p];
+        in.frac       = frac;
+        in.isaline    = 1;
+        in.line       = linenum;
+        in.thing      = nil;
+        g.intercept_p = g.intercept_p + 1;
+    }
+    # continue
+    ret 1;
+}
+
+# PIT_AddThingIntercepts
+fun add_thing_intercepts(g: *Game, thing: *Mobj) bool {
+    val tracepositive: bool  = (g.trace.dx ^ g.trace.dy) > 0;
+    var x1:            Fixed = 0;
+    var y1:            Fixed = 0;
+    var x2:            Fixed = 0;
+    var y2:            Fixed = 0;
+
+    # check a corner to corner crossection for hit
+    if (tracepositive) {
+        x1 = thing.x - thing.radius;
+        y1 = thing.y + thing.radius;
+        x2 = thing.x + thing.radius;
+        y2 = thing.y - thing.radius;
+    }
+    or {
+        x1 = thing.x - thing.radius;
+        y1 = thing.y - thing.radius;
+        x2 = thing.x + thing.radius;
+        y2 = thing.y + thing.radius;
+    }
+
+    val s1: i32 = point_on_divline_side(x1, y1, ?g.trace);
+    val s2: i32 = point_on_divline_side(x2, y2, ?g.trace);
+
+    # line isn't crossed?
+    if (s1 == s2) { ret 1; }
+
+    var dl: Divline;
+    dl.x  = x1;
+    dl.y  = y1;
+    dl.dx = x2 - x1;
+    dl.dy = y2 - y1;
+
+    val frac: Fixed = intercept_vector(?g.trace, ?dl);
+
+    # behind source?
+    if (frac < 0) { ret 1; }
+
+    if (g.intercept_p < defs.MAXINTERCEPTS) {
+        val in: *Intercept = ?g.intercepts[g.intercept_p];
+        in.frac       = frac;
+        in.isaline    = 0;
+        in.line       = level.NONE;
+        in.thing      = thing;
+        g.intercept_p = g.intercept_p + 1;
+    }
+    # keep going
+    ret 1;
+}
+
+# P_TraverseIntercepts: hand func the intercepts nearest first, up to maxfrac
+# ---
+# ret: true if the traverser function returns true for all lines
+fun traverse_intercepts(g: *Game, func: Traverser, maxfrac: Fixed) bool {
+    var count: i32        = g.intercept_p;
+    var in:    *Intercept = nil;
+
+    for (count > 0) {
+        count = count - 1;
+        var dist: Fixed = defs.MAXINT;
+        var scan: i32   = 0;
+        for (scan < g.intercept_p) {
+            if (g.intercepts[scan].frac < dist) {
+                dist = g.intercepts[scan].frac;
+                in   = ?g.intercepts[scan];
+            }
+            scan = scan + 1;
+        }
+
+        # checked everything in range
+        if (dist > maxfrac) { ret 1; }
+
+        # don't bother going farther
+        if (!func(g, in)) { ret 0; }
+
+        in.frac = defs.MAXINT;
+    }
+    # everything was traversed
+    ret 1;
+}
+
+# P_PathTraverse: traces a line from x1,y1 to x2,y2, calling the traverser
+# function for each thing or line it meets, nearest first
+# ---
+# ret: true if the traverser function returns true for all lines
+pub fun path_traverse(g: *Game, x1_in: Fixed, y1_in: Fixed, x2_in: Fixed, y2_in: Fixed, flags: i32, trav: Traverser) bool {
+    var x1: Fixed = x1_in;
+    var y1: Fixed = y1_in;
+    var x2: Fixed = x2_in;
+    var y2: Fixed = y2_in;
+
+    g.earlyout    = (flags & defs.PT_EARLYOUT) != 0;
+    g.validcount  = g.validcount + 1;
+    g.intercept_p = 0;
+
+    # don't side exactly on a line
+    if (((x1 - g.lv.bmaporgx) & (defs.MAPBLOCKSIZE - 1)) == 0) { x1 = x1 + 65536; }
+    if (((y1 - g.lv.bmaporgy) & (defs.MAPBLOCKSIZE - 1)) == 0) { y1 = y1 + 65536; }
+
+    g.trace.x  = x1;
+    g.trace.y  = y1;
+    g.trace.dx = x2 - x1;
+    g.trace.dy = y2 - y1;
+
+    x1 = x1 - g.lv.bmaporgx;
+    y1 = y1 - g.lv.bmaporgy;
+    val xt1: i32 = x1 >> defs.MAPBLOCKSHIFT;
+    val yt1: i32 = y1 >> defs.MAPBLOCKSHIFT;
+
+    x2 = x2 - g.lv.bmaporgx;
+    y2 = y2 - g.lv.bmaporgy;
+    val xt2: i32 = x2 >> defs.MAPBLOCKSHIFT;
+    val yt2: i32 = y2 >> defs.MAPBLOCKSHIFT;
+
+    var mapxstep: i32   = 0;
+    var mapystep: i32   = 0;
+    var partial:  Fixed = 65536;
+    var xstep:    Fixed = 256 * 65536;
+    var ystep:    Fixed = 256 * 65536;
+
+    if (xt2 > xt1) {
+        mapxstep = 1;
+        partial  = 65536 - ((x1 >> defs.MAPBTOFRAC) & 65535);
+        ystep    = fixed.div(y2 - y1, abs32(x2 - x1));
+    }
+    or (xt2 < xt1) {
+        mapxstep = -1;
+        partial  = (x1 >> defs.MAPBTOFRAC) & 65535;
+        ystep    = fixed.div(y2 - y1, abs32(x2 - x1));
+    }
+    var yintercept: Fixed = (y1 >> defs.MAPBTOFRAC) + fixed.mul(partial, ystep);
+
+    partial = 65536;
+    if (yt2 > yt1) {
+        mapystep = 1;
+        partial  = 65536 - ((y1 >> defs.MAPBTOFRAC) & 65535);
+        xstep    = fixed.div(x2 - x1, abs32(y2 - y1));
+    }
+    or (yt2 < yt1) {
+        mapystep = -1;
+        partial  = (y1 >> defs.MAPBTOFRAC) & 65535;
+        xstep    = fixed.div(x2 - x1, abs32(y2 - y1));
+    }
+    var xintercept: Fixed = (x1 >> defs.MAPBTOFRAC) + fixed.mul(partial, xstep);
+
+    # step through map blocks; count is present to prevent a round off error
+    # from skipping the break
+    var mapx:  i32 = xt1;
+    var mapy:  i32 = yt1;
+    var count: i32 = 0;
+    for (count < 64) {
+        if ((flags & defs.PT_ADDLINES) != 0) {
+            # early out
+            if (!block_lines_iterator(g, mapx, mapy, add_line_intercepts)) { ret 0; }
+        }
+        if ((flags & defs.PT_ADDTHINGS) != 0) {
+            # early out
+            if (!block_things_iterator(g, mapx, mapy, add_thing_intercepts)) { ret 0; }
+        }
+
+        if (mapx == xt2 && mapy == yt2) { brk; }
+
+        if ((yintercept >> 16) == mapy) {
+            yintercept = yintercept + ystep;
+            mapx       = mapx + mapxstep;
+        }
+        or ((xintercept >> 16) == mapx) {
+            xintercept = xintercept + xstep;
+            mapy       = mapy + mapystep;
+        }
+        count = count + 1;
+    }
+
+    # go through the sorted list
+    ret traverse_intercepts(g, trav, 65536);
+}
+
+# ----------------------------------------------------------------- p_sight.c
+
+# P_DivlineSide
+# ---
+# ret: side 0 (front), 1 (back), or 2 (on)
+fun divline_side(x: Fixed, y: Fixed, nx: Fixed, ny: Fixed, ndx: Fixed, ndy: Fixed) i32 {
+    if (ndx == 0) {
+        if (x == nx) { ret 2; }
+        if (x <= nx) { ret (ndy > 0)::i32; }
+        ret (ndy < 0)::i32;
+    }
+    if (ndy == 0) {
+        # the original compares x against the line's y here; kept
+        if (x == ny) { ret 2; }
+        if (y <= ny) { ret (ndx < 0)::i32; }
+        ret (ndx > 0)::i32;
+    }
+
+    val dx:    Fixed = x - nx;
+    val dy:    Fixed = y - ny;
+    val left:  Fixed = (ndy >> 16) * (dx >> 16);
+    val right: Fixed = (dy >> 16) * (ndx >> 16);
+
+    if (right < left)  { ret 0; }
+    if (left == right) { ret 2; }
+    ret 1;
+}
+
+# P_CrossSubsector
+# ---
+# ret: true if strace crosses the given subsector successfully
+fun cross_subsector(g: *Game, num: i32) bool {
+    val lv:  *level.Level     = g.lv;
+    val sub: *level.Subsector = ?lv.subsectors[num];
+
+    # check lines
+    var count:  i32 = sub.numlines;
+    var segnum: i32 = sub.firstline;
+    for (count > 0) {
+        val seg:  *level.Seg  = ?lv.segs[segnum];
+        val line: *level.Line = ?lv.lines[seg.linedef];
+        segnum = segnum + 1;
+        count  = count - 1;
+
+        # already checked other side?
+        if (line.validcount == g.validcount) { cnt; }
+        line.validcount = g.validcount;
+
+        val v1: level.Vertex = lv.vertexes[line.v1];
+        val v2: level.Vertex = lv.vertexes[line.v2];
+        var s1: i32          = divline_side(v1.x, v1.y, g.strace.x, g.strace.y, g.strace.dx, g.strace.dy);
+        var s2: i32          = divline_side(v2.x, v2.y, g.strace.x, g.strace.y, g.strace.dx, g.strace.dy);
+
+        # line isn't crossed?
+        if (s1 == s2) { cnt; }
+
+        var divl: Divline;
+        divl.x  = v1.x;
+        divl.y  = v1.y;
+        divl.dx = v2.x - v1.x;
+        divl.dy = v2.y - v1.y;
+        s1      = divline_side(g.strace.x, g.strace.y, divl.x, divl.y, divl.dx, divl.dy);
+        s2      = divline_side(g.t2x, g.t2y, divl.x, divl.y, divl.dx, divl.dy);
+
+        # line isn't crossed?
+        if (s1 == s2) { cnt; }
+
+        # stop because it is not two sided anyway; might do this after
+        # updating validcount?
+        if ((line.flags::i32 & defs.ML_TWOSIDED) == 0 || seg.backsector == level.NONE) { ret 0; }
+
+        # crosses a two sided line
+        val front: *level.Sector = ?lv.sectors[seg.frontsector];
+        val back:  *level.Sector = ?lv.sectors[seg.backsector];
+
+        # no wall to block sight with?
+        if (front.floorheight == back.floorheight && front.ceilingheight == back.ceilingheight) { cnt; }
+
+        # possible occluder because of ceiling height differences
+        var opentop: Fixed = back.ceilingheight;
+        if (front.ceilingheight < back.ceilingheight) { opentop = front.ceilingheight; }
+
+        # because of floor height differences
+        var openbottom: Fixed = back.floorheight;
+        if (front.floorheight > back.floorheight) { openbottom = front.floorheight; }
+
+        # quick test for totally closed doors
+        if (openbottom >= opentop) {
+            # stop
+            ret 0;
+        }
+
+        val frac: Fixed = intercept_vector(?g.strace, ?divl);
+
+        if (front.floorheight != back.floorheight) {
+            val slope: Fixed = fixed.div(openbottom - g.sightzstart, frac);
+            if (slope > g.bottomslope) { g.bottomslope = slope; }
+        }
+
+        if (front.ceilingheight != back.ceilingheight) {
+            val slope: Fixed = fixed.div(opentop - g.sightzstart, frac);
+            if (slope < g.topslope) { g.topslope = slope; }
+        }
+
+        if (g.topslope <= g.bottomslope) {
+            # stop
+            ret 0;
+        }
+    }
+    # passed the subsector ok
+    ret 1;
+}
+
+# P_CrossBSPNode
+# ---
+# ret: true if strace crosses the given node successfully
+fun cross_bsp_node(g: *Game, bspnum: i32) bool {
+    if ((bspnum & 0x8000) != 0) {
+        if (bspnum == -1) { ret cross_subsector(g, 0); }
+        ret cross_subsector(g, bspnum & 0x7fff);
+    }
+
+    val bsp: *level.Node = ?g.lv.nodes[bspnum];
+
+    # decide which side the start point is on
+    var side: i32 = divline_side(g.strace.x, g.strace.y, bsp.x, bsp.y, bsp.dx, bsp.dy);
+    if (side == 2) {
+        # an "on" should cross both sides
+        side = 0;
+    }
+
+    # cross the starting side
+    if (!cross_bsp_node(g, bsp.children[side]::i32)) { ret 0; }
+
+    # the partition plane is crossed here
+    if (side == divline_side(g.t2x, g.t2y, bsp.x, bsp.y, bsp.dx, bsp.dy)) {
+        # the line doesn't touch the other side
+        ret 1;
+    }
+
+    # cross the ending side
+    ret cross_bsp_node(g, bsp.children[side ^ 1]::i32);
+}
+
+# P_CheckSight
+# ---
+# ret: true if a straight line between t1 and t2 is unobstructed
+pub fun check_sight(g: *Game, t1: *Mobj, t2: *Mobj) bool {
+    val lv: *level.Level = g.lv;
+
+    # first check for trivial rejection: determine subsector entries in the
+    # REJECT table
+    val s1:      i32 = lv.subsectors[t1.subsector].sector;
+    val s2:      i32 = lv.subsectors[t2.subsector].sector;
+    val pnum:    i32 = s1 * lv.numsectors + s2;
+    val bytenum: i32 = pnum >> 3;
+    val bitnum:  i32 = 1 << (pnum & 7);
+
+    # check in REJECT table
+    if (bytenum < lv.rejectsize && (lv.rejectmatrix[bytenum]::i32 & bitnum) != 0) {
+        # can't possibly be connected
+        ret 0;
+    }
+
+    # an unobstructed LOS is possible. now look from eyes of t1 to any part
+    # of t2
+    g.validcount = g.validcount + 1;
+
+    g.sightzstart = t1.z + t1.height - (t1.height >> 2);
+    g.topslope    = (t2.z + t2.height) - g.sightzstart;
+    g.bottomslope = t2.z - g.sightzstart;
+
+    g.strace.x  = t1.x;
+    g.strace.y  = t1.y;
+    g.t2x       = t2.x;
+    g.t2y       = t2.y;
+    g.strace.dx = t2.x - t1.x;
+    g.strace.dy = t2.y - t1.y;
+
+    # the head node is the last node output
+    ret cross_bsp_node(g, lv.numnodes - 1);
+}

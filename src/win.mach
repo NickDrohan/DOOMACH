@@ -1,0 +1,266 @@
+# the Windows platform layer: one window, the keyboard, a clock, and a way to
+# put a 320 by 200 palette-indexed frame on the screen
+#
+# Everything here is a direct call into user32, gdi32 and kernel32. There is
+# no C between Mach and the operating system: the window procedure Windows
+# calls back into is an ordinary Mach function.
+
+use std.types.bool.bool;
+use std.types.size.isize;
+use std.types.size.usize;
+use std.types.string.str;
+
+# virtual key codes
+pub val VK_SHIFT:   i32 = 0x10;
+pub val VK_CONTROL: i32 = 0x11;
+pub val VK_SPACE:   i32 = 0x20;
+pub val VK_ESCAPE:  i32 = 0x1b;
+pub val VK_LEFT:    i32 = 0x25;
+pub val VK_UP:      i32 = 0x26;
+pub val VK_RIGHT:   i32 = 0x27;
+pub val VK_DOWN:    i32 = 0x28;
+
+val WM_DESTROY: u32 = 0x0002;
+val WM_CLOSE:   u32 = 0x0010;
+val WM_KEYDOWN: u32 = 0x0100;
+
+val WS_OVERLAPPEDWINDOW: u32   = 0x00cf0000;
+val WS_VISIBLE:          u32   = 0x10000000;
+val CW_USEDEFAULT:       i32   = -0x7fffffff - 1;
+val CS_OWNDC:            u32   = 0x0020;
+val PM_REMOVE:           u32   = 1;
+val SRCCOPY:             u32   = 0x00cc0020;
+val IDC_ARROW:           usize = 32512;
+
+def WndProc: fun(isize, u32, usize, isize) isize;
+
+rec WNDCLASSEXA {
+    cbSize:        u32;
+    style:         u32;
+    lpfnWndProc:   WndProc;
+    cbClsExtra:    i32;
+    cbWndExtra:    i32;
+    hInstance:     isize;
+    hIcon:         isize;
+    hCursor:       isize;
+    hbrBackground: isize;
+    lpszMenuName:  *u8;
+    lpszClassName: *u8;
+    hIconSm:       isize;
+}
+
+rec MSG {
+    hwnd:     isize;
+    message:  u32;
+    wParam:   usize;
+    lParam:   isize;
+    time:     u32;
+    pt_x:     i32;
+    pt_y:     i32;
+    lPrivate: u32;
+}
+
+rec RECT {
+    left:   i32;
+    top:    i32;
+    right:  i32;
+    bottom: i32;
+}
+
+# a BITMAPINFO for an 8-bit image: the header, then a 256-entry colour table
+rec BITMAPINFO8 {
+    biSize:          u32;
+    biWidth:         i32;
+    biHeight:        i32;
+    biPlanes:        u16;
+    biBitCount:      u16;
+    biCompression:   u32;
+    biSizeImage:     u32;
+    biXPelsPerMeter: i32;
+    biYPelsPerMeter: i32;
+    biClrUsed:       u32;
+    biClrImportant:  u32;
+    # blue, green, red, reserved
+    colors: [1024]u8;
+}
+
+#[library("kernel32.dll")]
+ext fun GetModuleHandleA(name: *u8) isize;
+#[library("kernel32.dll")]
+ext fun Sleep(ms: u32);
+#[library("kernel32.dll")]
+ext fun QueryPerformanceCounter(count: *i64) i32;
+#[library("kernel32.dll")]
+ext fun QueryPerformanceFrequency(frequency: *i64) i32;
+
+#[library("user32.dll")]
+ext fun RegisterClassExA(class: *WNDCLASSEXA) u16;
+#[library("user32.dll")]
+ext fun CreateWindowExA(exstyle: u32, class: *u8, title: *u8, style: u32, x: i32, y: i32, w: i32, h: i32, parent: isize, menu: isize, instance: isize, param: ptr) isize;
+#[library("user32.dll")]
+ext fun DefWindowProcA(hwnd: isize, msg: u32, wparam: usize, lparam: isize) isize;
+#[library("user32.dll")]
+ext fun PeekMessageA(msg: *MSG, hwnd: isize, first: u32, last: u32, remove: u32) i32;
+#[library("user32.dll")]
+ext fun TranslateMessage(msg: *MSG) i32;
+#[library("user32.dll")]
+ext fun DispatchMessageA(msg: *MSG) isize;
+#[library("user32.dll")]
+ext fun DestroyWindow(hwnd: isize) i32;
+#[library("user32.dll")]
+ext fun AdjustWindowRect(rect: *RECT, style: u32, menu: i32) i32;
+#[library("user32.dll")]
+ext fun GetClientRect(hwnd: isize, rect: *RECT) i32;
+#[library("user32.dll")]
+ext fun GetDC(hwnd: isize) isize;
+#[library("user32.dll")]
+ext fun LoadCursorA(instance: isize, name: usize) isize;
+#[library("user32.dll")]
+ext fun GetAsyncKeyState(key: i32) i16;
+#[library("user32.dll")]
+ext fun GetForegroundWindow() isize;
+#[library("user32.dll")]
+ext fun SetWindowTextA(hwnd: isize, text: *u8) i32;
+
+#[library("gdi32.dll")]
+ext fun StretchDIBits(hdc: isize, xd: i32, yd: i32, wd: i32, hd: i32, xs: i32, ys: i32, ws: i32, hs: i32, bits: *u8, info: *BITMAPINFO8, usage: u32, rop: u32) i32;
+
+# what the window procedure has seen since the window opened. Windows calls
+# the procedure with no argument of ours, so this has to be module state.
+var closed:  bool;
+var lastkey: i32;
+
+fun window_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) isize {
+    if (msg == WM_CLOSE || msg == WM_DESTROY) {
+        closed = 1;
+        ret 0;
+    }
+    if (msg == WM_KEYDOWN) {
+        # bit 30 of lparam is set for auto-repeat; only first presses count
+        if ((lparam & 0x40000000) == 0) { lastkey = wparam::i32; }
+        ret 0;
+    }
+    ret DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+pub rec Window {
+    hwnd: isize;
+    hdc:  isize;
+    info: BITMAPINFO8;
+    freq: i64;
+}
+
+# open a window whose client area is the given size
+# ---
+# win:    the window to fill in
+# title:  caption
+# width:  client width in pixels
+# height: client height in pixels
+# ret:    whether the window opened
+pub fun open(win: *Window, title: str, width: i32, height: i32) bool {
+    val instance: isize = GetModuleHandleA(nil);
+
+    var class: WNDCLASSEXA;
+    class.cbSize        = $size_of(WNDCLASSEXA)::u32;
+    class.style         = CS_OWNDC;
+    class.lpfnWndProc   = window_proc;
+    class.hInstance     = instance;
+    class.hCursor       = LoadCursorA(0, IDC_ARROW);
+    class.lpszClassName = "MachDoom";
+    if (RegisterClassExA(?class) == 0) { ret 0; }
+
+    val style: u32 = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+    var rect:  RECT;
+    rect.right  = width;
+    rect.bottom = height;
+    AdjustWindowRect(?rect, style, 0);
+
+    win.hwnd = CreateWindowExA(0, "MachDoom", title, style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, 0, 0, instance, nil);
+    if (win.hwnd == 0) { ret 0; }
+    win.hdc = GetDC(win.hwnd);
+
+    # a top-down 8-bit image; its colours are set by set_palette
+    win.info.biSize     = 40;
+    win.info.biWidth    = 320;
+    win.info.biHeight   = -200;
+    win.info.biPlanes   = 1;
+    win.info.biBitCount = 8;
+    win.info.biClrUsed  = 256;
+
+    QueryPerformanceFrequency(?win.freq);
+    closed  = 0;
+    lastkey = 0;
+    ret 1;
+}
+
+# set the colours the frame's bytes stand for
+# ---
+# win:     the window
+# playpal: 256 red, green, blue triples
+pub fun set_palette(win: *Window, playpal: *u8) {
+    var i: i32 = 0;
+    for (i < 256) {
+        win.info.colors[i * 4]     = playpal[i * 3 + 2];
+        win.info.colors[i * 4 + 1] = playpal[i * 3 + 1];
+        win.info.colors[i * 4 + 2] = playpal[i * 3];
+        win.info.colors[i * 4 + 3] = 0;
+        i                          = i + 1;
+    }
+}
+
+# handle whatever Windows has queued for the window
+# ---
+# ret: whether the window is still open
+pub fun pump(win: *Window) bool {
+    var msg: MSG;
+    for (PeekMessageA(?msg, 0, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(?msg);
+        DispatchMessageA(?msg);
+    }
+    ret !closed;
+}
+
+# the key most recently pressed, once; 0 when none has been since last asked
+pub fun take_key() i32 {
+    val k: i32 = lastkey;
+    lastkey = 0;
+    ret k;
+}
+
+# whether a key is held down right now, while the window has the focus
+pub fun key_down(win: *Window, key: i32) bool {
+    if (GetForegroundWindow() != win.hwnd) { ret 0; }
+    ret (GetAsyncKeyState(key)::i32 & 0x8000) != 0;
+}
+
+# show a frame, stretched to fill the window
+# ---
+# win:    the window
+# screen: 320 by 200 palette indices, row by row from the top
+pub fun present(win: *Window, screen: *u8) {
+    var rect: RECT;
+    GetClientRect(win.hwnd, ?rect);
+    StretchDIBits(win.hdc, 0, 0, rect.right, rect.bottom, 0, 0, 320, 200, screen, ?win.info, 0, SRCCOPY);
+}
+
+# change the caption
+pub fun set_title(win: *Window, title: str) {
+    SetWindowTextA(win.hwnd, title);
+}
+
+# close the window
+pub fun close(win: *Window) {
+    DestroyWindow(win.hwnd);
+}
+
+# a clock that never goes backwards, in microseconds
+pub fun micros(win: *Window) i64 {
+    var count: i64 = 0;
+    QueryPerformanceCounter(?count);
+    ret count / win.freq * 1000000 + (count % win.freq) * 1000000 / win.freq;
+}
+
+# give the processor back for a moment
+pub fun nap(ms: u32) {
+    Sleep(ms);
+}

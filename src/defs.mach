@@ -1,0 +1,580 @@
+# the simulation's types and its one piece of state
+#
+# In the C source the playsim is some three hundred file-scope variables
+# spread over twenty files. Here it is a single Game record, passed to
+# everything. A demo run is then a function of a WAD, a Game and a stream of
+# commands, and nothing hides in a global.
+#
+# Two things the C code does with pointers are done differently:
+#
+# - Map structures (sectors, lines, subsectors) are referred to by number, as
+#   level.mach stores them. Objects that live and die during play (map
+#   objects, door and platform movers) are still pointers.
+# - A thinker's function pointer is a kind byte. The C code compares that
+#   pointer against known functions to ask "is this a map object?"; a kind
+#   answers that directly, and the dispatch is one chain in tick.mach.
+#
+# Mach does not allow modules to import each other in a circle, and the C
+# files call each other freely. The two calls that would close a circle go
+# through function pointers held here: entering a state runs an action
+# (enemy.mach and pspr.mach, far above world.mach), and crossing, using or
+# shooting a line triggers a special (spec.mach).
+
+use std.allocator;
+use std.types.bool.bool;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use doom.fixed.Fixed;
+use doom.level;
+use doom.random;
+use doom.rdata;
+
+pub val MAXPLAYERS: i32 = 4;
+pub val TICRATE:    i32 = 35;
+
+pub val FRACUNIT: Fixed = 65536;
+pub val MAXINT:   i32   = 0x7fffffff;
+pub val MININT:   i32   = -0x7fffffff - 1;
+
+# object flags
+pub val MF_SPECIAL:      i32 = 1;
+pub val MF_SOLID:        i32 = 2;
+pub val MF_SHOOTABLE:    i32 = 4;
+pub val MF_NOSECTOR:     i32 = 8;
+pub val MF_NOBLOCKMAP:   i32 = 16;
+pub val MF_AMBUSH:       i32 = 32;
+pub val MF_JUSTHIT:      i32 = 64;
+pub val MF_JUSTATTACKED: i32 = 128;
+pub val MF_SPAWNCEILING: i32 = 256;
+pub val MF_NOGRAVITY:    i32 = 512;
+pub val MF_DROPOFF:      i32 = 0x400;
+pub val MF_PICKUP:       i32 = 0x800;
+pub val MF_NOCLIP:       i32 = 0x1000;
+pub val MF_SLIDE:        i32 = 0x2000;
+pub val MF_FLOAT:        i32 = 0x4000;
+pub val MF_TELEPORT:     i32 = 0x8000;
+pub val MF_MISSILE:      i32 = 0x10000;
+pub val MF_DROPPED:      i32 = 0x20000;
+pub val MF_SHADOW:       i32 = 0x40000;
+pub val MF_NOBLOOD:      i32 = 0x80000;
+pub val MF_CORPSE:       i32 = 0x100000;
+pub val MF_INFLOAT:      i32 = 0x200000;
+pub val MF_COUNTKILL:    i32 = 0x400000;
+pub val MF_COUNTITEM:    i32 = 0x800000;
+pub val MF_SKULLFLY:     i32 = 0x1000000;
+pub val MF_NOTDMATCH:    i32 = 0x2000000;
+pub val MF_TRANSLATION:  i32 = 0xc000000;
+pub val MF_TRANSSHIFT:   i32 = 26;
+
+# sprite frame bits
+pub val FF_FULLBRIGHT: i32 = 0x8000;
+pub val FF_FRAMEMASK:  i32 = 0x7fff;
+
+# map thing option bits
+pub val MTF_EASY:   i32 = 1;
+pub val MTF_NORMAL: i32 = 2;
+pub val MTF_HARD:   i32 = 4;
+pub val MTF_AMBUSH: i32 = 8;
+
+# line flags
+pub val ML_BLOCKING:      i32 = 1;
+pub val ML_BLOCKMONSTERS: i32 = 2;
+pub val ML_TWOSIDED:      i32 = 4;
+pub val ML_DONTPEGTOP:    i32 = 8;
+pub val ML_DONTPEGBOTTOM: i32 = 16;
+pub val ML_SECRET:        i32 = 32;
+pub val ML_SOUNDBLOCK:    i32 = 64;
+pub val ML_DONTDRAW:      i32 = 128;
+pub val ML_MAPPED:        i32 = 256;
+
+# skills
+pub val SK_BABY:      i32 = 0;
+pub val SK_EASY:      i32 = 1;
+pub val SK_MEDIUM:    i32 = 2;
+pub val SK_HARD:      i32 = 3;
+pub val SK_NIGHTMARE: i32 = 4;
+
+# keys
+pub val IT_BLUECARD:    i32 = 0;
+pub val IT_YELLOWCARD:  i32 = 1;
+pub val IT_REDCARD:     i32 = 2;
+pub val IT_BLUESKULL:   i32 = 3;
+pub val IT_YELLOWSKULL: i32 = 4;
+pub val IT_REDSKULL:    i32 = 5;
+pub val NUMCARDS:       i32 = 6;
+
+# weapons
+pub val WP_FIST:         i32 = 0;
+pub val WP_PISTOL:       i32 = 1;
+pub val WP_SHOTGUN:      i32 = 2;
+pub val WP_CHAINGUN:     i32 = 3;
+pub val WP_MISSILE:      i32 = 4;
+pub val WP_PLASMA:       i32 = 5;
+pub val WP_BFG:          i32 = 6;
+pub val WP_CHAINSAW:     i32 = 7;
+pub val WP_SUPERSHOTGUN: i32 = 8;
+pub val NUMWEAPONS:      i32 = 9;
+pub val WP_NOCHANGE:     i32 = 10;
+
+# ammunition
+pub val AM_CLIP:   i32 = 0;
+pub val AM_SHELL:  i32 = 1;
+pub val AM_CELL:   i32 = 2;
+pub val AM_MISL:   i32 = 3;
+pub val NUMAMMO:   i32 = 4;
+pub val AM_NOAMMO: i32 = 5;
+
+# powers
+pub val PW_INVULNERABILITY: i32 = 0;
+pub val PW_STRENGTH:        i32 = 1;
+pub val PW_INVISIBILITY:    i32 = 2;
+pub val PW_IRONFEET:        i32 = 3;
+pub val PW_ALLMAP:          i32 = 4;
+pub val PW_INFRARED:        i32 = 5;
+pub val NUMPOWERS:          i32 = 6;
+
+pub val INVULNTICS: i32 = 30 * 35;
+pub val INVISTICS:  i32 = 60 * 35;
+pub val INFRATICS:  i32 = 120 * 35;
+pub val IRONTICS:   i32 = 60 * 35;
+
+# player states
+pub val PST_LIVE:   i32 = 0;
+pub val PST_DEAD:   i32 = 1;
+pub val PST_REBORN: i32 = 2;
+
+# cheats
+pub val CF_NOCLIP:     i32 = 1;
+pub val CF_GODMODE:    i32 = 2;
+pub val CF_NOMOMENTUM: i32 = 4;
+
+# ticcmd buttons
+pub val BT_ATTACK:      i32 = 1;
+pub val BT_USE:         i32 = 2;
+pub val BT_CHANGE:      i32 = 4;
+pub val BT_WEAPONMASK:  i32 = 8 + 16 + 32;
+pub val BT_WEAPONSHIFT: i32 = 3;
+pub val BT_SPECIAL:     i32 = 128;
+
+pub val PS_WEAPON:   i32 = 0;
+pub val PS_FLASH:    i32 = 1;
+pub val NUMPSPRITES: i32 = 2;
+
+# p_local.h
+pub val FLOATSPEED:    Fixed = 4 * 65536;
+pub val MAXHEALTH:     i32   = 100;
+pub val VIEWHEIGHT:    Fixed = 41 * 65536;
+pub val MAPBLOCKSIZE:  i32   = 128 * 65536;
+pub val MAPBLOCKSHIFT: i32   = 23;
+pub val MAPBMASK:      i32   = 128 * 65536 - 1;
+pub val MAPBTOFRAC:    i32   = 7;
+pub val PLAYERRADIUS:  Fixed = 16 * 65536;
+pub val MAXRADIUS:     Fixed = 32 * 65536;
+pub val GRAVITY:       Fixed = 65536;
+pub val MAXMOVE:       Fixed = 30 * 65536;
+pub val USERANGE:      Fixed = 64 * 65536;
+pub val MELEERANGE:    Fixed = 64 * 65536;
+pub val MISSILERANGE:  Fixed = 32 * 64 * 65536;
+pub val BASETHRESHOLD: i32   = 100;
+pub val ONFLOORZ:      Fixed = -0x7fffffff - 1;
+pub val ONCEILINGZ:    Fixed = 0x7fffffff;
+pub val ITEMQUESIZE:   i32   = 128;
+
+pub val PT_ADDLINES:  i32 = 1;
+pub val PT_ADDTHINGS: i32 = 2;
+pub val PT_EARLYOUT:  i32 = 4;
+
+pub val MAXINTERCEPTS: i32 = 128;
+
+# what a thinker is; the C code holds a function pointer here
+pub val TH_NONE:        u8 = 0;
+pub val TH_REMOVED:     u8 = 1;
+pub val TH_MOBJ:        u8 = 2;
+pub val TH_DOOR:        u8 = 3;
+pub val TH_FLOOR:       u8 = 4;
+pub val TH_CEILING:     u8 = 5;
+pub val TH_PLAT:        u8 = 6;
+pub val TH_FIREFLICKER: u8 = 7;
+pub val TH_LIGHTFLASH:  u8 = 8;
+pub val TH_STROBE:      u8 = 9;
+pub val TH_GLOW:        u8 = 10;
+
+# how a line special was set off
+pub val TRIGGER_CROSS: i32 = 0;
+pub val TRIGGER_USE:   i32 = 1;
+pub val TRIGGER_SHOOT: i32 = 2;
+
+# the head of everything that acts once a tic. every record that thinks
+# begins with one of these, so a *Thinker can be cast to the record it heads.
+pub rec Thinker {
+    prev: *Thinker;
+    next: *Thinker;
+    kind: u8;
+}
+
+# a map object: a monster, a missile, an item, a player's body, a decoration
+pub rec Mobj {
+    thinker: Thinker;
+
+    x: Fixed;
+    y: Fixed;
+    z: Fixed;
+
+    # links in the sector's list of things
+    snext: *Mobj;
+    sprev: *Mobj;
+
+    angle:  u32;
+    sprite: i32;
+    frame:  i32;
+
+    # links in the blockmap cell's list of things
+    bnext: *Mobj;
+    bprev: *Mobj;
+
+    subsector: i32;
+
+    # the closest interval over all contacted sectors
+    floorz:   Fixed;
+    ceilingz: Fixed;
+
+    radius: Fixed;
+    height: Fixed;
+
+    momx: Fixed;
+    momy: Fixed;
+    momz: Fixed;
+
+    validcount: i32;
+
+    # MT_* object type; its info is info.mi(kind, ...)
+    kind: i32;
+
+    # state tic counter, and the S_* state it counts down
+    tics:   i32;
+    state:  i32;
+    flags:  i32;
+    health: i32;
+
+    # movement direction and steps left in it, for monsters
+    movedir:   i32;
+    movecount: i32;
+
+    # the thing being chased or attacked, or the firer of a missile
+    target: *Mobj;
+
+    reactiontime: i32;
+    threshold:    i32;
+
+    # only for players' bodies
+    player: *Player;
+
+    # player number last looked for
+    lastlook: i32;
+
+    # for nightmare respawn
+    spawnpoint: level.Thing;
+
+    # the thing being chased by a seeking missile
+    tracer: *Mobj;
+}
+
+# one layer of the weapon drawn over the view
+pub rec Pspdef {
+    # S_* state, 0 for none
+    state: i32;
+    tics:  i32;
+    sx:    Fixed;
+    sy:    Fixed;
+}
+
+# what a player intends for one tic
+pub rec Ticcmd {
+    forwardmove: i8;
+    sidemove:    i8;
+    angleturn:   i16;
+    consistancy: i16;
+    chatchar:    u8;
+    buttons:     u8;
+}
+
+pub rec Player {
+    mo:          *Mobj;
+    playerstate: i32;
+    cmd:         Ticcmd;
+
+    # eye height above the floor, bobbed, and the unbobbed height and its change
+    viewz:           Fixed;
+    viewheight:      Fixed;
+    deltaviewheight: Fixed;
+    bob:             Fixed;
+
+    # carried between levels; mo.health is the one used during a level
+    health:      i32;
+    armorpoints: i32;
+    armortype:   i32;
+
+    powers:   [6]i32;
+    cards:    [6]bool;
+    backpack: bool;
+
+    readyweapon:   i32;
+    pendingweapon: i32;
+    weaponowned:   [9]bool;
+    ammo:          [4]i32;
+    maxammo:       [4]i32;
+
+    attackdown: i32;
+    usedown:    i32;
+    cheats:     i32;
+    refire:     i32;
+
+    killcount:   i32;
+    itemcount:   i32;
+    secretcount: i32;
+
+    message: str;
+
+    damagecount: i32;
+    bonuscount:  i32;
+    attacker:    *Mobj;
+
+    extralight:    i32;
+    fixedcolormap: i32;
+    colormap:      i32;
+
+    psprites:  [2]Pspdef;
+    didsecret: bool;
+}
+
+pub rec Divline {
+    x:  Fixed;
+    y:  Fixed;
+    dx: Fixed;
+    dy: Fixed;
+}
+
+# where a traced path crosses a line or a thing
+pub rec Intercept {
+    frac:    Fixed;
+    isaline: bool;
+    line:    i32;
+    thing:   *Mobj;
+}
+
+# a wall switch that will pop back out
+pub rec Button {
+    line:     i32;
+    where:    i32;
+    btexture: i32;
+    btimer:   i32;
+    soundorg: i32;
+}
+
+# an animated flat or wall texture
+pub rec Anim {
+    istexture: bool;
+    picnum:    i32;
+    basepic:   i32;
+    numpics:   i32;
+    speed:     i32;
+}
+
+pub def ActionHook:  fun(*Game, *Mobj, *Player, *Pspdef, i32);
+pub def SpecialHook: fun(*Game, i32, i32, i32, *Mobj) bool;
+pub def SoundHook:   fun(*Game, *Mobj, i32);
+
+pub rec Game {
+    lv:  *level.Level;
+    rnd: random.Random;
+    # the WAD's graphics: texture heights for one floor mover, and the
+    # tables that animated walls and flats are switched through
+    d: *rdata.Data;
+
+    # memory for everything that lives for one level
+    a:         *allocator.Allocator;
+    chunk:     *u8;
+    chunkused: usize;
+    chunkcap:  usize;
+
+    # the two calls that go up the module order
+    run_action:   ActionHook;
+    line_special: SpecialHook;
+    start_sound:  SoundHook;
+
+    # the game
+    gameskill:       i32;
+    gameepisode:     i32;
+    gamemap:         i32;
+    gametic:         i32;
+    leveltime:       i32;
+    deathmatch:      i32;
+    netgame:         bool;
+    respawnmonsters: bool;
+    fastparm:        bool;
+    nomonsters:      bool;
+    respawnparm:     bool;
+    # 0 none, 1 the level's exit was taken, 2 its secret exit
+    exited: i32;
+    # the WAD holds only the first episode
+    shareware: bool;
+    # the flat that means "sky"
+    skyflatnum: i32;
+
+    players:       [4]Player;
+    playeringame:  [4]bool;
+    consoleplayer: i32;
+    playerstarts:  [4]level.Thing;
+
+    totalkills:  i32;
+    totalitems:  i32;
+    totalsecret: i32;
+
+    # p_tick: the ring of thinkers; thinkercap is its head and its tail
+    thinkercap: Thinker;
+
+    # p_mobj: items waiting to respawn, and one list of things per blockmap
+    # cell
+    itemrespawnque:  [128]level.Thing;
+    itemrespawntime: [128]i32;
+    iquehead:        i32;
+    iquetail:        i32;
+    blocklinks:      **Mobj;
+    validcount:      i32;
+    bodyque:         [32]*Mobj;
+    bodyqueslot:     i32;
+
+    # p_maputl
+    opentop:     Fixed;
+    openbottom:  Fixed;
+    openrange:   Fixed;
+    lowfloor:    Fixed;
+    intercepts:  [128]Intercept;
+    intercept_p: i32;
+    trace:       Divline;
+    earlyout:    bool;
+
+    # p_sight, and shared with p_map's aiming
+    sightzstart: Fixed;
+    topslope:    Fixed;
+    bottomslope: Fixed;
+    strace:      Divline;
+    t2x:         Fixed;
+    t2y:         Fixed;
+
+    # p_map: the move being tried
+    tmbbox:      [4]Fixed;
+    tmthing:     *Mobj;
+    tmflags:     i32;
+    tmx:         Fixed;
+    tmy:         Fixed;
+    floatok:     bool;
+    tmfloorz:    Fixed;
+    tmceilingz:  Fixed;
+    tmdropoffz:  Fixed;
+    ceilingline: i32;
+    spechit:     [8]i32;
+    numspechit:  i32;
+
+    # p_map: sliding along walls
+    bestslidefrac:   Fixed;
+    secondslidefrac: Fixed;
+    bestslideline:   i32;
+    secondslideline: i32;
+    slidemo:         *Mobj;
+    tmxmove:         Fixed;
+    tmymove:         Fixed;
+
+    # p_map: shooting, using, explosions, crushing
+    linetarget:  *Mobj;
+    shootthing:  *Mobj;
+    shootz:      Fixed;
+    la_damage:   i32;
+    attackrange: Fixed;
+    aimslope:    Fixed;
+    usething:    *Mobj;
+    bombsource:  *Mobj;
+    bombspot:    *Mobj;
+    bombdamage:  i32;
+    crushchange: bool;
+    nofit:       bool;
+
+    # p_enemy
+    soundtarget: *Mobj;
+
+    # p_spec and p_switch
+    activeplats:     [30]ptr;
+    activeceilings:  [30]ptr;
+    linespeciallist: [64]i32;
+    numlinespecials: i32;
+    buttonlist:      [16]Button;
+    switchlist:      [100]i32;
+    numswitches:     i32;
+    anims:           [32]Anim;
+    numanims:        i32;
+
+    # p_pspr
+    swingx:      Fixed;
+    swingy:      Fixed;
+    bulletslope: Fixed;
+
+    # p_user
+    onground: bool;
+}
+
+val CHUNK: usize = 1 << 20;
+
+# memory that lasts until the level ends; zeroed
+# ---
+# g:    the game
+# size: bytes wanted
+# ret:  the memory, or nil when there is none left
+pub fun alloc(g: *Game, size: usize) ptr {
+    val need: usize = (size + 15) & (0 - 16:~usize);
+    if (g.chunk == nil || g.chunkused + need > g.chunkcap) {
+        var cap: usize = CHUNK;
+        if (need + 16 > cap) { cap = need + 16; }
+        val got: res[*u8, allocator.Error] = allocator.zallocate[u8](g.a, cap);
+        if (sel got.err) { ret nil; }
+        # each chunk begins with the address of the one before and its size
+        val head: *usize = got.ok:~*usize;
+        head[0]     = g.chunk::usize;
+        head[1]     = cap;
+        g.chunk     = got.ok;
+        g.chunkused = 16;
+        g.chunkcap  = cap;
+    }
+    val p: *u8 = ?g.chunk[g.chunkused];
+    g.chunkused = g.chunkused + need;
+    ret p:~ptr;
+}
+
+# give back everything alloc handed out, as the level ends
+pub fun free_level(g: *Game) {
+    for (g.chunk != nil) {
+        val head: *usize = g.chunk:~*usize;
+        val prev: usize  = head[0];
+        val cap:  usize  = head[1];
+        allocator.deallocate[u8](g.a, g.chunk, cap);
+        g.chunk = prev::*u8;
+    }
+    g.chunkused = 0;
+    g.chunkcap  = 0;
+}
+
+# make a noise; origin may be nil
+pub fun sound(g: *Game, origin: *Mobj, sfx: i32) {
+    if (g.start_sound != nil) { g.start_sound(g, origin, sfx); }
+}
+
+# the sector an object stands in
+pub fun sector_of(g: *Game, mo: *Mobj) *level.Sector {
+    ret ?g.lv.sectors[g.lv.subsectors[mo.subsector].sector];
+}
+
+# the next number of the playsim's random walk
+pub fun p_random(g: *Game) i32 {
+    ret random.p_random(?g.rnd);
+}

@@ -1,0 +1,534 @@
+# a game in progress: starting one, loading its levels, turning the keyboard
+# or a recorded demo into commands, and advancing a tic at a time
+#
+# Ported from g_game.c and the level setup of p_setup.c. What is left out is
+# everything around the game rather than in it: menus, saved games, the
+# intermission and finale screens, and network play. Leaving a level goes
+# straight to the next one.
+
+use std.allocator;
+use std.types.bool.bool;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.defs.Player;
+use doom.defs.Ticcmd;
+use doom.info;
+use doom.level;
+use doom.random;
+use doom.rdata;
+use doom.spec;
+use doom.tick;
+use doom.wad;
+use doom.world;
+
+val VERSION:    u8 = 109;
+val DEMOMARKER: u8 = 0x80;
+
+val FORWARDMOVE: [2]i32 = [2]i32{0x19, 0x32};
+val SIDEMOVE:    [2]i32 = [2]i32{0x18, 0x28};
+val ANGLETURN:   [3]i32 = [3]i32{640, 1280, 320};
+
+val SLOWTURNTICS: i32 = 6;
+
+# what the player is holding down this tic
+pub rec Input {
+    forward:      bool;
+    back:         bool;
+    left:         bool;
+    right:        bool;
+    strafe_left:  bool;
+    strafe_right: bool;
+    run:          bool;
+    fire:         bool;
+    activate:     bool;
+    # 1 to 7 to change weapon, 0 for no change
+    weapon: i32;
+}
+
+pub rec Session {
+    g:   Game;
+    a:   *allocator.Allocator;
+    w:   *wad.Wad;
+    d:   *rdata.Data;
+    lvl: level.Level;
+
+    # a demo being played back, if any
+    demoplayback: bool;
+    demo:         *u8;
+    demolen:      usize;
+    demopos:      usize;
+    # the demo ran out of commands, or its level was left
+    demodone: bool;
+
+    # tics the turn keys have been held, for the slow start of a turn
+    turnheld: i32;
+
+    # the level could not be loaded; the session cannot continue
+    broken: bool;
+}
+
+# set up a session; call once
+# ---
+# s: the session, zeroed
+# a: allocator for levels and everything in them
+# w: the archive
+# d: its graphics
+pub fun init(s: *Session, a: *allocator.Allocator, w: *wad.Wad, d: *rdata.Data) {
+    s.a = a;
+    s.w = w;
+    s.d = d;
+
+    val g: *Game = ?s.g;
+    g.a = a;
+    g.d = d;
+    tick.install_hooks(g);
+
+    # the shareware WAD holds one episode and one texture lump
+    val second: opt[u32] = wad.find(w, "TEXTURE2");
+    g.shareware  = sel second.none;
+    g.skyflatnum = rdata.flat_num(d, "F_SKY1");
+
+    g.playeringame[0] = 1;
+    g.consoleplayer   = 0;
+
+    spec.init_switch_list(g);
+    spec.init_pic_anims(g);
+}
+
+# P_LoadThings: spawn everything the map places
+fun load_things(g: *Game) {
+    var i: i32 = 0;
+    for (i < g.lv.numthings) {
+        val mt:   *level.Thing = ?g.lv.things[i];
+        val kind: i32          = mt.kind::i32;
+
+        # do not spawn cool, new monsters if not the second game. the
+        # original stops reading things altogether at the first one, and so
+        # does this.
+        if (kind == 68 || kind == 64 || kind == 88 || kind == 89 || kind == 69 || kind == 67 || kind == 71 ||
+            kind == 65 || kind == 66 || kind == 84) {
+            brk;
+        }
+
+        world.spawn_map_thing(g, mt);
+        i = i + 1;
+    }
+}
+
+# G_DoLoadLevel and P_SetupLevel
+# ---
+# ret: whether the level loaded
+fun load_level(s: *Session) bool {
+    val g: *Game = ?s.g;
+
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (g.playeringame[i] && g.players[i].playerstate == defs.PST_DEAD) { g.players[i].playerstate = defs.PST_REBORN; }
+        g.players[i].killcount   = 0;
+        g.players[i].secretcount = 0;
+        g.players[i].itemcount   = 0;
+        i                        = i + 1;
+    }
+
+    g.totalkills  = 0;
+    g.totalitems  = 0;
+    g.totalsecret = 0;
+    g.exited      = 0;
+
+    # initial height of point of view will be set by player think
+    g.players[g.consoleplayer].viewz = 1;
+
+    # everything of the old level goes at once
+    defs.free_level(g);
+    world.init_thinkers(g);
+
+    # find map name
+    var name: [5]u8 = [5]u8{'E', '1', 'M', '1', 0};
+    name[1] = ('0' + g.gameepisode)::u8;
+    name[3] = ('0' + g.gamemap)::u8;
+
+    val built: res[level.Level, level.LevelError] = level.load(s.a, s.w, ?name[0]);
+    if (sel built.err) {
+        s.broken = 1;
+        ret 0;
+    }
+    s.lvl = built.ok;
+    g.lv  = ?s.lvl;
+
+    val bound: rdata.BindError = rdata.bind(s.d, g.lv);
+    if (!(sel bound.ok)) {
+        s.broken = 1;
+        ret 0;
+    }
+
+    g.leveltime = 0;
+
+    # one list of things for each blockmap cell
+    val cells: i32 = g.lv.bmapwidth * g.lv.bmapheight;
+    g.blocklinks = defs.alloc(g, (cells * 8)::usize):~**defs.Mobj;
+
+    g.bodyqueslot = 0;
+    load_things(g);
+
+    # clear special respawning que
+    g.iquehead = 0;
+    g.iquetail = 0;
+
+    # set up world state
+    spec.spawn_specials(g);
+    ret 1;
+}
+
+# G_InitNew: can be called by the startup code or the menu task
+# ---
+# skill_in:   SK_BABY to SK_NIGHTMARE
+# episode_in: 1 in the shareware game
+# map_in:     1 to 9
+# ret:        whether the level loaded
+pub fun init_new(s: *Session, skill_in: i32, episode_in: i32, map_in: i32) bool {
+    val g: *Game = ?s.g;
+
+    var skill: i32 = skill_in;
+    if (skill > defs.SK_NIGHTMARE) { skill = defs.SK_NIGHTMARE; }
+    if (skill < 0)                 { skill = 0; }
+
+    var episode: i32 = episode_in;
+    if (episode < 1)                { episode = 1; }
+    if (g.shareware && episode > 1) { episode = 1; }
+    if (episode > 3)                { episode = 3; }
+
+    var map: i32 = map_in;
+    if (map < 1) { map = 1; }
+    if (map > 9) { map = 9; }
+
+    random.clear(?g.rnd);
+
+    g.respawnmonsters = skill == defs.SK_NIGHTMARE || g.respawnparm;
+
+    # force players to be initialized upon first level load
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        g.players[i].playerstate = defs.PST_REBORN;
+        i                        = i + 1;
+    }
+
+    s.demoplayback = 0;
+    s.demodone     = 0;
+    g.gameepisode  = episode;
+    g.gamemap      = map;
+    g.gameskill    = skill;
+
+    ret load_level(s);
+}
+
+# G_DoPlayDemo: start playing a demo lump
+# ---
+# name: the lump, such as "DEMO1"
+# ret:  whether the demo exists, is from this version, and its level loaded
+pub fun play_demo(s: *Session, name: str) bool {
+    val g:     *Game    = ?s.g;
+    val found: opt[u32] = wad.find(s.w, name);
+    if (sel found.none) { ret 0; }
+
+    val p:   *u8   = wad.bytes(s.w, found.some);
+    val len: usize = wad.lump(s.w, found.some).size::usize;
+    if (len < 13 || p[0] != VERSION) { ret 0; }
+
+    val skill:   i32 = p[1]::i32;
+    val episode: i32 = p[2]::i32;
+    val map:     i32 = p[3]::i32;
+    g.deathmatch    = p[4]::i32;
+    g.respawnparm   = p[5] != 0;
+    g.fastparm      = p[6] != 0;
+    g.nomonsters    = p[7] != 0;
+    g.consoleplayer = p[8]::i32;
+
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        g.playeringame[i] = p[9 + i] != 0;
+        i                 = i + 1;
+    }
+    g.netgame = g.playeringame[1];
+
+    if (!init_new(s, skill, episode, map)) { ret 0; }
+
+    s.demo         = p;
+    s.demolen      = len;
+    s.demopos      = 13;
+    s.demoplayback = 1;
+    s.demodone     = 0;
+    ret 1;
+}
+
+# G_ReadDemoTiccmd
+fun read_demo_ticcmd(s: *Session, cmd: *Ticcmd) {
+    if (s.demopos + 4 > s.demolen || s.demo[s.demopos] == DEMOMARKER) {
+        # end of demo data stream
+        s.demodone = 1;
+        ret;
+    }
+    cmd.forwardmove = s.demo[s.demopos]:~i8;
+    cmd.sidemove    = s.demo[s.demopos + 1]:~i8;
+    cmd.angleturn   = (s.demo[s.demopos + 2]::u16 << 8):~i16;
+    cmd.buttons     = s.demo[s.demopos + 3];
+    s.demopos       = s.demopos + 4;
+}
+
+# G_BuildTiccmd: builds a ticcmd from all of the available inputs
+fun build_ticcmd(s: *Session, input: *Input, cmd: *Ticcmd) {
+    var blank: Ticcmd;
+    @cmd = blank;
+
+    var speed: i32 = 0;
+    if (input.run) { speed = 1; }
+
+    var forward: i32 = 0;
+    var side:    i32 = 0;
+
+    # use two stage accelerative turning on the keyboard
+    if (input.left || input.right) {
+        s.turnheld = s.turnheld + 1;
+    }
+    or {
+        s.turnheld = 0;
+    }
+
+    var tspeed: i32 = speed;
+    if (s.turnheld < SLOWTURNTICS) {
+        # slow turn
+        tspeed = 2;
+    }
+
+    var turn: i32 = 0;
+    if (input.right) { turn = turn - ANGLETURN[tspeed]; }
+    if (input.left)  { turn = turn + ANGLETURN[tspeed]; }
+    cmd.angleturn = turn::i16;
+
+    if (input.forward)      { forward = forward + FORWARDMOVE[speed]; }
+    if (input.back)         { forward = forward - FORWARDMOVE[speed]; }
+    if (input.strafe_right) { side = side + SIDEMOVE[speed]; }
+    if (input.strafe_left)  { side = side - SIDEMOVE[speed]; }
+
+    # buttons
+    var buttons: i32 = 0;
+    if (input.fire)     { buttons = buttons | defs.BT_ATTACK; }
+    if (input.activate) { buttons = buttons | defs.BT_USE; }
+
+    # chainsaw overrides
+    if (input.weapon >= 1 && input.weapon <= 7) {
+        buttons = buttons | defs.BT_CHANGE;
+        buttons = buttons | ((input.weapon - 1) << defs.BT_WEAPONSHIFT);
+    }
+    cmd.buttons = buttons::u8;
+
+    val maxmove: i32 = FORWARDMOVE[1];
+    if (forward > maxmove) {
+        forward = maxmove;
+    }
+    or (forward < 0 - maxmove) {
+        forward = 0 - maxmove;
+    }
+    if (side > maxmove) {
+        side = maxmove;
+    }
+    or (side < 0 - maxmove) {
+        side = 0 - maxmove;
+    }
+
+    cmd.forwardmove = forward::i8;
+    cmd.sidemove    = side::i8;
+}
+
+# G_PlayerFinishLevel: can when a player completes a level
+fun player_finish_level(g: *Game, player: i32) {
+    val p: *Player = ?g.players[player];
+
+    var i: i32 = 0;
+    for (i < defs.NUMPOWERS) {
+        p.powers[i] = 0;
+        p.cards[i]  = 0;
+        i           = i + 1;
+    }
+    # cancel invisibility
+    p.mo.flags = p.mo.flags & ~defs.MF_SHADOW;
+    # cancel gun flashes
+    p.extralight = 0;
+    # cancel ir gogles
+    p.fixedcolormap = 0;
+    # no palette changes
+    p.damagecount = 0;
+    p.bonuscount  = 0;
+}
+
+# G_DoCompleted and G_DoWorldDone, without the intermission between them
+fun completed(s: *Session) {
+    val g:      *Game = ?s.g;
+    val secret: bool  = g.exited == 2;
+
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (g.playeringame[i]) {
+            # take away cards and stuff
+            player_finish_level(g, i);
+        }
+        i = i + 1;
+    }
+
+    # the level to go to: the secret exit leads to map 9, map 9 leads back
+    # to the level after the one with the secret exit, and the last level of
+    # the episode leads round to the first
+    var next: i32 = g.gamemap + 1;
+    if (secret) {
+        next = 9;
+    }
+    or (g.gamemap == 9) {
+        # returning from secret level
+        if (g.gameepisode == 1) {
+            next = 4;
+        }
+        or (g.gameepisode == 2) {
+            next = 6;
+        }
+        or (g.gameepisode == 3) {
+            next = 7;
+        }
+        or {
+            next = 3;
+        }
+    }
+    or (g.gamemap == 8) {
+        next = 1;
+    }
+
+    g.gamemap = next;
+    load_level(s);
+}
+
+# G_Ticker: make ticcmds for the players and advance the world one tic
+# ---
+# s:     the session
+# input: what is held down, ignored while a demo plays
+pub fun ticker(s: *Session, input: *Input) {
+    val g: *Game = ?s.g;
+    if (s.broken) { ret; }
+
+    # do player reborns if needed
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (g.playeringame[i] && g.players[i].playerstate == defs.PST_REBORN) {
+            # reload the level from scratch
+            if (!load_level(s)) { ret; }
+            brk;
+        }
+        i = i + 1;
+    }
+
+    # do things to change the game state
+    if (g.exited != 0) {
+        if (s.demoplayback) {
+            # a demo ends where its level does
+            s.demodone = 1;
+            ret;
+        }
+        completed(s);
+        if (s.broken) { ret; }
+    }
+
+    # get commands
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (g.playeringame[i]) {
+            val cmd: *Ticcmd = ?g.players[i].cmd;
+            if (s.demoplayback) {
+                var blank: Ticcmd;
+                @cmd = blank;
+                read_demo_ticcmd(s, cmd);
+                if (s.demodone) { ret; }
+            }
+            or {
+                build_ticcmd(s, input, cmd);
+            }
+        }
+        i = i + 1;
+    }
+
+    tick.ticker(g);
+    g.gametic = g.gametic + 1;
+}
+
+# a running sum over the state that a demo must reproduce: every map
+# object's place, momentum, health and state, the random walk, and the
+# player. two runs that agree here tic after tic are in sync.
+pub fun checksum(s: *Session) u32 {
+    val g:   *Game = ?s.g;
+    var sum: u32   = g.rnd.play::u32;
+
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            val mo: *defs.Mobj = th:~*defs.Mobj;
+            sum = sum * 31 + mo.x:~u32;
+            sum = sum * 31 + mo.y:~u32;
+            sum = sum * 31 + mo.z:~u32;
+            sum = sum * 31 + mo.momx:~u32;
+            sum = sum * 31 + mo.momy:~u32;
+            sum = sum * 31 + mo.angle;
+            sum = sum * 31 + mo.health:~u32;
+            sum = sum * 31 + mo.state:~u32;
+        }
+        th = th.next;
+    }
+    ret sum;
+}
+
+test build_ticcmd__keys_become_commands {
+    var s:     Session;
+    var input: Input;
+    var cmd:   Ticcmd;
+
+    # walking forward, then running
+    input.forward = 1;
+    build_ticcmd(?s, ?input, ?cmd);
+    if (cmd.forwardmove != 0x19 || cmd.sidemove != 0 || cmd.angleturn != 0) { ret 1; }
+    input.run = 1;
+    build_ticcmd(?s, ?input, ?cmd);
+    if (cmd.forwardmove != 0x32) { ret 2; }
+
+    # forward and back cancel; strafing right while running
+    input.back         = 1;
+    input.strafe_right = 1;
+    build_ticcmd(?s, ?input, ?cmd);
+    if (cmd.forwardmove != 0 || cmd.sidemove != 0x28) { ret 3; }
+
+    # a turn starts slow for six tics, then takes the running speed
+    var blank: Input;
+    input      = blank;
+    input.left = 1;
+    input.run  = 1;
+    var i: i32 = 0;
+    for (i < 5) {
+        build_ticcmd(?s, ?input, ?cmd);
+        if (cmd.angleturn != 320) { ret 4; }
+        i = i + 1;
+    }
+    build_ticcmd(?s, ?input, ?cmd);
+    if (cmd.angleturn != 1280) { ret 5; }
+    input.left  = 0;
+    input.right = 1;
+    build_ticcmd(?s, ?input, ?cmd);
+    if (cmd.angleturn != 0 - 1280) { ret 6; }
+
+    # fire, use, and a change to weapon 3
+    input          = blank;
+    input.fire     = 1;
+    input.activate = 1;
+    input.weapon   = 3;
+    build_ticcmd(?s, ?input, ?cmd);
+    if (cmd.buttons != (defs.BT_ATTACK | defs.BT_USE | defs.BT_CHANGE | (2 << defs.BT_WEAPONSHIFT))::u8) { ret 7; }
+    ret 0;
+}

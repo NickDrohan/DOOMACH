@@ -1,0 +1,62 @@
+[project]
+id = "doom"
+version = "0.1.0"
+mach = "^6.9"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.windows-x86_64]
+isa = "x86_64"
+os  = "windows"
+abi = "win64"
+
+[artifact.doom]
+kind = "bin"
+entry = "root.mach"
+out = "bin/doom{artifact.suffix}"
+targets = ["*"]
+link = ["kernel32", "user32", "gdi32"]
+need = []
+
+[link.kernel32]
+source = "system"
+name = "kernel32.dll"
+os = ["windows"]
+isa = ["*"]
+abi = ["*"]
+export = false
+
+[link.user32]
+source = "system"
+name = "user32.dll"
+os = ["windows"]
+isa = ["*"]
+abi = ["*"]
+export = false
+
+[link.gdi32]
+source = "system"
+name = "gdi32.dll"
+os = ["windows"]
+isa = ["*"]
+abi = ["*"]
+export = false
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[dep.std]
+git = "https://github.com/briar-systems/mach-std"
+ref = "tag/v9.4.1"

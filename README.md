@@ -1,0 +1,239 @@
+# doom
+
+A port of id Software's Doom engine to Mach, built so that the port asks hard questions of the
+language rather than just transliterating C.
+
+```bash
+scripts/bootstrap.sh                    # compiler 6.9.0, std, shareware WAD, id's source
+scripts/mach build products/doom --profile release
+out=products/doom/out/windows-x86_64/release/bin/doom.exe
+
+$out wad products/doom/data/DOOM1.WAD        # list the archive's directory
+$out map products/doom/data/DOOM1.WAD E1M1   # dump a loaded map, one record per line
+$out frame products/doom/data/DOOM1.WAD E1M1 frame.ppm              # draw from the player start
+$out frame products/doom/data/DOOM1.WAD E1M1 frame.ppm 1900 -3200 135   # or from x, y, degrees
+python products/doom/harness/topng.py frame.ppm frame.png 3         # PPM to PNG, enlarged 3x
+$out play products/doom/data/DOOM1.WAD        # play the first episode in a window
+$out play products/doom/data/DOOM1.WAD 5 4    # ... from E1M5 on "Ultra-Violence"
+$out demo products/doom/data/DOOM1.WAD DEMO1  # run a built-in demo headless
+bash products/doom/check.sh             # acceptance gates
+```
+
+## The shape of it
+
+**One simulation, three renderers, no C.**
+
+1. **A deterministic headless core** — WAD loading, fixed-point maths, BSP, the playsim and demo
+   playback. The oracle is Doom's own recorded demos: the simulation is integer-only and draws
+   every random number from one 256-byte table, so a single wrong bit desyncs a demo within
+   seconds.
+2. **Three renderers gated pixel-identical to each other**
+   - scalar software, the classic column and span drawer;
+   - AVX2, for the vectorizer and Mach's 256-bit lanes;
+   - SPIR-V compute, the same Mach source compiled to a shader, with the 320x200 indexed
+     framebuffer read back from the GPU.
+3. **A platform layer in Mach** — Win32 window, input and audio, and the Vulkan host, through
+   `ext fun` against system DLLs. No SDL and no C shim.
+4. **Doom's C idioms redone** — the `actionf_t` union of function pointers as a `tag`, the
+   `info.c` state tables as comptime or embedded data, the zone allocator as explicit arenas.
+
+## Build order
+
+Each step lands with its gates before the next begins.
+
+| | step | gate | state |
+| --- | --- | --- | --- |
+| 1 | WAD reader, fixed point, random table | directory matches an independent Python reader | **done** |
+| 2 | Map loading: vertexes, lines, sectors, BSP, blockmap | all nine maps dump identically to an independent Python reader | **done** |
+| 3 | Scalar renderer | twelve still viewpoints and four views from inside the demos, pinned by hash; debug and release identical | **done** |
+| 4 | Playsim and demo playback | all three shareware demos run to their last tic in sync | **done** |
+| 5 | Win32 window, input, sound effects | playable | **playable**; no sound yet |
+| 6 | AVX2 renderer | every demo frame identical to scalar; measured speedup | |
+| 7 | SPIR-V compute renderer and Vulkan host | every demo frame identical to scalar | |
+
+Step 7 rests on a backend that is days old. If it cannot carry the renderer, that is a finding
+for the Mach team and gets written up as one, not worked around. What is known so far is thin: a
+throwaway column drawer (one compute invocation per screen column, a texture column walked
+through a light table into a storage buffer, calling a helper function) compiled under 6.9.0 to
+a SPIR-V 1.6 module for `vulkan1.3` in both profiles. That module has not been validated or run
+— there is no `spirv-val` on this machine and no Vulkan host yet.
+
+## Playing it
+
+`doom play <wad> [map 1-9] [skill 1-5]` opens a 960 by 720 window on the first episode.
+
+| key | does |
+| --- | --- |
+| Up, Down or W, S | forward, back |
+| Left, Right | turn |
+| A, D | strafe |
+| Shift | run |
+| Ctrl or F | fire |
+| Space or E | open doors, press switches; restart the level when dead |
+| 1 to 7 | change weapon |
+| Esc | quit |
+
+It is the game: monsters, weapons, doors, lifts, switches, keys, secrets, damaging floors,
+teleporters, pickups, the status bar and the red and gold screen flashes. Finishing a level goes
+straight to the next.
+
+What is missing, all of it around the game rather than in it: **sound and music**, the menus,
+the intermission and ending screens, the automap, saved games. The marine's face on the status
+bar shows how hurt he is and nothing else. Nightmare skill does not speed the demons up as it
+should, because the state table is a constant here and the original edits it in place.
+
+The window procedure Windows calls is a plain Mach function, the frame goes to the screen as an
+8-bit image through `StretchDIBits`, and nothing links but user32, gdi32 and kernel32.
+
+How far it has been checked: the simulation by the demos below; the renderer and status bar by
+looking at frames captured from the running window; the mapping from held keys to commands by a
+unit test. The path from the real keyboard to those held keys has been read, not exercised.
+
+## How it is laid out
+
+Mach modules cannot import each other in a circle. Doom's C files do, constantly: moving a
+thing damages another, damage kills, death spawns things, spawning tries a move, and entering
+any animation frame can run code from anywhere. So the port has a real layering, top to bottom:
+
+| module | from | what |
+| --- | --- | --- |
+| `root` | `d_main.c`, `i_*.c` | commands, the play loop |
+| `win`, `st` | `i_video.c`, `st_stuff.c` | the window; the status bar |
+| `game` | `g_game.c`, `p_setup.c` | sessions, levels, demos, keys to commands |
+| `tick` | `p_tick.c`, `p_user.c` | one tic; the player; thinker dispatch |
+| `enemy`, `pspr` | `p_enemy.c`, `p_pspr.c` | what monsters and weapons do |
+| `spec` | `p_spec.c`, `p_switch.c`, `p_telept.c` | what lines and sectors trigger |
+| `movers` | `p_doors.c`, `p_floor.c`, `p_ceilng.c`, `p_plats.c`, `p_lights.c` | doors, floors, lifts, lights |
+| `world` | `p_mobj.c`, `p_map.c`, `p_inter.c` | things, movement, collision, damage |
+| `maputl` | `p_maputl.c`, `p_sight.c` | geometry, the blockmap, line of sight |
+| `render` | `r_*.c` | the software renderer |
+| `defs`, `info`, `tables` | headers, `info.c`, `tables.c` | types, the state table, trigonometry |
+| `rdata`, `level`, `wad`, `fixed`, `random` | `r_data.c`, `p_setup.c`, `w_wad.c`, `m_*.c` | data |
+
+Two calls go *up* that order and would close a circle. Both go through a function pointer held
+in the game state: `run_action`, by which entering a state runs a monster's or a weapon's
+behaviour, and `line_special`, by which crossing, using or shooting a line sets off a door or a
+lift. The three C files that are circular among themselves and cannot be pulled apart that way
+(`p_mobj.c`, `p_map.c`, `p_inter.c`) became the one module `world`.
+
+## Acceptance gates
+
+`bash products/doom/check.sh` asserts, and fails loudly on:
+
+- the standard library checkout matching its pinned tag;
+- the unit tests, and that both profiles build;
+- the game data being exactly shareware Doom 1.9, by SHA-256;
+- the lump directory of that WAD matching `harness/wadls.py` byte for byte (1,264 lumps);
+- debug and release agreeing on it;
+- a non-WAD, a WAD cut off before its directory, and a missing file each rejected with exit 2,
+  and a bare invocation with exit 1;
+- each of E1M1 to E1M9 loading to exactly what `harness/mapdump.py` derives on its own: every
+  vertex, sector, side, line, subsector, seg, node and thing, with the slope types, bounding
+  boxes, per-sector line tables, sound origins and block boxes that `P_SetupLevel` computes
+  (45,718 lines of dump in all);
+- debug and release agreeing on all nine, and the dumps matching `fixtures/maps.sha256`;
+- a map the WAD does not hold, and a map whose first line names vertex 65535, each rejected with
+  exit 3, while the other maps of the damaged file still load.
+
+- twelve still frames, the player start of each map and three more views of E1M1, drawn by both
+  profiles and matching `fixtures/frames.sha256` pixel for pixel.
+
+- each of the three demos in the WAD playing to its pinned last line (tic, a sum over every
+  object's position, momentum, health and state, and the player's position, health and kills), in
+  both profiles;
+- four views from inside those demos, with monsters, items and the weapon in hand, matching
+  `fixtures/shots.sha256` in both profiles;
+- a demo the WAD does not hold rejected with exit 3.
+
+**What the demo gates do and do not establish.** A demo is one player's recorded commands. The
+simulation is deterministic and draws every random number from one table, so if anything at all
+is computed differently, the monsters move differently, the recorded commands stop making sense,
+and the player runs into a wall and dies somewhere else. Here, on the first run, the player
+fought through 5,026, 3,836 and 2,134 tics, killed 61, 41 and 20 monsters, and in each demo died
+between 53 and 58 tics before the recording ends, which is where a recording stops: just after
+its player dies. That is strong evidence of sync and it is not proof, because the pinned values
+were produced by this port and not by the original. A reference engine printing the same sum
+would settle it.
+
+Perturbed four ways: drawing a pair of random numbers in the other order, strengthening friction
+by one part in 59,392, and letting monsters reach one unit further each sent all three demos
+somewhere else. Restoring the 32 units of explosion reach that the original loses to an overflow
+changed nothing: no explosion in the three demos has anything standing in that gap.
+
+**The frame gates are weaker than the rest, and say so.** Everything above them is checked
+against an independent implementation. The frames are not: there is no reference engine on this
+machine, so they were looked at, found to be Doom, and pinned. They prove that nothing drifts and
+that the optimiser changes no pixel. They do not prove the pixels match the original's. Demo sync
+does not cover the renderer either, so a frame-by-frame comparison against a reference
+port remains owed.
+
+Checked that they can fail. Each of these turned the run red and was then restored: breaking the
+name upper-casing, shifting the fixed-point multiply by 15 instead of 16, dropping the directory
+bounds check, flipping the sign of the slope test, subtracting the block-box radius where it is
+added, and dropping the vertex range check (which segfaults, as the C original would).
+
+The renderer was perturbed the same way: dropping the shade that north-south walls are darkened
+by, losing one bit of the floor texture's row mask, and clipping solid walls as if they could be
+seen through each changed the frames. Lowering the smallest wall scale from 256 to 255 did not,
+and cannot: no sightline in the shareware maps is long enough to reach it.
+
+One perturbation of the map loader got through at first, and is worth knowing about. `M_AddToBox` tests a box's low
+bound and only *otherwise* its high bound, so a point that lowers one never raises the other.
+Rewriting that as two independent tests changed nothing in any of the nine maps, because a
+sector's outline revisits its vertexes and the bound is caught on the second visit. The data
+cannot see that bug, so a unit test now pins the behaviour instead.
+
+## Where the port departs from the C
+
+- **Indices, not pointers.** `line_t` points at its vertexes, sides and sectors; `Line` holds
+  their numbers. An index means the same thing in a storage buffer on a GPU as it does on the
+  CPU, which the third renderer needs, and every one is range-checked once at load.
+- **A damaged map is refused.** The original reads whatever a bad index lands on. Here the
+  loader names the lump that holds the bad reference and exits 3.
+- **One record, not two hundred globals.** The C renderer's state is file-scope variables shared
+  across five files. Here it is a `Renderer` record, so a frame is a function of that record and
+  the eye position, which is the shape a second and third renderer need.
+- **Textures are composed at start**, not on first use. Same pixels, no cache.
+- **A point at the eye has a distance.** `R_PointToDist` divides zero by zero there and indexes
+  far outside a table; this returns the sensible answer, as Chocolate Doom does.
+- **A thinker's function pointer is a kind byte.** The C code stores a function in every
+  thinker and compares it against known functions to ask what a thinker is. A kind answers that
+  directly, and one chain in `tick.mach` turns it back into a call.
+- **Nothing is freed during a level.** The original frees a dead thing's memory while other
+  things may still point at it, and usually gets away with reading it. Here a level's objects
+  live in one arena that is dropped whole when the level ends, so a stale pointer reads what the
+  thing last held, every time.
+- **Explosions keep their overflow.** `MAXRADIUS` is already in fixed point where
+  `P_RadiusAttack` shifts it again, so it vanishes and blast reach is the damage alone. Kept,
+  with a comment, because demos depend on it.
+- **"None" is -1.** A one-sided line's back sector is a null pointer in C and `NONE` here.
+
+## Toolchain
+
+`toolchain.env` in this directory pins **Mach 6.9.0**, overriding the portfolio's 5.11.0 for this
+product only — the SPIR-V backend and 256-bit vectors arrived after 5.11. `scripts/mach` picks the
+override up from the product path. The standard library is `tag/v9.4.1`.
+
+## Data and reference source
+
+Neither is committed; `bootstrap.sh` fetches both into ignored directories.
+
+- `data/DOOM1.WAD` — the shareware episode, free to distribute but not to relicense. It is pinned
+  by hash in `fixtures/DOOM1.WAD.sha256`, so any mirror serves.
+- `ref/DOOM` — id Software's `linuxdoom-1.10`, the source this port is read against. Where it
+  differs from the DOS executable that recorded the demos (fixed-point division goes through a
+  double in the Linux source), the port follows the DOS behaviour, as Chocolate Doom does.
+
+## Licence
+
+GPL-2.0-or-later, in [LICENSE](LICENSE): this is a derivative of id Software's GPL release. That
+applies to this directory only; the other products in the portfolio are unaffected.
+
+## Deliberately not built
+
+Low-detail mode and view sizes other than the standard one with the status bar.
+
+Networking and multiplayer. Music (sound effects only). Doom II, Heretic, Hexen, or any source
+port extension — the target is the shareware episode behaving as the original did. Targets other
+than windows-x86_64: the simulation is integer-only and ought to reproduce elsewhere, but nothing
+here tests that.

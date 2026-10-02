@@ -1,0 +1,457 @@
+# what the renderer draws with: wall textures, flats, the light tables and the
+# palette, all read out of the WAD
+#
+# Ported from r_data.c. A wall texture is a rectangle assembled from patches.
+# Where one patch covers a column, the column is drawn straight from that
+# patch's lump; where several overlap, the column is composed once into a
+# block owned by the texture. The C code composes on first use; this composes
+# everything at start, which changes nothing that can be seen.
+
+use std.allocator;
+use std.types.bool.bool;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use doom.level;
+use doom.wad;
+
+pub rec Texture {
+    name:       [9]u8;
+    width:      i32;
+    height:     i32;
+    widthmask:  i32;
+    patchcount: i32;
+    # this texture's patches are patches[firstpatch ..]
+    firstpatch: i32;
+    # this texture's columns are collump/colofs[firstcol ..]
+    firstcol:      i32;
+    compositesize: i32;
+    composite:     *u8;
+}
+
+pub rec TexPatch {
+    originx: i32;
+    originy: i32;
+    lump:    i32;
+}
+
+pub rec Data {
+    w: *wad.Wad;
+
+    numtextures: i32;
+    textures:    *Texture;
+    patches:     *TexPatch;
+    # for each column of each texture: the patch lump it is drawn from, or -1
+    # for a composed column, and the offset of its pixels in that lump or in
+    # the texture's composite block. the offset is 16 bits wide, as in the
+    # original, which is what breaks patches taller than fits
+    collump: *i16;
+    colofs:  *u16;
+
+    firstflat: i32;
+    numflats:  i32;
+
+    # which texture or flat is drawn in place of each one: itself, except
+    # while an animation has moved it on
+    texturetranslation: *i32;
+    flattranslation:    *i32;
+
+    # 34 light tables of 256 palette indices each
+    colormaps: *u8;
+    # 14 palettes of 256 red, green, blue triples; the first is the normal one
+    playpal: *u8;
+}
+
+# why the WAD's graphics could not be set up
+pub tag DataError: u8 {
+    # a lump the renderer cannot do without is missing or too small
+    lump: str;
+    # a texture names a patch the WAD does not hold
+    patch: i32;
+    # a texture definition or a patch points outside its lump
+    damaged: i32;
+    memory;
+}
+
+fun le16(p: *u8, at: usize) i32 {
+    ret ((p[at]::u16 | (p[at + 1]::u16 << 8)):~i16)::i32;
+}
+
+fun le32(p: *u8, at: usize) i32 {
+    ret (p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24)):~i32;
+}
+
+fun upper(c: u8) u8 {
+    if (c >= 'a' && c <= 'z') { ret c - 32; }
+    ret c;
+}
+
+fun fail(e: DataError) res[Data, DataError] {
+    ret res[Data, DataError].err{e};
+}
+
+fun grab[T](a: *allocator.Allocator, count: i32, out: **T) bool {
+    if (count <= 0) { ret 1; }
+    val r: res[*T, allocator.Error] = allocator.zallocate[T](a, count::usize);
+    if (sel r.err) { ret 0; }
+    @out = r.ok;
+    ret 1;
+}
+
+# a named lump's number, or -1
+fun lump_num(w: *wad.Wad, name: str) i32 {
+    val found: opt[u32] = wad.find(w, name);
+    if (sel found.some) { ret found.some::i32; }
+    ret -1;
+}
+
+# R_DrawColumnInCache: copy one patch column's posts into a composed column
+fun draw_column_in_cache(patch: *u8, cache: *u8, originy: i32, cacheheight: i32) {
+    var at: usize = 0;
+    for (patch[at] != 0xff) {
+        var count:    i32 = patch[at + 1]::i32;
+        var position: i32 = originy + patch[at]::i32;
+        if (position < 0) {
+            count    = count + position;
+            position = 0;
+        }
+        if (position + count > cacheheight) { count = cacheheight - position; }
+        # the original copies from the top of the post even when the post
+        # starts above the texture, so the pixels shift rather than clip
+        var k: i32 = 0;
+        for (k < count) {
+            cache[position + k] = patch[at + 3 + k::usize];
+            k                   = k + 1;
+        }
+        at = at + patch[at + 1]::usize + 4;
+    }
+}
+
+# R_GenerateLookup: decide, for each column of a texture, where it is drawn from
+fun generate_lookup(a: *allocator.Allocator, d: *Data, texnum: i32) bool {
+    val t: *Texture = ?d.textures[texnum];
+    t.composite     = nil;
+    t.compositesize = 0;
+
+    var counts: *u8;
+    if (!grab[u8](a, t.width, ?counts)) { ret 0; }
+
+    var i: i32 = 0;
+    for (i < t.patchcount) {
+        val p:         *TexPatch = ?d.patches[t.firstpatch + i];
+        val realpatch: *u8       = wad.bytes(d.w, p.lump::u32);
+        val x1:        i32       = p.originx;
+        var x2:        i32       = x1 + le16(realpatch, 0);
+        var x:         i32       = x1;
+        if (x1 < 0)       { x = 0; }
+        if (x2 > t.width) { x2 = t.width; }
+        for (x < x2) {
+            counts[x]                 = counts[x] + 1;
+            d.collump[t.firstcol + x] = p.lump::i16;
+            d.colofs[t.firstcol + x]  = (le32(realpatch, 8 + (x - x1)::usize * 4) + 3)::u16;
+            x                         = x + 1;
+        }
+        i = i + 1;
+    }
+
+    var x: i32 = 0;
+    for (x < t.width) {
+        # a column no patch covers ends the scan, as it does in the original
+        if (counts[x] == 0) { ret 1; }
+        if (counts[x] > 1) {
+            d.collump[t.firstcol + x] = -1;
+            d.colofs[t.firstcol + x]  = t.compositesize::u16;
+            t.compositesize           = t.compositesize + t.height;
+        }
+        x = x + 1;
+    }
+    ret 1;
+}
+
+# R_GenerateComposite: compose the columns that several patches overlap on
+fun generate_composite(a: *allocator.Allocator, d: *Data, texnum: i32) bool {
+    val t: *Texture = ?d.textures[texnum];
+    if (t.compositesize == 0)                        { ret 1; }
+    if (!grab[u8](a, t.compositesize, ?t.composite)) { ret 0; }
+
+    var i: i32 = 0;
+    for (i < t.patchcount) {
+        val p:         *TexPatch = ?d.patches[t.firstpatch + i];
+        val realpatch: *u8       = wad.bytes(d.w, p.lump::u32);
+        val x1:        i32       = p.originx;
+        var x2:        i32       = x1 + le16(realpatch, 0);
+        var x:         i32       = x1;
+        if (x1 < 0)       { x = 0; }
+        if (x2 > t.width) { x2 = t.width; }
+        for (x < x2) {
+            if (d.collump[t.firstcol + x] < 0) {
+                val ofs: i32 = le32(realpatch, 8 + (x - x1)::usize * 4);
+                draw_column_in_cache(?realpatch[ofs], ?t.composite[d.colofs[t.firstcol + x]], p.originy, t.height);
+            }
+            x = x + 1;
+        }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# a texture lump (TEXTURE1 or TEXTURE2) and how many textures it defines
+rec TexLump {
+    data:  *u8;
+    size:  i32;
+    count: i32;
+}
+
+fun texture_lump(w: *wad.Wad, name: str) TexLump {
+    var t: TexLump;
+    val n: i32 = lump_num(w, name);
+    if (n < 0) { ret t; }
+    t.size = wad.lump(w, n::u32).size::i32;
+    if (t.size < 4) { ret t; }
+    t.data  = wad.bytes(w, n::u32);
+    t.count = le32(t.data, 0);
+    ret t;
+}
+
+# read the WAD's graphics
+# ---
+# a:   allocator for the lookup tables and composed textures
+# w:   the archive, which must outlive the Data
+# ret: the graphics, or what was wrong with them
+pub fun init(a: *allocator.Allocator, w: *wad.Wad) res[Data, DataError] {
+    var d: Data;
+    d.w = w;
+
+    # R_InitColormaps, and the palette the video layer would load
+    val cm: i32 = lump_num(w, "COLORMAP");
+    if (cm < 0 || wad.lump(w, cm::u32).size < 34 * 256) { ret fail(DataError.lump{"COLORMAP"}); }
+    d.colormaps = wad.bytes(w, cm::u32);
+    val pp: i32 = lump_num(w, "PLAYPAL");
+    if (pp < 0 || wad.lump(w, pp::u32).size < 768) { ret fail(DataError.lump{"PLAYPAL"}); }
+    d.playpal = wad.bytes(w, pp::u32);
+
+    # R_InitFlats
+    val fs: i32 = lump_num(w, "F_START");
+    val fe: i32 = lump_num(w, "F_END");
+    if (fs < 0 || fe < fs) { ret fail(DataError.lump{"F_START"}); }
+    d.firstflat = fs + 1;
+    d.numflats  = fe - 1 - d.firstflat + 1;
+
+    # R_InitTextures: the patch names
+    val pn: i32 = lump_num(w, "PNAMES");
+    if (pn < 0 || wad.lump(w, pn::u32).size < 4) { ret fail(DataError.lump{"PNAMES"}); }
+    val names:         *u8 = wad.bytes(w, pn::u32);
+    val nummappatches: i32 = le32(names, 0);
+    if (nummappatches < 0 || wad.lump(w, pn::u32).size::i32 < 4 + nummappatches * 8) {
+        ret fail(DataError.lump{"PNAMES"});
+    }
+    var patchlookup: *i32;
+    if (!grab[i32](a, nummappatches, ?patchlookup)) { ret fail(DataError.memory{}); }
+    var i: i32 = 0;
+    for (i < nummappatches) {
+        var name: [9]u8;
+        var k:    usize = 0;
+        for (k < 8) {
+            name[k] = names[4 + i::usize * 8 + k];
+            k       = k + 1;
+        }
+        patchlookup[i] = lump_num(w, ?name[0]);
+        i              = i + 1;
+    }
+
+    # the texture definitions, in one lump or two
+    var lumps: [2]TexLump;
+    lumps[0] = texture_lump(w, "TEXTURE1");
+    lumps[1] = texture_lump(w, "TEXTURE2");
+    if (lumps[0].data == nil || lumps[0].count < 0 || lumps[1].count < 0) {
+        ret fail(DataError.lump{"TEXTURE1"});
+    }
+    d.numtextures = lumps[0].count + lumps[1].count;
+    if (!grab[Texture](a, d.numtextures, ?d.textures)) { ret fail(DataError.memory{}); }
+
+    # a first pass to size the patch and column tables
+    var totalpatches: i32 = 0;
+    var totalwidth:   i32 = 0;
+    i = 0;
+    for (i < d.numtextures) {
+        var tl:    *TexLump = ?lumps[0];
+        var index: i32      = i;
+        if (i >= lumps[0].count) {
+            tl    = ?lumps[1];
+            index = i - lumps[0].count;
+        }
+        if (4 + index * 4 + 4 > tl.size) { ret fail(DataError.damaged{i}); }
+        val offset: i32 = le32(tl.data, 4 + index::usize * 4);
+        if (offset < 0 || offset + 22 > tl.size) { ret fail(DataError.damaged{i}); }
+        val m: *u8      = ?tl.data[offset];
+        val t: *Texture = ?d.textures[i];
+        var k: usize    = 0;
+        for (k < 8 && m[k] != 0) {
+            t.name[k] = upper(m[k]);
+            k         = k + 1;
+        }
+        t.width      = le16(m, 12);
+        t.height     = le16(m, 14);
+        t.patchcount = le16(m, 20);
+        if (t.width <= 0 || t.height <= 0 || t.patchcount < 0) { ret fail(DataError.damaged{i}); }
+        if (offset + 22 + t.patchcount * 10 > tl.size)         { ret fail(DataError.damaged{i}); }
+        t.firstpatch = totalpatches;
+        t.firstcol   = totalwidth;
+        totalpatches = totalpatches + t.patchcount;
+        totalwidth   = totalwidth + t.width;
+
+        var j: i32 = 1;
+        for (j * 2 <= t.width) { j = j << 1; }
+        t.widthmask = j - 1;
+        i           = i + 1;
+    }
+    if (!grab[TexPatch](a, totalpatches, ?d.patches)) { ret fail(DataError.memory{}); }
+    if (!grab[i16](a, totalwidth, ?d.collump))        { ret fail(DataError.memory{}); }
+    if (!grab[u16](a, totalwidth, ?d.colofs))         { ret fail(DataError.memory{}); }
+
+    # a second pass for the patches of each texture
+    i = 0;
+    for (i < d.numtextures) {
+        var tl:    *TexLump = ?lumps[0];
+        var index: i32      = i;
+        if (i >= lumps[0].count) {
+            tl    = ?lumps[1];
+            index = i - lumps[0].count;
+        }
+        val m: *u8      = ?tl.data[le32(tl.data, 4 + index::usize * 4)];
+        val t: *Texture = ?d.textures[i];
+        var j: i32      = 0;
+        for (j < t.patchcount) {
+            val mp: *u8       = ?m[22 + j * 10];
+            val p:  *TexPatch = ?d.patches[t.firstpatch + j];
+            val pi: i32       = le16(mp, 4);
+            p.originx = le16(mp, 0);
+            p.originy = le16(mp, 2);
+            if (pi < 0 || pi >= nummappatches || patchlookup[pi] < 0) { ret fail(DataError.patch{i}); }
+            p.lump = patchlookup[pi];
+            # the patch must hold a column offset for each of its columns
+            val pl: wad.Lump = wad.lump(w, p.lump::u32);
+            if (pl.size < 8) { ret fail(DataError.damaged{i}); }
+            val pw: i32 = le16(wad.bytes(w, p.lump::u32), 0);
+            if (pw < 0 || 8 + pw * 4 > pl.size::i32) { ret fail(DataError.damaged{i}); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < d.numtextures) {
+        if (!generate_lookup(a, ?d, i))    { ret fail(DataError.memory{}); }
+        if (!generate_composite(a, ?d, i)) { ret fail(DataError.memory{}); }
+        i = i + 1;
+    }
+
+    if (!grab[i32](a, d.numtextures + 1, ?d.texturetranslation)) { ret fail(DataError.memory{}); }
+    if (!grab[i32](a, d.numflats + 1, ?d.flattranslation))       { ret fail(DataError.memory{}); }
+    i = 0;
+    for (i < d.numtextures) {
+        d.texturetranslation[i] = i;
+        i                       = i + 1;
+    }
+    i = 0;
+    for (i < d.numflats) {
+        d.flattranslation[i] = i;
+        i                    = i + 1;
+    }
+    ret res[Data, DataError].ok{d};
+}
+
+# R_CheckTextureNumForName: a texture's number by name, ignoring case
+# ---
+# d:    the graphics
+# name: up to eight characters; "-" means no texture
+# ret:  the number, 0 for "-", or -1 when there is no such texture
+pub fun texture_num(d: *Data, name: str) i32 {
+    if (name[0] == '-') { ret 0; }
+    var i: i32 = 0;
+    for (i < d.numtextures) {
+        val t:    *Texture = ?d.textures[i];
+        var k:    usize    = 0;
+        var same: bool     = 1;
+        for (k < 8) {
+            if (upper(name[k]) != t.name[k]) {
+                same = 0;
+                brk;
+            }
+            if (name[k] == 0) { brk; }
+            k = k + 1;
+        }
+        if (same) { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# R_FlatNumForName: a flat's number by name
+# ---
+# d:    the graphics
+# name: up to eight characters
+# ret:  the flat's position after F_START, or -1 when the WAD has no such lump
+pub fun flat_num(d: *Data, name: str) i32 {
+    val n: i32 = lump_num(d.w, name);
+    if (n < 0) { ret -1; }
+    ret n - d.firstflat;
+}
+
+# a flat's 64 by 64 pixels
+pub fun flat(d: *Data, picnum: i32) *u8 {
+    ret wad.bytes(d.w, (d.firstflat + picnum)::u32);
+}
+
+# R_GetColumn: the pixels of one column of a texture
+# ---
+# d:   the graphics
+# tex: texture number
+# col: column, wrapped to the texture's width
+# ret: the column's pixels, top first
+pub fun get_column(d: *Data, tex: i32, col: i32) *u8 {
+    val t:    *Texture = ?d.textures[tex];
+    val c:    i32      = col & t.widthmask;
+    val lump: i32      = d.collump[t.firstcol + c]::i32;
+    val ofs:  usize    = d.colofs[t.firstcol + c]::usize;
+    if (lump > 0) { ret ?wad.bytes(d.w, lump::u32)[ofs]; }
+    ret ?t.composite[ofs];
+}
+
+# why a map could not be given its textures
+pub tag BindError: u8 {
+    # this side names a texture the WAD does not define
+    side: i32;
+    # this sector names a flat the WAD does not hold
+    sector: i32;
+    ok;
+}
+
+# resolve a map's texture and flat names to numbers, as P_LoadSideDefs and
+# P_LoadSectors do while loading
+# ---
+# d:   the graphics
+# lv:  the map
+# ret: ok, or the first side or sector with an unknown name
+pub fun bind(d: *Data, lv: *level.Level) BindError {
+    var i: i32 = 0;
+    for (i < lv.numsides) {
+        val s: *level.Side = ?lv.sides[i];
+        s.toptex    = texture_num(d, ?s.toptexture[0]);
+        s.bottomtex = texture_num(d, ?s.bottomtexture[0]);
+        s.midtex    = texture_num(d, ?s.midtexture[0]);
+        if (s.toptex < 0 || s.bottomtex < 0 || s.midtex < 0) { ret BindError.side{i}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < lv.numsectors) {
+        val s: *level.Sector = ?lv.sectors[i];
+        s.floorflat   = flat_num(d, ?s.floorpic[0]);
+        s.ceilingflat = flat_num(d, ?s.ceilingpic[0]);
+        if (s.floorflat < 0 || s.ceilingflat < 0) { ret BindError.sector{i}; }
+        i = i + 1;
+    }
+    ret BindError.ok{};
+}

@@ -1,0 +1,1542 @@
+# the parts of a map that move or flicker: doors, floors, ceilings, lifts
+# and lights
+#
+# Ported from p_doors.c, p_floor.c, p_ceilng.c, p_plats.c and p_lights.c,
+# with the sector lookups they share from p_spec.c. Each mover is a thinker:
+# a record that begins with a Thinker header and is run once a tic until it
+# removes itself.
+#
+# The C functions take the line that set the effect off, mostly for its tag.
+# Here they take the tag and the line's number, because one caller (the death
+# of a boss) has a tag and no line.
+
+use std.types.bool.bool;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.defs.Mobj;
+use doom.defs.Player;
+use doom.defs.Thinker;
+use doom.fixed.Fixed;
+use doom.info;
+use doom.level;
+use doom.world;
+
+# door kinds
+pub val NORMAL:             i32 = 0;
+pub val CLOSE_30_THEN_OPEN: i32 = 1;
+pub val CLOSE:              i32 = 2;
+pub val OPEN:               i32 = 3;
+pub val RAISE_IN_5_MINS:    i32 = 4;
+pub val BLAZE_RAISE:        i32 = 5;
+pub val BLAZE_OPEN:         i32 = 6;
+pub val BLAZE_CLOSE:        i32 = 7;
+
+# ceiling kinds
+pub val LOWER_TO_FLOOR:         i32 = 0;
+pub val RAISE_TO_HIGHEST:       i32 = 1;
+pub val LOWER_AND_CRUSH:        i32 = 2;
+pub val CRUSH_AND_RAISE:        i32 = 3;
+pub val FAST_CRUSH_AND_RAISE:   i32 = 4;
+pub val SILENT_CRUSH_AND_RAISE: i32 = 5;
+
+# floor kinds
+pub val LOWER_FLOOR:               i32 = 0;
+pub val LOWER_FLOOR_TO_LOWEST:     i32 = 1;
+pub val TURBO_LOWER:               i32 = 2;
+pub val RAISE_FLOOR:               i32 = 3;
+pub val RAISE_FLOOR_TO_NEAREST:    i32 = 4;
+pub val RAISE_TO_TEXTURE:          i32 = 5;
+pub val LOWER_AND_CHANGE:          i32 = 6;
+pub val RAISE_FLOOR_24:            i32 = 7;
+pub val RAISE_FLOOR_24_AND_CHANGE: i32 = 8;
+pub val RAISE_FLOOR_CRUSH:         i32 = 9;
+pub val RAISE_FLOOR_TURBO:         i32 = 10;
+pub val DONUT_RAISE:               i32 = 11;
+pub val RAISE_FLOOR_512:           i32 = 12;
+
+# stair kinds
+pub val BUILD_8:  i32 = 0;
+pub val TURBO_16: i32 = 1;
+
+# lift kinds
+pub val PERPETUAL_RAISE:             i32 = 0;
+pub val DOWN_WAIT_UP_STAY:           i32 = 1;
+pub val RAISE_AND_CHANGE:            i32 = 2;
+pub val RAISE_TO_NEAREST_AND_CHANGE: i32 = 3;
+pub val BLAZE_DWUS:                  i32 = 4;
+
+# lift states
+val PLAT_UP:        i32 = 0;
+val PLAT_DOWN:      i32 = 1;
+val PLAT_WAITING:   i32 = 2;
+val PLAT_IN_STASIS: i32 = 3;
+
+# what moving a plane came to
+val OK:       i32 = 0;
+val CRUSHED:  i32 = 1;
+val PASTDEST: i32 = 2;
+
+val VDOORSPEED: Fixed = 2 * 65536;
+val VDOORWAIT:  i32   = 150;
+val FLOORSPEED: Fixed = 65536;
+val CEILSPEED:  Fixed = 65536;
+val PLATSPEED:  Fixed = 65536;
+val PLATWAIT:   i32   = 3;
+
+val     GLOWSPEED:    i32 = 8;
+val     STROBEBRIGHT: i32 = 5;
+pub val FASTDARK:     i32 = 15;
+pub val SLOWDARK:     i32 = 35;
+
+val MAXCEILINGS: i32 = 30;
+val MAXPLATS:    i32 = 30;
+
+pub rec Door {
+    thinker:   Thinker;
+    kind:      i32;
+    sector:    i32;
+    topheight: Fixed;
+    speed:     Fixed;
+    # 1 = up, 0 = waiting at top, -1 = down
+    direction: i32;
+    # tics to wait at the top
+    topwait: i32;
+    # (keep in case a door going down is reset) when it reaches 0, start
+    # going down
+    topcountdown: i32;
+}
+
+pub rec FloorMove {
+    thinker:         Thinker;
+    kind:            i32;
+    crush:           bool;
+    sector:          i32;
+    direction:       i32;
+    newspecial:      i32;
+    texture:         i32;
+    floordestheight: Fixed;
+    speed:           Fixed;
+}
+
+pub rec Ceiling {
+    thinker:      Thinker;
+    kind:         i32;
+    sector:       i32;
+    bottomheight: Fixed;
+    topheight:    Fixed;
+    speed:        Fixed;
+    crush:        bool;
+    # 1 = up, 0 = waiting, -1 = down
+    direction: i32;
+    # ID
+    tagnum:       i32;
+    olddirection: i32;
+}
+
+pub rec Plat {
+    thinker:   Thinker;
+    sector:    i32;
+    speed:     Fixed;
+    low:       Fixed;
+    high:      Fixed;
+    wait:      i32;
+    count:     i32;
+    status:    i32;
+    oldstatus: i32;
+    crush:     bool;
+    tagnum:    i32;
+    kind:      i32;
+}
+
+pub rec FireFlicker {
+    thinker:  Thinker;
+    sector:   i32;
+    count:    i32;
+    maxlight: i32;
+    minlight: i32;
+}
+
+pub rec LightFlash {
+    thinker:  Thinker;
+    sector:   i32;
+    count:    i32;
+    maxlight: i32;
+    minlight: i32;
+    maxtime:  i32;
+    mintime:  i32;
+}
+
+pub rec Strobe {
+    thinker:    Thinker;
+    sector:     i32;
+    count:      i32;
+    minlight:   i32;
+    maxlight:   i32;
+    darktime:   i32;
+    brighttime: i32;
+}
+
+pub rec Glow {
+    thinker:   Thinker;
+    sector:    i32;
+    minlight:  i32;
+    maxlight:  i32;
+    direction: i32;
+}
+
+# -------------------------------------------------- p_spec.c: sector lookups
+
+fun sec(g: *Game, secnum: i32) *level.Sector {
+    ret ?g.lv.sectors[secnum];
+}
+
+# the number of the i'th line of a sector
+fun sector_line(g: *Game, secnum: i32, i: i32) i32 {
+    ret g.lv.sector_lines[g.lv.sectors[secnum].firstline + i];
+}
+
+# getNextSector: the sector on the other side of a line, or NONE
+pub fun next_sector(g: *Game, linenum: i32, secnum: i32) i32 {
+    val line: *level.Line = ?g.lv.lines[linenum];
+    if ((line.flags::i32 & defs.ML_TWOSIDED) == 0) { ret level.NONE; }
+    if (line.frontsector == secnum)                { ret line.backsector; }
+    ret line.frontsector;
+}
+
+# P_FindLowestFloorSurrounding
+pub fun find_lowest_floor_surrounding(g: *Game, secnum: i32) Fixed {
+    var floor: Fixed = sec(g, secnum).floorheight;
+    var i:     i32   = 0;
+    for (i < sec(g, secnum).linecount) {
+        val other: i32 = next_sector(g, sector_line(g, secnum, i), secnum);
+        i = i + 1;
+        if (other == level.NONE)               { cnt; }
+        if (sec(g, other).floorheight < floor) { floor = sec(g, other).floorheight; }
+    }
+    ret floor;
+}
+
+# P_FindHighestFloorSurrounding
+pub fun find_highest_floor_surrounding(g: *Game, secnum: i32) Fixed {
+    var floor: Fixed = 0 - 500 * 65536;
+    var i:     i32   = 0;
+    for (i < sec(g, secnum).linecount) {
+        val other: i32 = next_sector(g, sector_line(g, secnum, i), secnum);
+        i = i + 1;
+        if (other == level.NONE)               { cnt; }
+        if (sec(g, other).floorheight > floor) { floor = sec(g, other).floorheight; }
+    }
+    ret floor;
+}
+
+# P_FindNextHighestFloor: the lowest floor around a sector that is above a
+# height. the original keeps at most 20 candidates and stops looking there.
+pub fun find_next_highest_floor(g: *Game, secnum: i32, currentheight: Fixed) Fixed {
+    var heightlist: [20]Fixed;
+    var h:          i32 = 0;
+    var i:          i32 = 0;
+    for (i < sec(g, secnum).linecount) {
+        val other: i32 = next_sector(g, sector_line(g, secnum, i), secnum);
+        i = i + 1;
+        if (other == level.NONE) { cnt; }
+        if (sec(g, other).floorheight > currentheight) {
+            heightlist[h] = sec(g, other).floorheight;
+            h             = h + 1;
+        }
+        # check for overflow
+        if (h >= 20) { brk; }
+    }
+
+    # find lowest height in list
+    if (h == 0) { ret currentheight; }
+
+    var min: Fixed = heightlist[0];
+    # range checking?
+    i = 1;
+    for (i < h) {
+        if (heightlist[i] < min) { min = heightlist[i]; }
+        i = i + 1;
+    }
+    ret min;
+}
+
+# P_FindLowestCeilingSurrounding
+pub fun find_lowest_ceiling_surrounding(g: *Game, secnum: i32) Fixed {
+    var height: Fixed = defs.MAXINT;
+    var i:      i32   = 0;
+    for (i < sec(g, secnum).linecount) {
+        val other: i32 = next_sector(g, sector_line(g, secnum, i), secnum);
+        i = i + 1;
+        if (other == level.NONE)                  { cnt; }
+        if (sec(g, other).ceilingheight < height) { height = sec(g, other).ceilingheight; }
+    }
+    ret height;
+}
+
+# P_FindHighestCeilingSurrounding
+pub fun find_highest_ceiling_surrounding(g: *Game, secnum: i32) Fixed {
+    var height: Fixed = 0;
+    var i:      i32   = 0;
+    for (i < sec(g, secnum).linecount) {
+        val other: i32 = next_sector(g, sector_line(g, secnum, i), secnum);
+        i = i + 1;
+        if (other == level.NONE)                  { cnt; }
+        if (sec(g, other).ceilingheight > height) { height = sec(g, other).ceilingheight; }
+    }
+    ret height;
+}
+
+# P_FindSectorFromLineTag: the next sector after start with a tag, or -1
+pub fun find_sector_from_tag(g: *Game, tag: i32, start: i32) i32 {
+    var i: i32 = start + 1;
+    for (i < g.lv.numsectors) {
+        if (g.lv.sectors[i].tagnum::i32 == tag) { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# P_FindMinSurroundingLight
+pub fun find_min_surrounding_light(g: *Game, secnum: i32, max: i32) i32 {
+    var min: i32 = max;
+    var i:   i32 = 0;
+    for (i < sec(g, secnum).linecount) {
+        val check: i32 = next_sector(g, sector_line(g, secnum, i), secnum);
+        i = i + 1;
+        if (check == level.NONE)                 { cnt; }
+        if (sec(g, check).lightlevel::i32 < min) { min = sec(g, check).lightlevel::i32; }
+    }
+    ret min;
+}
+
+# ---------------------------------------------------------------- p_floor.c
+
+# T_MovePlane: move a plane (floor or ceiling) and check for crushing
+# ---
+# floor_or_ceiling: 0 for the floor, 1 for the ceiling
+# direction:        -1 down, 1 up
+# ret:              OK, CRUSHED or PASTDEST
+fun move_plane(g: *Game, secnum: i32, speed: Fixed, dest: Fixed, crush: bool, floor_or_ceiling: i32, direction: i32) i32 {
+    val sector: *level.Sector = sec(g, secnum);
+
+    if (floor_or_ceiling == 0) {
+        # floor
+        if (direction == -1) {
+            # down
+            if (sector.floorheight - speed < dest) {
+                val lastpos: Fixed = sector.floorheight;
+                sector.floorheight = dest;
+                if (world.change_sector(g, secnum, crush)) {
+                    sector.floorheight = lastpos;
+                    world.change_sector(g, secnum, crush);
+                }
+                ret PASTDEST;
+            }
+            val lastpos: Fixed = sector.floorheight;
+            sector.floorheight = sector.floorheight - speed;
+            if (world.change_sector(g, secnum, crush)) {
+                sector.floorheight = lastpos;
+                world.change_sector(g, secnum, crush);
+                ret CRUSHED;
+            }
+        }
+        or (direction == 1) {
+            # up
+            if (sector.floorheight + speed > dest) {
+                val lastpos: Fixed = sector.floorheight;
+                sector.floorheight = dest;
+                if (world.change_sector(g, secnum, crush)) {
+                    sector.floorheight = lastpos;
+                    world.change_sector(g, secnum, crush);
+                }
+                ret PASTDEST;
+            }
+            # could get crushed
+            val lastpos: Fixed = sector.floorheight;
+            sector.floorheight = sector.floorheight + speed;
+            if (world.change_sector(g, secnum, crush)) {
+                if (crush) { ret CRUSHED; }
+                sector.floorheight = lastpos;
+                world.change_sector(g, secnum, crush);
+                ret CRUSHED;
+            }
+        }
+    }
+    or (floor_or_ceiling == 1) {
+        # ceiling
+        if (direction == -1) {
+            # down
+            if (sector.ceilingheight - speed < dest) {
+                val lastpos: Fixed = sector.ceilingheight;
+                sector.ceilingheight = dest;
+                if (world.change_sector(g, secnum, crush)) {
+                    sector.ceilingheight = lastpos;
+                    world.change_sector(g, secnum, crush);
+                }
+                ret PASTDEST;
+            }
+            # could get crushed
+            val lastpos: Fixed = sector.ceilingheight;
+            sector.ceilingheight = sector.ceilingheight - speed;
+            if (world.change_sector(g, secnum, crush)) {
+                if (crush) { ret CRUSHED; }
+                sector.ceilingheight = lastpos;
+                world.change_sector(g, secnum, crush);
+                ret CRUSHED;
+            }
+        }
+        or (direction == 1) {
+            # up
+            if (sector.ceilingheight + speed > dest) {
+                val lastpos: Fixed = sector.ceilingheight;
+                sector.ceilingheight = dest;
+                if (world.change_sector(g, secnum, crush)) {
+                    sector.ceilingheight = lastpos;
+                    world.change_sector(g, secnum, crush);
+                }
+                ret PASTDEST;
+            }
+            sector.ceilingheight = sector.ceilingheight + speed;
+            world.change_sector(g, secnum, crush);
+        }
+    }
+    ret OK;
+}
+
+# T_MoveFloor: move a floor to its destination (up or down)
+pub fun floor_think(g: *Game, floor: *FloorMove) {
+    val res: i32 = move_plane(g, floor.sector, floor.speed, floor.floordestheight, floor.crush, 0, floor.direction);
+
+    if ((g.leveltime & 7) == 0) { defs.sound(g, nil, info.SFX_STNMOV); }
+
+    if (res == PASTDEST) {
+        val sector: *level.Sector = sec(g, floor.sector);
+        sector.specialdata = nil;
+
+        if (floor.direction == 1) {
+            if (floor.kind == DONUT_RAISE) {
+                sector.special   = floor.newspecial::i16;
+                sector.floorflat = floor.texture;
+            }
+        }
+        or (floor.direction == -1) {
+            if (floor.kind == LOWER_AND_CHANGE) {
+                sector.special   = floor.newspecial::i16;
+                sector.floorflat = floor.texture;
+            }
+        }
+        world.remove_thinker(?floor.thinker);
+        defs.sound(g, nil, info.SFX_PSTOP);
+    }
+}
+
+fun new_floor(g: *Game, secnum: i32) *FloorMove {
+    val floor: *FloorMove = defs.alloc(g, $size_of(FloorMove)):~*FloorMove;
+    world.add_thinker(g, ?floor.thinker);
+    sec(g, secnum).specialdata = floor:~ptr;
+    floor.thinker.kind         = defs.TH_FLOOR;
+    floor.sector               = secnum;
+    ret floor;
+}
+
+# EV_DoFloor: handle floor types
+# ---
+# tag:     the sectors to act on
+# linenum: the line that set it off, or NONE; two kinds copy from its sector
+# kind:    one of the floor kinds
+# ret:     whether any floor was started
+pub fun do_floor(g: *Game, tag: i32, linenum: i32, kind: i32) bool {
+    var secnum: i32  = -1;
+    var rtn:    bool = 0;
+
+    for {
+        secnum = find_sector_from_tag(g, tag, secnum);
+        if (secnum < 0) { brk; }
+        val sector: *level.Sector = sec(g, secnum);
+
+        # already moving? if so, keep going...
+        if (sector.specialdata != nil) { cnt; }
+
+        # new floor thinker
+        rtn = 1;
+        val floor: *FloorMove = new_floor(g, secnum);
+        floor.kind  = kind;
+        floor.crush = 0;
+
+        if (kind == LOWER_FLOOR) {
+            floor.direction       = -1;
+            floor.speed           = FLOORSPEED;
+            floor.floordestheight = find_highest_floor_surrounding(g, secnum);
+        }
+        or (kind == LOWER_FLOOR_TO_LOWEST) {
+            floor.direction       = -1;
+            floor.speed           = FLOORSPEED;
+            floor.floordestheight = find_lowest_floor_surrounding(g, secnum);
+        }
+        or (kind == TURBO_LOWER) {
+            floor.direction       = -1;
+            floor.speed           = FLOORSPEED * 4;
+            floor.floordestheight = find_highest_floor_surrounding(g, secnum);
+            if (floor.floordestheight != sector.floorheight) { floor.floordestheight = floor.floordestheight + 8 * 65536; }
+        }
+        or (kind == RAISE_FLOOR_CRUSH || kind == RAISE_FLOOR) {
+            if (kind == RAISE_FLOOR_CRUSH) { floor.crush = 1; }
+            floor.direction       = 1;
+            floor.speed           = FLOORSPEED;
+            floor.floordestheight = find_lowest_ceiling_surrounding(g, secnum);
+            if (floor.floordestheight > sector.ceilingheight) { floor.floordestheight = sector.ceilingheight; }
+            if (kind == RAISE_FLOOR_CRUSH)                    { floor.floordestheight = floor.floordestheight - 8 * 65536; }
+        }
+        or (kind == RAISE_FLOOR_TURBO) {
+            floor.direction       = 1;
+            floor.speed           = FLOORSPEED * 4;
+            floor.floordestheight = find_next_highest_floor(g, secnum, sector.floorheight);
+        }
+        or (kind == RAISE_FLOOR_TO_NEAREST) {
+            floor.direction       = 1;
+            floor.speed           = FLOORSPEED;
+            floor.floordestheight = find_next_highest_floor(g, secnum, sector.floorheight);
+        }
+        or (kind == RAISE_FLOOR_24) {
+            floor.direction       = 1;
+            floor.speed           = FLOORSPEED;
+            floor.floordestheight = sector.floorheight + 24 * 65536;
+        }
+        or (kind == RAISE_FLOOR_512) {
+            floor.direction       = 1;
+            floor.speed           = FLOORSPEED;
+            floor.floordestheight = sector.floorheight + 512 * 65536;
+        }
+        or (kind == RAISE_FLOOR_24_AND_CHANGE) {
+            floor.direction       = 1;
+            floor.speed           = FLOORSPEED;
+            floor.floordestheight = sector.floorheight + 24 * 65536;
+            if (linenum != level.NONE) {
+                val front: *level.Sector = sec(g, g.lv.lines[linenum].frontsector);
+                sector.floorflat = front.floorflat;
+                sector.special   = front.special;
+            }
+        }
+        or (kind == RAISE_TO_TEXTURE) {
+            var minsize: i32 = defs.MAXINT;
+            floor.direction = 1;
+            floor.speed     = FLOORSPEED;
+            var i: i32 = 0;
+            for (i < sector.linecount) {
+                val line: *level.Line = ?g.lv.lines[sector_line(g, secnum, i)];
+                i = i + 1;
+                if ((line.flags::i32 & defs.ML_TWOSIDED) == 0) { cnt; }
+                var s: i32 = 0;
+                for (s < 2) {
+                    if (line.sidenum[s] != level.NONE) {
+                        val tex: i32 = g.lv.sides[line.sidenum[s]].bottomtex;
+                        if (tex >= 0 && (g.d.textures[tex].height << 16) < minsize) {
+                            minsize = g.d.textures[tex].height << 16;
+                        }
+                    }
+                    s = s + 1;
+                }
+            }
+            floor.floordestheight = sector.floorheight + minsize;
+        }
+        or (kind == LOWER_AND_CHANGE) {
+            floor.direction       = -1;
+            floor.speed           = FLOORSPEED;
+            floor.floordestheight = find_lowest_floor_surrounding(g, secnum);
+            floor.texture         = sector.floorflat;
+
+            var i: i32 = 0;
+            for (i < sector.linecount) {
+                val line: *level.Line = ?g.lv.lines[sector_line(g, secnum, i)];
+                i = i + 1;
+                if ((line.flags::i32 & defs.ML_TWOSIDED) == 0 || line.sidenum[1] == level.NONE) { cnt; }
+
+                # the sector on the far side of this line
+                var other: i32 = g.lv.sides[line.sidenum[0]].sector;
+                if (other == secnum) { other = g.lv.sides[line.sidenum[1]].sector; }
+
+                if (sec(g, other).floorheight == floor.floordestheight) {
+                    floor.texture    = sec(g, other).floorflat;
+                    floor.newspecial = sec(g, other).special::i32;
+                    brk;
+                }
+            }
+        }
+    }
+    ret rtn;
+}
+
+# EV_BuildStairs: build a staircase
+pub fun build_stairs(g: *Game, tag: i32, kind: i32) bool {
+    var secnum: i32  = -1;
+    var rtn:    bool = 0;
+
+    for {
+        secnum = find_sector_from_tag(g, tag, secnum);
+        if (secnum < 0) { brk; }
+
+        # already moving? if so, keep going...
+        if (sec(g, secnum).specialdata != nil) { cnt; }
+
+        # new floor thinker
+        rtn = 1;
+        var floor: *FloorMove = new_floor(g, secnum);
+        floor.direction = 1;
+
+        var speed:     Fixed = FLOORSPEED / 4;
+        var stairsize: Fixed = 8 * 65536;
+        if (kind == TURBO_16) {
+            speed     = FLOORSPEED * 4;
+            stairsize = 16 * 65536;
+        }
+        floor.speed = speed;
+        var height: Fixed = sec(g, secnum).floorheight + stairsize;
+        floor.floordestheight = height;
+
+        val texture: i32 = sec(g, secnum).floorflat;
+
+        # find next sector to raise:
+        # 1. find a 2-sided line with the same sector side[0]
+        # 2. the other side is the next sector to raise
+        # the search moves on to the sector it just started, as the original
+        # does, which also moves where the outer scan resumes
+        for {
+            var ok: bool = 0;
+            var i:  i32  = 0;
+            for (i < sec(g, secnum).linecount) {
+                val line: *level.Line = ?g.lv.lines[sector_line(g, secnum, i)];
+                i = i + 1;
+                if ((line.flags::i32 & defs.ML_TWOSIDED) == 0) { cnt; }
+                if (line.frontsector != secnum)                { cnt; }
+
+                val newsecnum: i32 = line.backsector;
+                if (newsecnum == level.NONE)                { cnt; }
+                if (sec(g, newsecnum).floorflat != texture) { cnt; }
+
+                height = height + stairsize;
+
+                if (sec(g, newsecnum).specialdata != nil) { cnt; }
+
+                secnum                = newsecnum;
+                floor                 = new_floor(g, secnum);
+                floor.direction       = 1;
+                floor.speed           = speed;
+                floor.floordestheight = height;
+                ok                    = 1;
+                brk;
+            }
+            if (!ok) { brk; }
+        }
+    }
+    ret rtn;
+}
+
+# EV_DoDonut: a lowering pillar with a ring around it that rises
+pub fun do_donut(g: *Game, tag: i32) bool {
+    var secnum: i32  = -1;
+    var rtn:    bool = 0;
+
+    for {
+        secnum = find_sector_from_tag(g, tag, secnum);
+        if (secnum < 0) { brk; }
+        val s1: i32 = secnum;
+
+        # already moving? if so, keep going...
+        if (sec(g, s1).specialdata != nil) { cnt; }
+
+        rtn = 1;
+        if (sec(g, s1).linecount == 0) { cnt; }
+        val s2: i32 = next_sector(g, sector_line(g, s1, 0), s1);
+        if (s2 == level.NONE) { cnt; }
+
+        var i: i32 = 0;
+        for (i < sec(g, s2).linecount) {
+            # the original's two-sided test never excludes anything, because
+            # of where its "!" sits; only the back-sector test is real
+            val s3: i32 = g.lv.lines[sector_line(g, s2, i)].backsector;
+            i = i + 1;
+            if (s3 == s1 || s3 == level.NONE) { cnt; }
+
+            # spawn rising slime
+            var floor: *FloorMove = new_floor(g, s2);
+            floor.kind            = DONUT_RAISE;
+            floor.crush           = 0;
+            floor.direction       = 1;
+            floor.speed           = FLOORSPEED / 2;
+            floor.texture         = sec(g, s3).floorflat;
+            floor.newspecial      = 0;
+            floor.floordestheight = sec(g, s3).floorheight;
+
+            # spawn lowering donut-hole
+            floor                 = new_floor(g, s1);
+            floor.kind            = LOWER_FLOOR;
+            floor.crush           = 0;
+            floor.direction       = -1;
+            floor.speed           = FLOORSPEED / 2;
+            floor.floordestheight = sec(g, s3).floorheight;
+            brk;
+        }
+    }
+    ret rtn;
+}
+
+# ---------------------------------------------------------------- p_doors.c
+
+# T_VerticalDoor
+pub fun door_think(g: *Game, door: *Door) {
+    val sector: *level.Sector = sec(g, door.sector);
+
+    if (door.direction == 0) {
+        # waiting
+        door.topcountdown = door.topcountdown - 1;
+        if (door.topcountdown == 0) {
+            if (door.kind == BLAZE_RAISE) {
+                # time to go back down
+                door.direction = -1;
+                defs.sound(g, nil, info.SFX_BDCLS);
+            }
+            or (door.kind == NORMAL) {
+                # time to go back down
+                door.direction = -1;
+                defs.sound(g, nil, info.SFX_DORCLS);
+            }
+            or (door.kind == CLOSE_30_THEN_OPEN) {
+                door.direction = 1;
+                defs.sound(g, nil, info.SFX_DOROPN);
+            }
+        }
+    }
+    or (door.direction == 2) {
+        # initial wait
+        door.topcountdown = door.topcountdown - 1;
+        if (door.topcountdown == 0) {
+            if (door.kind == RAISE_IN_5_MINS) {
+                door.direction = 1;
+                door.kind      = NORMAL;
+                defs.sound(g, nil, info.SFX_DOROPN);
+            }
+        }
+    }
+    or (door.direction == -1) {
+        # down
+        val res: i32 = move_plane(g, door.sector, door.speed, sector.floorheight, 0, 1, door.direction);
+        if (res == PASTDEST) {
+            if (door.kind == BLAZE_RAISE || door.kind == BLAZE_CLOSE) {
+                sector.specialdata = nil;
+                # unlink and free
+                world.remove_thinker(?door.thinker);
+                defs.sound(g, nil, info.SFX_BDCLS);
+            }
+            or (door.kind == NORMAL || door.kind == CLOSE) {
+                sector.specialdata = nil;
+                # unlink and free
+                world.remove_thinker(?door.thinker);
+            }
+            or (door.kind == CLOSE_30_THEN_OPEN) {
+                door.direction    = 0;
+                door.topcountdown = 35 * 30;
+            }
+        }
+        or (res == CRUSHED) {
+            if (door.kind != BLAZE_CLOSE && door.kind != CLOSE) {
+                # do not go back up!
+                door.direction = 1;
+                defs.sound(g, nil, info.SFX_DOROPN);
+            }
+        }
+    }
+    or (door.direction == 1) {
+        # up
+        val res: i32 = move_plane(g, door.sector, door.speed, door.topheight, 0, 1, door.direction);
+        if (res == PASTDEST) {
+            if (door.kind == BLAZE_RAISE || door.kind == NORMAL) {
+                # wait at top
+                door.direction    = 0;
+                door.topcountdown = door.topwait;
+            }
+            or (door.kind == CLOSE_30_THEN_OPEN || door.kind == BLAZE_OPEN || door.kind == OPEN) {
+                sector.specialdata = nil;
+                # unlink and free
+                world.remove_thinker(?door.thinker);
+            }
+        }
+    }
+}
+
+fun new_door(g: *Game, secnum: i32) *Door {
+    val door: *Door = defs.alloc(g, $size_of(Door)):~*Door;
+    world.add_thinker(g, ?door.thinker);
+    sec(g, secnum).specialdata = door:~ptr;
+    door.thinker.kind          = defs.TH_DOOR;
+    door.sector                = secnum;
+    ret door;
+}
+
+# EV_DoDoor
+pub fun do_door(g: *Game, tag: i32, kind: i32) bool {
+    var secnum: i32  = -1;
+    var rtn:    bool = 0;
+
+    for {
+        secnum = find_sector_from_tag(g, tag, secnum);
+        if (secnum < 0) { brk; }
+        val sector: *level.Sector = sec(g, secnum);
+        if (sector.specialdata != nil) { cnt; }
+
+        # new door thinker
+        rtn = 1;
+        val door: *Door = new_door(g, secnum);
+        door.kind    = kind;
+        door.topwait = VDOORWAIT;
+        door.speed   = VDOORSPEED;
+
+        if (kind == BLAZE_CLOSE) {
+            door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
+            door.direction = -1;
+            door.speed     = VDOORSPEED * 4;
+            defs.sound(g, nil, info.SFX_BDCLS);
+        }
+        or (kind == CLOSE) {
+            door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
+            door.direction = -1;
+            defs.sound(g, nil, info.SFX_DORCLS);
+        }
+        or (kind == CLOSE_30_THEN_OPEN) {
+            door.topheight = sector.ceilingheight;
+            door.direction = -1;
+            defs.sound(g, nil, info.SFX_DORCLS);
+        }
+        or (kind == BLAZE_RAISE || kind == BLAZE_OPEN) {
+            door.direction = 1;
+            door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
+            door.speed     = VDOORSPEED * 4;
+            if (door.topheight != sector.ceilingheight) { defs.sound(g, nil, info.SFX_BDOPN); }
+        }
+        or (kind == NORMAL || kind == OPEN) {
+            door.direction = 1;
+            door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
+            if (door.topheight != sector.ceilingheight) { defs.sound(g, nil, info.SFX_DOROPN); }
+        }
+    }
+    ret rtn;
+}
+
+fun has_key(p: *Player, card: i32, skull: i32) bool {
+    ret p.cards[card] || p.cards[skull];
+}
+
+# EV_DoLockedDoor: move a locked door up/down
+pub fun do_locked_door(g: *Game, linenum: i32, kind: i32, thing: *Mobj) bool {
+    val p: *Player = thing.player;
+    if (p == nil) { ret 0; }
+
+    val special: i32 = g.lv.lines[linenum].special::i32;
+    if (special == 99 || special == 133) {
+        # blue lock
+        if (!has_key(p, defs.IT_BLUECARD, defs.IT_BLUESKULL)) {
+            p.message = "You need a blue key to activate this object";
+            defs.sound(g, nil, info.SFX_OOF);
+            ret 0;
+        }
+    }
+    or (special == 134 || special == 135) {
+        # red lock
+        if (!has_key(p, defs.IT_REDCARD, defs.IT_REDSKULL)) {
+            p.message = "You need a red key to activate this object";
+            defs.sound(g, nil, info.SFX_OOF);
+            ret 0;
+        }
+    }
+    or (special == 136 || special == 137) {
+        # yellow lock
+        if (!has_key(p, defs.IT_YELLOWCARD, defs.IT_YELLOWSKULL)) {
+            p.message = "You need a yellow key to activate this object";
+            defs.sound(g, nil, info.SFX_OOF);
+            ret 0;
+        }
+    }
+
+    ret do_door(g, g.lv.lines[linenum].tagnum::i32, kind);
+}
+
+# EV_VerticalDoor: open a door manually, no tag value
+pub fun vertical_door(g: *Game, linenum: i32, thing: *Mobj) {
+    val line:    *level.Line = ?g.lv.lines[linenum];
+    val player:  *Player     = thing.player;
+    val special: i32         = line.special::i32;
+
+    # check for locks
+    if (special == 26 || special == 32) {
+        # blue lock
+        if (player == nil) { ret; }
+        if (!has_key(player, defs.IT_BLUECARD, defs.IT_BLUESKULL)) {
+            player.message = "You need a blue key to open this door";
+            defs.sound(g, nil, info.SFX_OOF);
+            ret;
+        }
+    }
+    or (special == 27 || special == 34) {
+        # yellow lock
+        if (player == nil) { ret; }
+        if (!has_key(player, defs.IT_YELLOWCARD, defs.IT_YELLOWSKULL)) {
+            player.message = "You need a yellow key to open this door";
+            defs.sound(g, nil, info.SFX_OOF);
+            ret;
+        }
+    }
+    or (special == 28 || special == 33) {
+        # red lock
+        if (player == nil) { ret; }
+        if (!has_key(player, defs.IT_REDCARD, defs.IT_REDSKULL)) {
+            player.message = "You need a red key to open this door";
+            defs.sound(g, nil, info.SFX_OOF);
+            ret;
+        }
+    }
+
+    # if the sector has an active thinker, use it. the door is the sector on
+    # the line's back side; the original reads past the line when there is
+    # none.
+    if (line.sidenum[1] == level.NONE) { ret; }
+    val secnum: i32           = g.lv.sides[line.sidenum[1]].sector;
+    val sector: *level.Sector = sec(g, secnum);
+
+    if (sector.specialdata != nil) {
+        if (special == 1 || special == 26 || special == 27 || special == 28 || special == 117) {
+            # only for "raise" doors, not "open"s. the original assumes the
+            # sector's thinker is a door whatever it is, and writes into it;
+            # here anything that is not a door is left alone.
+            val head: *Thinker = sector.specialdata:~*Thinker;
+            if (head.kind == defs.TH_DOOR) {
+                val door: *Door = sector.specialdata:~*Door;
+                if (door.direction == -1) {
+                    # go back up
+                    door.direction = 1;
+                }
+                or {
+                    if (thing.player == nil) {
+                        # JDC: bad guys never close doors
+                        ret;
+                    }
+                    # start going down immediately
+                    door.direction = -1;
+                }
+            }
+            ret;
+        }
+    }
+
+    # for proper sound
+    if (special == 117 || special == 118) {
+        # blazing door raise / open
+        defs.sound(g, nil, info.SFX_BDOPN);
+    }
+    or {
+        # normal door sound, locked door sound
+        defs.sound(g, nil, info.SFX_DOROPN);
+    }
+
+    # new door thinker
+    val door: *Door = new_door(g, secnum);
+    door.direction = 1;
+    door.speed     = VDOORSPEED;
+    door.topwait   = VDOORWAIT;
+
+    if (special == 1 || special == 26 || special == 27 || special == 28) {
+        door.kind = NORMAL;
+    }
+    or (special == 31 || special == 32 || special == 33 || special == 34) {
+        door.kind    = OPEN;
+        line.special = 0;
+    }
+    or (special == 117) {
+        # blazing door raise
+        door.kind  = BLAZE_RAISE;
+        door.speed = VDOORSPEED * 4;
+    }
+    or (special == 118) {
+        # blazing door open
+        door.kind    = BLAZE_OPEN;
+        line.special = 0;
+        door.speed   = VDOORSPEED * 4;
+    }
+
+    # find the top and bottom of the movement range
+    door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
+}
+
+# P_SpawnDoorCloseIn30: spawn a door that closes after 30 seconds
+pub fun spawn_door_close_in_30(g: *Game, secnum: i32) {
+    val door: *Door = new_door(g, secnum);
+    sec(g, secnum).special = 0;
+    door.direction         = 0;
+    door.kind              = NORMAL;
+    door.speed             = VDOORSPEED;
+    door.topcountdown      = 30 * 35;
+}
+
+# P_SpawnDoorRaiseIn5Mins: spawn a door that opens after 5 minutes
+pub fun spawn_door_raise_in_5_mins(g: *Game, secnum: i32) {
+    val door: *Door = new_door(g, secnum);
+    sec(g, secnum).special = 0;
+    door.direction         = 2;
+    door.kind              = RAISE_IN_5_MINS;
+    door.speed             = VDOORSPEED;
+    door.topheight         = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
+    door.topwait           = VDOORWAIT;
+    door.topcountdown      = 5 * 60 * 35;
+}
+
+# --------------------------------------------------------------- p_ceilng.c
+
+# P_RemoveActiveCeiling: remove a ceiling's thinker
+fun remove_active_ceiling(g: *Game, c: *Ceiling) {
+    var i: i32 = 0;
+    for (i < MAXCEILINGS) {
+        if (g.activeceilings[i] == c:~ptr) {
+            sec(g, c.sector).specialdata = nil;
+            world.remove_thinker(?c.thinker);
+            g.activeceilings[i] = nil;
+            brk;
+        }
+        i = i + 1;
+    }
+}
+
+# T_MoveCeiling
+pub fun ceiling_think(g: *Game, ceiling: *Ceiling) {
+    if (ceiling.direction == 1) {
+        # up
+        val res: i32 = move_plane(g, ceiling.sector, ceiling.speed, ceiling.topheight, 0, 1, ceiling.direction);
+
+        if ((g.leveltime & 7) == 0 && ceiling.kind != SILENT_CRUSH_AND_RAISE) { defs.sound(g, nil, info.SFX_STNMOV); }
+
+        if (res == PASTDEST) {
+            if (ceiling.kind == RAISE_TO_HIGHEST) {
+                remove_active_ceiling(g, ceiling);
+            }
+            or (ceiling.kind == SILENT_CRUSH_AND_RAISE) {
+                defs.sound(g, nil, info.SFX_PSTOP);
+                ceiling.direction = -1;
+            }
+            or (ceiling.kind == FAST_CRUSH_AND_RAISE || ceiling.kind == CRUSH_AND_RAISE) {
+                ceiling.direction = -1;
+            }
+        }
+    }
+    or (ceiling.direction == -1) {
+        # down
+        val res: i32 = move_plane(g, ceiling.sector, ceiling.speed, ceiling.bottomheight, ceiling.crush, 1, ceiling.direction);
+
+        if ((g.leveltime & 7) == 0 && ceiling.kind != SILENT_CRUSH_AND_RAISE) { defs.sound(g, nil, info.SFX_STNMOV); }
+
+        if (res == PASTDEST) {
+            if (ceiling.kind == SILENT_CRUSH_AND_RAISE) {
+                defs.sound(g, nil, info.SFX_PSTOP);
+                ceiling.speed     = CEILSPEED;
+                ceiling.direction = 1;
+            }
+            or (ceiling.kind == CRUSH_AND_RAISE) {
+                ceiling.speed     = CEILSPEED;
+                ceiling.direction = 1;
+            }
+            or (ceiling.kind == FAST_CRUSH_AND_RAISE) {
+                ceiling.direction = 1;
+            }
+            or (ceiling.kind == LOWER_AND_CRUSH || ceiling.kind == LOWER_TO_FLOOR) {
+                remove_active_ceiling(g, ceiling);
+            }
+        }
+        or (res == CRUSHED) {
+            if (ceiling.kind == SILENT_CRUSH_AND_RAISE || ceiling.kind == CRUSH_AND_RAISE || ceiling.kind == LOWER_AND_CRUSH) {
+                ceiling.speed = CEILSPEED / 8;
+            }
+        }
+    }
+}
+
+# P_ActivateInStasisCeiling: restart a ceiling that's in-stasis
+fun activate_in_stasis_ceiling(g: *Game, tag: i32) {
+    var i: i32 = 0;
+    for (i < MAXCEILINGS) {
+        val c: *Ceiling = g.activeceilings[i]:~*Ceiling;
+        if (c != nil && c.tagnum == tag && c.direction == 0) {
+            c.direction    = c.olddirection;
+            c.thinker.kind = defs.TH_CEILING;
+        }
+        i = i + 1;
+    }
+}
+
+# EV_DoCeiling: move a ceiling up/down and all around!
+pub fun do_ceiling(g: *Game, tag: i32, kind: i32) bool {
+    var secnum: i32  = -1;
+    var rtn:    bool = 0;
+
+    # reactivate in-stasis ceilings...for certain types
+    if (kind == FAST_CRUSH_AND_RAISE || kind == SILENT_CRUSH_AND_RAISE || kind == CRUSH_AND_RAISE) {
+        activate_in_stasis_ceiling(g, tag);
+    }
+
+    for {
+        secnum = find_sector_from_tag(g, tag, secnum);
+        if (secnum < 0) { brk; }
+        val sector: *level.Sector = sec(g, secnum);
+        if (sector.specialdata != nil) { cnt; }
+
+        # new door thinker
+        rtn = 1;
+        val ceiling: *Ceiling = defs.alloc(g, $size_of(Ceiling)):~*Ceiling;
+        world.add_thinker(g, ?ceiling.thinker);
+        sector.specialdata   = ceiling:~ptr;
+        ceiling.thinker.kind = defs.TH_CEILING;
+        ceiling.sector       = secnum;
+        ceiling.crush        = 0;
+
+        if (kind == FAST_CRUSH_AND_RAISE) {
+            ceiling.crush        = 1;
+            ceiling.topheight    = sector.ceilingheight;
+            ceiling.bottomheight = sector.floorheight + 8 * 65536;
+            ceiling.direction    = -1;
+            ceiling.speed        = CEILSPEED * 2;
+        }
+        or (kind == RAISE_TO_HIGHEST) {
+            ceiling.topheight = find_highest_ceiling_surrounding(g, secnum);
+            ceiling.direction = 1;
+            ceiling.speed     = CEILSPEED;
+        }
+        or {
+            if (kind == SILENT_CRUSH_AND_RAISE || kind == CRUSH_AND_RAISE) {
+                ceiling.crush     = 1;
+                ceiling.topheight = sector.ceilingheight;
+            }
+            ceiling.bottomheight = sector.floorheight;
+            if (kind != LOWER_TO_FLOOR) { ceiling.bottomheight = ceiling.bottomheight + 8 * 65536; }
+            ceiling.direction = -1;
+            ceiling.speed     = CEILSPEED;
+        }
+
+        ceiling.tagnum = sector.tagnum::i32;
+        ceiling.kind   = kind;
+
+        # P_AddActiveCeiling
+        var i: i32 = 0;
+        for (i < MAXCEILINGS) {
+            if (g.activeceilings[i] == nil) {
+                g.activeceilings[i] = ceiling:~ptr;
+                brk;
+            }
+            i = i + 1;
+        }
+    }
+    ret rtn;
+}
+
+# EV_CeilingCrushStop: stop a ceiling from crushing!
+pub fun ceiling_crush_stop(g: *Game, tag: i32) bool {
+    var rtn: bool = 0;
+    var i:   i32  = 0;
+    for (i < MAXCEILINGS) {
+        val c: *Ceiling = g.activeceilings[i]:~*Ceiling;
+        if (c != nil && c.tagnum == tag && c.direction != 0) {
+            c.olddirection = c.direction;
+            c.thinker.kind = defs.TH_NONE;
+            # in-stasis
+            c.direction = 0;
+            rtn         = 1;
+        }
+        i = i + 1;
+    }
+    ret rtn;
+}
+
+# ---------------------------------------------------------------- p_plats.c
+
+# P_RemoveActivePlat
+fun remove_active_plat(g: *Game, plat: *Plat) {
+    var i: i32 = 0;
+    for (i < MAXPLATS) {
+        if (g.activeplats[i] == plat:~ptr) {
+            sec(g, plat.sector).specialdata = nil;
+            world.remove_thinker(?plat.thinker);
+            g.activeplats[i] = nil;
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# T_PlatRaise: move a plat up and down
+pub fun plat_think(g: *Game, plat: *Plat) {
+    if (plat.status == PLAT_UP) {
+        val res: i32 = move_plane(g, plat.sector, plat.speed, plat.high, plat.crush, 0, 1);
+
+        if (plat.kind == RAISE_AND_CHANGE || plat.kind == RAISE_TO_NEAREST_AND_CHANGE) {
+            if ((g.leveltime & 7) == 0) { defs.sound(g, nil, info.SFX_STNMOV); }
+        }
+
+        if (res == CRUSHED && !plat.crush) {
+            plat.count  = plat.wait;
+            plat.status = PLAT_DOWN;
+            defs.sound(g, nil, info.SFX_PSTART);
+        }
+        or (res == PASTDEST) {
+            plat.count  = plat.wait;
+            plat.status = PLAT_WAITING;
+            defs.sound(g, nil, info.SFX_PSTOP);
+
+            if (plat.kind == BLAZE_DWUS || plat.kind == DOWN_WAIT_UP_STAY || plat.kind == RAISE_AND_CHANGE ||
+                plat.kind == RAISE_TO_NEAREST_AND_CHANGE) {
+                remove_active_plat(g, plat);
+            }
+        }
+    }
+    or (plat.status == PLAT_DOWN) {
+        val res: i32 = move_plane(g, plat.sector, plat.speed, plat.low, 0, 0, -1);
+
+        if (res == PASTDEST) {
+            plat.count  = plat.wait;
+            plat.status = PLAT_WAITING;
+            defs.sound(g, nil, info.SFX_PSTOP);
+        }
+    }
+    or (plat.status == PLAT_WAITING) {
+        plat.count = plat.count - 1;
+        if (plat.count == 0) {
+            if (sec(g, plat.sector).floorheight == plat.low) {
+                plat.status = PLAT_UP;
+            }
+            or {
+                plat.status = PLAT_DOWN;
+            }
+            defs.sound(g, nil, info.SFX_PSTART);
+        }
+    }
+}
+
+# P_ActivateInStasis
+fun activate_in_stasis(g: *Game, tag: i32) {
+    var i: i32 = 0;
+    for (i < MAXPLATS) {
+        val p: *Plat = g.activeplats[i]:~*Plat;
+        if (p != nil && p.tagnum == tag && p.status == PLAT_IN_STASIS) {
+            p.status       = p.oldstatus;
+            p.thinker.kind = defs.TH_PLAT;
+        }
+        i = i + 1;
+    }
+}
+
+# EV_DoPlat: do platforms. "amount" is only used for SOME platforms.
+pub fun do_plat(g: *Game, linenum: i32, kind: i32, amount: i32) bool {
+    val line: *level.Line = ?g.lv.lines[linenum];
+    val tag:  i32         = line.tagnum::i32;
+
+    var secnum: i32  = -1;
+    var rtn:    bool = 0;
+
+    # activate all <type> plats that are in_stasis
+    if (kind == PERPETUAL_RAISE) { activate_in_stasis(g, tag); }
+
+    for {
+        secnum = find_sector_from_tag(g, tag, secnum);
+        if (secnum < 0) { brk; }
+        val sector: *level.Sector = sec(g, secnum);
+
+        if (sector.specialdata != nil) { cnt; }
+
+        # find lowest & highest floors around sector
+        rtn = 1;
+        val plat: *Plat = defs.alloc(g, $size_of(Plat)):~*Plat;
+        world.add_thinker(g, ?plat.thinker);
+
+        plat.kind          = kind;
+        plat.sector        = secnum;
+        sector.specialdata = plat:~ptr;
+        plat.thinker.kind  = defs.TH_PLAT;
+        plat.crush         = 0;
+        plat.tagnum        = tag;
+
+        if (kind == RAISE_TO_NEAREST_AND_CHANGE) {
+            plat.speed       = PLATSPEED / 2;
+            sector.floorflat = sec(g, g.lv.sides[line.sidenum[0]].sector).floorflat;
+            plat.high        = find_next_highest_floor(g, secnum, sector.floorheight);
+            plat.wait        = 0;
+            plat.status      = PLAT_UP;
+            # NO MORE DAMAGE, IF APPLICABLE
+            sector.special = 0;
+
+            defs.sound(g, nil, info.SFX_STNMOV);
+        }
+        or (kind == RAISE_AND_CHANGE) {
+            plat.speed       = PLATSPEED / 2;
+            sector.floorflat = sec(g, g.lv.sides[line.sidenum[0]].sector).floorflat;
+            plat.high        = sector.floorheight + amount * 65536;
+            plat.wait        = 0;
+            plat.status      = PLAT_UP;
+
+            defs.sound(g, nil, info.SFX_STNMOV);
+        }
+        or (kind == DOWN_WAIT_UP_STAY || kind == BLAZE_DWUS) {
+            plat.speed = PLATSPEED * 4;
+            if (kind == BLAZE_DWUS) { plat.speed = PLATSPEED * 8; }
+            plat.low = find_lowest_floor_surrounding(g, secnum);
+
+            if (plat.low > sector.floorheight) { plat.low = sector.floorheight; }
+
+            plat.high   = sector.floorheight;
+            plat.wait   = 35 * PLATWAIT;
+            plat.status = PLAT_DOWN;
+            defs.sound(g, nil, info.SFX_PSTART);
+        }
+        or (kind == PERPETUAL_RAISE) {
+            plat.speed = PLATSPEED;
+            plat.low   = find_lowest_floor_surrounding(g, secnum);
+
+            if (plat.low > sector.floorheight) { plat.low = sector.floorheight; }
+
+            plat.high = find_highest_floor_surrounding(g, secnum);
+
+            if (plat.high < sector.floorheight) { plat.high = sector.floorheight; }
+
+            plat.wait   = 35 * PLATWAIT;
+            plat.status = defs.p_random(g) & 1;
+
+            defs.sound(g, nil, info.SFX_PSTART);
+        }
+
+        # P_AddActivePlat
+        var i: i32 = 0;
+        for (i < MAXPLATS) {
+            if (g.activeplats[i] == nil) {
+                g.activeplats[i] = plat:~ptr;
+                brk;
+            }
+            i = i + 1;
+        }
+    }
+    ret rtn;
+}
+
+# EV_StopPlat
+pub fun stop_plat(g: *Game, tag: i32) {
+    var j: i32 = 0;
+    for (j < MAXPLATS) {
+        val p: *Plat = g.activeplats[j]:~*Plat;
+        if (p != nil && p.status != PLAT_IN_STASIS && p.tagnum == tag) {
+            p.oldstatus    = p.status;
+            p.status       = PLAT_IN_STASIS;
+            p.thinker.kind = defs.TH_NONE;
+        }
+        j = j + 1;
+    }
+}
+
+# --------------------------------------------------------------- p_lights.c
+
+# T_FireFlicker
+pub fun fire_flicker_think(g: *Game, flick: *FireFlicker) {
+    flick.count = flick.count - 1;
+    if (flick.count != 0) { ret; }
+
+    val amount: i32           = (defs.p_random(g) & 3) * 16;
+    val sector: *level.Sector = sec(g, flick.sector);
+
+    if (sector.lightlevel::i32 - amount < flick.minlight) {
+        sector.lightlevel = flick.minlight::i16;
+    }
+    or {
+        sector.lightlevel = (flick.maxlight - amount)::i16;
+    }
+
+    flick.count = 4;
+}
+
+# P_SpawnFireFlicker
+pub fun spawn_fire_flicker(g: *Game, secnum: i32) {
+    val sector: *level.Sector = sec(g, secnum);
+
+    # note that we are resetting the sector attributes. nothing special about
+    # it during gameplay.
+    sector.special = 0;
+
+    val flick: *FireFlicker = defs.alloc(g, $size_of(FireFlicker)):~*FireFlicker;
+    world.add_thinker(g, ?flick.thinker);
+    flick.thinker.kind = defs.TH_FIREFLICKER;
+    flick.sector       = secnum;
+    flick.maxlight     = sector.lightlevel::i32;
+    flick.minlight     = find_min_surrounding_light(g, secnum, sector.lightlevel::i32) + 16;
+    flick.count        = 4;
+}
+
+# T_LightFlash: do flashing lights
+pub fun light_flash_think(g: *Game, flash: *LightFlash) {
+    flash.count = flash.count - 1;
+    if (flash.count != 0) { ret; }
+
+    val sector: *level.Sector = sec(g, flash.sector);
+    if (sector.lightlevel::i32 == flash.maxlight) {
+        sector.lightlevel = flash.minlight::i16;
+        flash.count       = (defs.p_random(g) & flash.mintime) + 1;
+    }
+    or {
+        sector.lightlevel = flash.maxlight::i16;
+        flash.count       = (defs.p_random(g) & flash.maxtime) + 1;
+    }
+}
+
+# P_SpawnLightFlash: after the map has been loaded, scan each sector for
+# specials that spawn thinkers
+pub fun spawn_light_flash(g: *Game, secnum: i32) {
+    val sector: *level.Sector = sec(g, secnum);
+
+    # nothing special about it during gameplay
+    sector.special = 0;
+
+    val flash: *LightFlash = defs.alloc(g, $size_of(LightFlash)):~*LightFlash;
+    world.add_thinker(g, ?flash.thinker);
+    flash.thinker.kind = defs.TH_LIGHTFLASH;
+    flash.sector       = secnum;
+    flash.maxlight     = sector.lightlevel::i32;
+    flash.minlight     = find_min_surrounding_light(g, secnum, sector.lightlevel::i32);
+    flash.maxtime      = 64;
+    flash.mintime      = 7;
+    flash.count        = (defs.p_random(g) & flash.maxtime) + 1;
+}
+
+# T_StrobeFlash
+pub fun strobe_think(g: *Game, flash: *Strobe) {
+    flash.count = flash.count - 1;
+    if (flash.count != 0) { ret; }
+
+    val sector: *level.Sector = sec(g, flash.sector);
+    if (sector.lightlevel::i32 == flash.minlight) {
+        sector.lightlevel = flash.maxlight::i16;
+        flash.count       = flash.brighttime;
+    }
+    or {
+        sector.lightlevel = flash.minlight::i16;
+        flash.count       = flash.darktime;
+    }
+}
+
+# P_SpawnStrobeFlash: after the map has been loaded, scan each sector for
+# specials that spawn thinkers
+pub fun spawn_strobe_flash(g: *Game, secnum: i32, fast_or_slow: i32, in_sync: bool) {
+    val sector: *level.Sector = sec(g, secnum);
+
+    val flash: *Strobe = defs.alloc(g, $size_of(Strobe)):~*Strobe;
+    world.add_thinker(g, ?flash.thinker);
+    flash.sector       = secnum;
+    flash.darktime     = fast_or_slow;
+    flash.brighttime   = STROBEBRIGHT;
+    flash.thinker.kind = defs.TH_STROBE;
+    flash.maxlight     = sector.lightlevel::i32;
+    flash.minlight     = find_min_surrounding_light(g, secnum, sector.lightlevel::i32);
+
+    if (flash.minlight == flash.maxlight) { flash.minlight = 0; }
+
+    # nothing special about it during gameplay
+    sector.special = 0;
+
+    if (!in_sync) {
+        flash.count = (defs.p_random(g) & 7) + 1;
+    }
+    or {
+        flash.count = 1;
+    }
+}
+
+# EV_StartLightStrobing: start strobing lights (usually from a trigger)
+pub fun start_light_strobing(g: *Game, tag: i32) {
+    var secnum: i32 = -1;
+    for {
+        secnum = find_sector_from_tag(g, tag, secnum);
+        if (secnum < 0)                        { brk; }
+        if (sec(g, secnum).specialdata != nil) { cnt; }
+        spawn_strobe_flash(g, secnum, SLOWDARK, 0);
+    }
+}
+
+# EV_TurnTagLightsOff: turn line's tag lights off
+pub fun turn_tag_lights_off(g: *Game, tag: i32) {
+    var j: i32 = 0;
+    for (j < g.lv.numsectors) {
+        val sector: *level.Sector = sec(g, j);
+        if (sector.tagnum::i32 == tag) {
+            var min: i32 = sector.lightlevel::i32;
+            var i:   i32 = 0;
+            for (i < sector.linecount) {
+                val tsec: i32 = next_sector(g, sector_line(g, j, i), j);
+                i = i + 1;
+                if (tsec == level.NONE)                 { cnt; }
+                if (sec(g, tsec).lightlevel::i32 < min) { min = sec(g, tsec).lightlevel::i32; }
+            }
+            sector.lightlevel = min::i16;
+        }
+        j = j + 1;
+    }
+}
+
+# EV_LightTurnOn: turn line's tag lights on
+pub fun light_turn_on(g: *Game, tag: i32, bright_in: i32) {
+    var bright: i32 = bright_in;
+    var i:      i32 = 0;
+    for (i < g.lv.numsectors) {
+        val sector: *level.Sector = sec(g, i);
+        if (sector.tagnum::i32 == tag) {
+            # bright = 0 means to search for highest light level surrounding
+            # sector. the found level carries over to the next tagged sector,
+            # as in the original.
+            if (bright == 0) {
+                var j: i32 = 0;
+                for (j < sector.linecount) {
+                    val temp: i32 = next_sector(g, sector_line(g, i, j), i);
+                    j = j + 1;
+                    if (temp == level.NONE)                    { cnt; }
+                    if (sec(g, temp).lightlevel::i32 > bright) { bright = sec(g, temp).lightlevel::i32; }
+                }
+            }
+            sector.lightlevel = bright::i16;
+        }
+        i = i + 1;
+    }
+}
+
+# T_Glow: spawn glowing light
+pub fun glow_think(g: *Game, glow: *Glow) {
+    val sector: *level.Sector = sec(g, glow.sector);
+
+    if (glow.direction == -1) {
+        # down
+        sector.lightlevel = (sector.lightlevel::i32 - GLOWSPEED)::i16;
+        if (sector.lightlevel::i32 <= glow.minlight) {
+            sector.lightlevel = (sector.lightlevel::i32 + GLOWSPEED)::i16;
+            glow.direction    = 1;
+        }
+    }
+    or (glow.direction == 1) {
+        # up
+        sector.lightlevel = (sector.lightlevel::i32 + GLOWSPEED)::i16;
+        if (sector.lightlevel::i32 >= glow.maxlight) {
+            sector.lightlevel = (sector.lightlevel::i32 - GLOWSPEED)::i16;
+            glow.direction    = -1;
+        }
+    }
+}
+
+# P_SpawnGlowingLight
+pub fun spawn_glowing_light(g: *Game, secnum: i32) {
+    val sector: *level.Sector = sec(g, secnum);
+
+    val glow: *Glow = defs.alloc(g, $size_of(Glow)):~*Glow;
+    world.add_thinker(g, ?glow.thinker);
+    glow.sector       = secnum;
+    glow.minlight     = find_min_surrounding_light(g, secnum, sector.lightlevel::i32);
+    glow.maxlight     = sector.lightlevel::i32;
+    glow.thinker.kind = defs.TH_GLOW;
+    glow.direction    = -1;
+
+    sector.special = 0;
+}

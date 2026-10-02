@@ -1,0 +1,83 @@
+# Doom's random numbers: a fixed table of 256 bytes walked by two indices
+#
+# The playsim index is the heart of demo sync: every monster decision draws
+# from it, so one draw too many or too few and a recorded demo diverges. The
+# second index serves anything that must not disturb the simulation (menus,
+# screen wipes). Ported from m_random.c.
+
+use std.types.size.usize;
+
+val TABLE: [256]u8 = [256]u8{
+    0, 8, 109, 220, 222, 241, 149, 107, 75, 248, 254, 140, 16, 66, 74, 21, 211, 47, 80, 242,
+    154, 27, 205, 128, 161, 89, 77, 36, 95, 110, 85, 48, 212, 140, 211, 249, 22, 79, 200, 50,
+    28, 188, 52, 140, 202, 120, 68, 145, 62, 70, 184, 190, 91, 197, 152, 224, 149, 104, 25,
+    178, 252, 182, 202, 182, 141, 197, 4, 81, 181, 242, 145, 42, 39, 227, 156, 198, 225, 193,
+    219, 93, 122, 175, 249, 0, 175, 143, 70, 239, 46, 246, 163, 53, 163, 109, 168, 135, 2, 235,
+    25, 92, 20, 145, 138, 77, 69, 166, 78, 176, 173, 212, 166, 113, 94, 161, 41, 50, 239, 49,
+    111, 164, 70, 60, 2, 37, 171, 75, 136, 156, 11, 56, 42, 146, 138, 229, 73, 146, 77, 61, 98,
+    196, 135, 106, 63, 197, 195, 86, 96, 203, 113, 101, 170, 247, 181, 113, 80, 250, 108, 7,
+    255, 237, 129, 226, 79, 107, 112, 166, 103, 241, 24, 223, 239, 120, 198, 58, 60, 82, 128,
+    3, 184, 66, 143, 224, 145, 224, 81, 206, 163, 45, 63, 90, 168, 114, 59, 33, 159, 95, 28,
+    139, 123, 98, 125, 196, 15, 70, 194, 253, 54, 14, 109, 226, 71, 17, 161, 93, 186, 87, 244,
+    138, 20, 52, 123, 251, 26, 36, 17, 46, 52, 231, 232, 76, 31, 221, 84, 37, 216, 165, 212,
+    106, 197, 242, 98, 43, 39, 175, 254, 145, 190, 84, 118, 222, 187, 136, 120, 163, 236, 249
+};
+
+# what the 256 entries add up to, checked against m_random.c when this was ported
+val TABLE_SUM: i32 = 32986;
+
+# the two walks through the table
+pub rec Random {
+    play: u8;
+    misc: u8;
+}
+
+# draw the next playsim number, 0 to 255
+# ---
+# r:   generator state
+# ret: the next table entry on the playsim walk
+pub fun p_random(r: *Random) i32 {
+    r.play = r.play + 1;
+    ret TABLE[r.play::usize]::i32;
+}
+
+# draw the next number that the simulation never sees, 0 to 255
+# ---
+# r:   generator state
+# ret: the next table entry on the non-playsim walk
+pub fun m_random(r: *Random) i32 {
+    r.misc = r.misc + 1;
+    ret TABLE[r.misc::usize]::i32;
+}
+
+# rewind both walks, as every level start and demo start does
+# ---
+# r: generator state
+pub fun clear(r: *Random) {
+    r.play = 0;
+    r.misc = 0;
+}
+
+test p_random__first_draws {
+    var r: Random;
+    if (p_random(?r) != 8)   { ret 1; }
+    if (p_random(?r) != 109) { ret 2; }
+    if (m_random(?r) != 8)   { ret 3; }
+    if (p_random(?r) != 220) { ret 4; }
+    ret 0;
+}
+
+test p_random__wraps_after_256 {
+    var r:   Random;
+    var i:   i32 = 0;
+    var sum: i32 = 0;
+    for (i < 256) {
+        sum = sum + p_random(?r);
+        i   = i + 1;
+    }
+    # the walk is back at entry 0, and the table's total is a fixed number
+    if (r.play != 0)       { ret 1; }
+    if (p_random(?r) != 8) { ret 2; }
+    if (sum != TABLE_SUM)  { ret 3; }
+    ret 0;
+}
