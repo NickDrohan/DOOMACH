@@ -129,4 +129,21 @@ gate "release draws the same four demo views" 0 shots_are_pinned "$work/release"
 
 gate "rejects a demo the WAD does not hold" 3 "$debug" demo "$wad" DEMO9
 
+# Sound. The first demo's sound is written out as a WAV file, 143 seconds of
+# it. With the sound hook installed the demo must still end where it ends
+# without, since nothing in the simulation may depend on what is audible.
+"$debug" wav "$wad" DEMO1 "$work/debug.wav" >"$work/wav.debug" 2>/dev/null
+"$release" wav "$wad" DEMO1 "$work/release.wav" >/dev/null 2>&1
+demo_sum() { awk '/^end tic/ {print $3, $5}' "$1"; }
+gate "sound does not disturb the simulation" 0 test "$(demo_sum "$work/wav.debug")" = "$(demo_sum "$here/fixtures/DEMO1.expected")"
+same "debug and release mix the same sound" "$work/debug.wav" "$work/release.wav"
+wav_is_pinned() { (cd "$work" && sha256sum -c --status "$here/fixtures/sound.sha256"); }
+gate "the demo's sound matches the committed hash" 0 wav_is_pinned
+if [[ -n "$python" ]]; then
+    # the pistol's lump must appear in the file sample for sample, scaled as
+    # the mixer scales a noise at full volume in the centre
+    gate "the pistol is in the mix exactly as the WAD holds it" 0 \
+        "$python" "$here/harness/wavcheck.py" "$wad" "$work/debug.wav"
+fi
+
 gates_done

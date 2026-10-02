@@ -384,7 +384,7 @@ pub rec Anim {
 
 pub def ActionHook:  fun(*Game, *Mobj, *Player, *Pspdef, i32);
 pub def SpecialHook: fun(*Game, i32, i32, i32, *Mobj) bool;
-pub def SoundHook:   fun(*Game, *Mobj, i32);
+pub def SoundHook:   fun(*Game, ptr, bool, Fixed, Fixed, i32);
 
 pub rec Game {
     lv:  *level.Level;
@@ -418,6 +418,9 @@ pub rec Game {
     respawnparm:     bool;
     # 0 none, 1 the level's exit was taken, 2 its secret exit
     exited: i32;
+    # counts the levels loaded; whatever held a pointer into the last one
+    # must let go when this changes
+    levelserial: i32;
     # the WAD holds only the first episode
     shareware: bool;
     # the flat that means "sky"
@@ -564,9 +567,22 @@ pub fun free_level(g: *Game) {
     g.chunkcap  = 0;
 }
 
-# make a noise; origin may be nil
+# make a noise at a thing; origin may be nil for a noise that has no place
 pub fun sound(g: *Game, origin: *Mobj, sfx: i32) {
-    if (g.start_sound != nil) { g.start_sound(g, origin, sfx); }
+    if (g.start_sound == nil) { ret; }
+    if (origin == nil) {
+        g.start_sound(g, nil, 0, 0, 0, sfx);
+    }
+    or {
+        g.start_sound(g, origin:~ptr, 1, origin.x, origin.y, sfx);
+    }
+}
+
+# make a noise at the middle of a sector, as doors and lifts do
+pub fun sector_sound(g: *Game, secnum: i32, sfx: i32) {
+    if (g.start_sound == nil) { ret; }
+    val sec: *level.Sector = ?g.lv.sectors[secnum];
+    g.start_sound(g, sec:~ptr, 0, sec.soundorg_x, sec.soundorg_y, sfx);
 }
 
 # the sector an object stands in

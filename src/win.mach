@@ -264,3 +264,113 @@ pub fun micros(win: *Window) i64 {
 pub fun nap(ms: u32) {
     Sleep(ms);
 }
+
+# ------------------------------------------------------------------- audio
+
+val WAVE_MAPPER:  u32 = 0xffffffff;
+val WHDR_DONE:    u32 = 1;
+val AUDIO_FRAMES: i32 = 256;
+val AUDIO_BLOCKS: i32 = 4;
+
+rec WAVEFORMATEX {
+    wFormatTag:      u16;
+    nChannels:       u16;
+    nSamplesPerSec:  u32;
+    nAvgBytesPerSec: u32;
+    nBlockAlign:     u16;
+    wBitsPerSample:  u16;
+    cbSize:          u16;
+}
+
+rec WAVEHDR {
+    lpData:          *i16;
+    dwBufferLength:  u32;
+    dwBytesRecorded: u32;
+    dwUser:          usize;
+    dwFlags:         u32;
+    dwLoops:         u32;
+    lpNext:          ptr;
+    reserved:        usize;
+}
+
+#[library("winmm.dll")]
+ext fun waveOutOpen(handle: *isize, device: u32, format: *WAVEFORMATEX, callback: usize, instance: usize, flags: u32) u32;
+#[library("winmm.dll")]
+ext fun waveOutPrepareHeader(handle: isize, header: *WAVEHDR, size: u32) u32;
+#[library("winmm.dll")]
+ext fun waveOutWrite(handle: isize, header: *WAVEHDR, size: u32) u32;
+#[library("winmm.dll")]
+ext fun waveOutReset(handle: isize) u32;
+#[library("winmm.dll")]
+ext fun waveOutClose(handle: isize) u32;
+
+# fills a buffer with interleaved 16-bit stereo: the buffer, and how many
+# frames it holds
+pub def Fill: fun(*i16, i32);
+
+# a sound output: a few short blocks kept queued at the device, each refilled
+# as soon as the device has finished playing it
+pub rec Audio {
+    handle:  isize;
+    opened:  bool;
+    headers: [4]WAVEHDR;
+    samples: [2048]i16;
+}
+
+# open the default sound device for 16-bit stereo
+# ---
+# au:   the output to fill in
+# rate: frames a second
+# ret:  whether there is a device; the game runs silent without one
+pub fun audio_open(au: *Audio, rate: i32) bool {
+    var format: WAVEFORMATEX;
+    format.wFormatTag      = 1;
+    format.nChannels       = 2;
+    format.nSamplesPerSec  = rate::u32;
+    format.nAvgBytesPerSec = (rate * 4)::u32;
+    format.nBlockAlign     = 4;
+    format.wBitsPerSample  = 16;
+
+    au.opened = 0;
+    if (waveOutOpen(?au.handle, WAVE_MAPPER, ?format, 0, 0, 0) != 0) { ret 0; }
+
+    # every block starts out "finished", so the first pump fills them all
+    var i: i32 = 0;
+    for (i < AUDIO_BLOCKS) {
+        val h: *WAVEHDR = ?au.headers[i];
+        h.lpData         = ?au.samples[i * AUDIO_FRAMES * 2];
+        h.dwBufferLength = (AUDIO_FRAMES * 4)::u32;
+        h.dwFlags        = 0;
+        if (waveOutPrepareHeader(au.handle, h, $size_of(WAVEHDR)::u32) != 0) { ret 0; }
+        h.dwFlags = h.dwFlags | WHDR_DONE;
+        i         = i + 1;
+    }
+    au.opened = 1;
+    ret 1;
+}
+
+# refill and requeue every block the device has finished with
+# ---
+# au:   the output
+# fill: what produces the samples
+pub fun audio_pump(au: *Audio, fill: Fill) {
+    if (!au.opened) { ret; }
+    var i: i32 = 0;
+    for (i < AUDIO_BLOCKS) {
+        val h: *WAVEHDR = ?au.headers[i];
+        if ((h.dwFlags & WHDR_DONE) != 0) {
+            fill(h.lpData, AUDIO_FRAMES);
+            h.dwFlags = h.dwFlags & ~WHDR_DONE;
+            waveOutWrite(au.handle, h, $size_of(WAVEHDR)::u32);
+        }
+        i = i + 1;
+    }
+}
+
+# stop and close the device
+pub fun audio_close(au: *Audio) {
+    if (!au.opened) { ret; }
+    waveOutReset(au.handle);
+    waveOutClose(au.handle);
+    au.opened = 0;
+}

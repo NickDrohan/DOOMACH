@@ -1,0 +1,405 @@
+# sound effects: which noises are playing, how loud and from which side, and
+# the samples that come out
+#
+# Ported from s_sound.c (the channels, and how distance and direction become
+# volume and stereo separation) and from the mixing half of i_sound.c. No
+# music. The simulation reports each noise through the start_sound hook; it
+# never waits on, reads from or is changed by anything here, so demos play
+# the same with sound as without.
+#
+# The mixer's state is module state rather than part of the game, because
+# the hook hands it a Game and nothing else, and because there is one sound
+# device however many games there might be.
+
+use std.types.bool.bool;
+use std.types.option.opt;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.defs.Mobj;
+use doom.fixed;
+use doom.fixed.Fixed;
+use doom.sfx;
+use t: doom.tables;
+use doom.wad;
+use doom.world;
+
+# the rate the mixer produces, and that nearly every effect is stored at
+pub val RATE: i32 = 11025;
+
+val NUMCHANNELS: i32 = 8;
+
+# when to clip out sounds: does not fit the large outdoor areas
+val S_CLIPPING_DIST: Fixed = 1200 * 65536;
+
+# distance effect. sounds closer than this are at full volume; farther ones
+# fade to nothing at the clipping distance.
+val S_CLOSE_DIST: Fixed = 160 * 65536;
+val S_ATTENUATOR: i32   = 1040;
+
+val NORM_SEP:       i32   = 128;
+val S_STEREO_SWING: Fixed = 96 * 65536;
+
+# the menu's sound volume runs 0 to 15; the mixer's 0 to 127
+val SFX_VOLUME: i32 = 15;
+
+rec Channel {
+    # SFX_* being played, 0 when the channel is free
+    sfx: i32;
+    # what is making the noise: a map object, a sector, or nil for a noise
+    # with no place. only ever compared, except for a map object's position.
+    origin: ptr;
+    ismobj: bool;
+    x:      Fixed;
+    y:      Fixed;
+    # the samples, unsigned 8-bit, how many, and where playback has reached
+    # as a 16.16 position stepping by the effect's rate over the mixer's
+    data:     *u8;
+    len:      u32;
+    pos:      u32;
+    step:     u32;
+    leftvol:  i32;
+    rightvol: i32;
+}
+
+var channels: [8]Channel;
+var archive:  *wad.Wad;
+var serial:   i32;
+
+# S_StopChannel
+fun stop_channel(cnum: i32) {
+    channels[cnum].sfx = 0;
+}
+
+# stop everything, as S_Start does when a level begins
+fun stop_all() {
+    var i: i32 = 0;
+    for (i < NUMCHANNELS) {
+        stop_channel(i);
+        i = i + 1;
+    }
+}
+
+# the level changed under us: every origin points into memory that is gone
+fun check_level(g: *Game) {
+    if (serial != g.levelserial) {
+        stop_all();
+        serial = g.levelserial;
+    }
+}
+
+# what S_AdjustSoundParams works out
+rec Params {
+    audible: bool;
+    volume:  i32;
+    sep:     i32;
+}
+
+# S_AdjustSoundParams: changes volume and stereo-separation variables from
+# the norm of a sound effect to be played. if the sound is not audible,
+# returns audible false. otherwise, modifies parameters and returns true.
+fun adjust(g: *Game, listener: *Mobj, x: Fixed, y: Fixed) Params {
+    var p: Params;
+
+    # calculate the distance to sound origin and clip it if necessary
+    var adx: Fixed = listener.x - x;
+    if (adx < 0) { adx = 0 - adx; }
+    var ady: Fixed = listener.y - y;
+    if (ady < 0) { ady = 0 - ady; }
+
+    # from _GG1_ p.428. approx. euclidean distance fast.
+    var less: Fixed = ady;
+    if (adx < ady) { less = adx; }
+    var approx_dist: Fixed = adx + ady - (less >> 1);
+
+    if (g.gamemap != 8 && approx_dist > S_CLIPPING_DIST) { ret p; }
+
+    # angle of source to listener
+    var angle: u32 = world.point_to_angle2(listener.x, listener.y, x, y);
+
+    if (angle > listener.angle) {
+        angle = angle - listener.angle;
+    }
+    or {
+        angle = angle + (0xffffffff - listener.angle);
+    }
+    angle = angle >> t.ANGLETOFINESHIFT;
+
+    # stereo separation
+    p.sep = 128 - (fixed.mul(S_STEREO_SWING, t.FINESINE[angle]) >> 16);
+
+    # volume calculation
+    if (approx_dist < S_CLOSE_DIST) {
+        p.volume = SFX_VOLUME;
+    }
+    or (g.gamemap == 8) {
+        # the boss level's sounds carry across the whole map
+        if (approx_dist > S_CLIPPING_DIST) { approx_dist = S_CLIPPING_DIST; }
+        p.volume = 15 + ((SFX_VOLUME - 15) * ((S_CLIPPING_DIST - approx_dist) >> 16)) / S_ATTENUATOR;
+    }
+    or {
+        # distance effect
+        p.volume = (SFX_VOLUME * ((S_CLIPPING_DIST - approx_dist) >> 16)) / S_ATTENUATOR;
+    }
+
+    p.audible = p.volume > 0;
+    ret p;
+}
+
+# I_UpdateSoundParams: separation, that is, orientation/stereo. range is
+# 1 - 256. the per-channel volumes run 0 to 127.
+fun set_volume(c: *Channel, volume_in: i32, sep_in: i32) {
+    # the simulation's 0 to 15 onto the mixer's 0 to 127
+    val volume: i32 = volume_in * 8;
+    var sep:    i32 = sep_in + 1;
+
+    # per left/right channel. x^2 seperation, adjust volume properly.
+    c.leftvol  = volume - ((volume * sep * sep) >> 16);
+    sep        = sep - 257;
+    c.rightvol = volume - ((volume * sep * sep) >> 16);
+
+    if (c.leftvol < 0)    { c.leftvol = 0; }
+    if (c.leftvol > 127)  { c.leftvol = 127; }
+    if (c.rightvol < 0)   { c.rightvol = 0; }
+    if (c.rightvol > 127) { c.rightvol = 127; }
+}
+
+# S_getChannel: if none available, return -1. otherwise channel #.
+fun get_channel(origin: ptr, sfxnum: i32) i32 {
+    # find an open channel
+    var cnum: i32 = 0;
+    for (cnum < NUMCHANNELS) {
+        if (channels[cnum].sfx == 0) { brk; }
+        if (origin != nil && channels[cnum].origin == origin) {
+            stop_channel(cnum);
+            brk;
+        }
+        cnum = cnum + 1;
+    }
+
+    # none available
+    if (cnum == NUMCHANNELS) {
+        # look for lower priority
+        cnum = 0;
+        for (cnum < NUMCHANNELS) {
+            if (sfx.priority(channels[cnum].sfx) >= sfx.priority(sfxnum)) { brk; }
+            cnum = cnum + 1;
+        }
+
+        if (cnum == NUMCHANNELS) {
+            # FUCK! no lower priority. sorry, Charlie.
+            ret -1;
+        }
+        # otherwise, kick out lower priority
+        stop_channel(cnum);
+    }
+    ret cnum;
+}
+
+# the start_sound hook, S_StartSound: begin a noise
+# ---
+# g:      the game
+# origin: what makes it, or nil
+# ismobj: whether origin is a map object, which may move while it sounds
+# x:      where it is
+# y:      where it is
+# sfxnum: SFX_* effect
+pub fun start(g: *Game, origin: ptr, ismobj: bool, x: Fixed, y: Fixed, sfxnum: i32) {
+    if (archive == nil || sfxnum < 1 || sfxnum >= sfx.NUMSFX) { ret; }
+    check_level(g);
+
+    val listener: *Mobj = g.players[g.consoleplayer].mo;
+    var volume:   i32   = SFX_VOLUME;
+    var sep:      i32   = NORM_SEP;
+
+    # check to see if it is audible, and if not, modify the params
+    if (origin != nil && listener != nil && origin != listener:~ptr) {
+        val p: Params = adjust(g, listener, x, y);
+        volume = p.volume;
+        sep    = p.sep;
+        if (x == listener.x && y == listener.y) { sep = NORM_SEP; }
+        if (!p.audible)                         { ret; }
+    }
+
+    # kill old sound: one thing makes one noise at a time
+    var i: i32 = 0;
+    for (i < NUMCHANNELS) {
+        if (channels[i].sfx != 0 && channels[i].origin == origin) {
+            stop_channel(i);
+            brk;
+        }
+        i = i + 1;
+    }
+
+    # the samples: a lump named DS and the effect's name, holding a format
+    # word, a rate, a count, and then unsigned 8-bit samples. the first and
+    # last sixteen samples are padding the original's sound library skips.
+    var name: [9]u8;
+    sfx.lump_name(sfxnum, ?name[0]);
+    val found: opt[u32] = wad.find(archive, ?name[0]);
+    if (sel found.none) { ret; }
+    val size: u32 = wad.lump(archive, found.some).size;
+    if (size <= 8 + 32) { ret; }
+    val lump: *u8 = wad.bytes(archive, found.some);
+    val rate: u32 = lump[2]::u32 | (lump[3]::u32 << 8);
+    var len:  u32 = lump[4]::u32 | (lump[5]::u32 << 8) | (lump[6]::u32 << 16) | (lump[7]::u32 << 24);
+    if (len > size - 8)         { len = size - 8; }
+    if (len <= 32 || rate == 0) { ret; }
+
+    # try to find a channel
+    val cnum: i32 = get_channel(origin, sfxnum);
+    if (cnum < 0) { ret; }
+
+    val c: *Channel = ?channels[cnum];
+    c.sfx    = sfxnum;
+    c.origin = origin;
+    c.ismobj = ismobj;
+    c.x      = x;
+    c.y      = y;
+    c.data   = ?lump[8 + 16];
+    c.len    = len - 32;
+    c.pos    = 0;
+    c.step   = (rate << 16) / RATE:~u32;
+    set_volume(c, volume, sep);
+}
+
+# S_UpdateSounds: once a tic, move each playing noise to where its source and
+# the listener now are, and drop those that have gone out of earshot
+pub fun update(g: *Game) {
+    check_level(g);
+    val listener: *Mobj = g.players[g.consoleplayer].mo;
+    if (listener == nil) { ret; }
+
+    var i: i32 = 0;
+    for (i < NUMCHANNELS) {
+        val c: *Channel = ?channels[i];
+        i = i + 1;
+        if (c.sfx == 0 || c.origin == nil || c.origin == listener:~ptr) { cnt; }
+
+        # initialize parameters; check non-local sounds for distance clipping
+        # or modify their params
+        if (c.ismobj) {
+            val mo: *Mobj = c.origin:~*Mobj;
+            c.x = mo.x;
+            c.y = mo.y;
+        }
+        val p: Params = adjust(g, listener, c.x, c.y);
+        if (!p.audible) {
+            c.sfx = 0;
+        }
+        or {
+            set_volume(c, p.volume, p.sep);
+        }
+    }
+}
+
+# I_UpdateSound: mix the playing noises into interleaved 16-bit stereo
+# ---
+# out:    room for two samples a frame, left then right
+# frames: how many frames to produce
+pub fun mix(out: *i16, frames: i32) {
+    var f: i32 = 0;
+    for (f < frames) {
+        var dl: i32 = 0;
+        var dr: i32 = 0;
+
+        # love thy L2 chache - made this a loop. now more channels could be
+        # set at compile time as well.
+        var i: i32 = 0;
+        for (i < NUMCHANNELS) {
+            val c: *Channel = ?channels[i];
+            i = i + 1;
+            if (c.sfx == 0) { cnt; }
+
+            # get the raw data from the channel, and add left and right part
+            # of it to the current data, adjusting volume accordingly
+            val sample: i32 = c.data[c.pos >> 16]::i32 - 128;
+            dl = dl + (c.leftvol * sample * 256) / 127;
+            dr = dr + (c.rightvol * sample * 256) / 127;
+
+            # increment index, and check whether we are done
+            c.pos = c.pos + c.step;
+            if ((c.pos >> 16) >= c.len) { c.sfx = 0; }
+        }
+
+        # clamp to range. left hardware channel. has been char instead of
+        # short.
+        if (dl > 0x7fff) {
+            dl = 0x7fff;
+        }
+        or (dl < 0 - 0x8000) {
+            dl = 0 - 0x8000;
+        }
+        if (dr > 0x7fff) {
+            dr = 0x7fff;
+        }
+        or (dr < 0 - 0x8000) {
+            dr = 0 - 0x8000;
+        }
+
+        out[f * 2]     = dl::i16;
+        out[f * 2 + 1] = dr::i16;
+        f              = f + 1;
+    }
+}
+
+# how many channels are playing; for tests and for the curious
+pub fun playing() i32 {
+    var n: i32 = 0;
+    var i: i32 = 0;
+    for (i < NUMCHANNELS) {
+        if (channels[i].sfx != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# give the game its sound hook; call once, after the WAD is loaded
+# ---
+# g: the game
+# w: the archive the effects are read from, which must outlive the game
+pub fun install(g: *Game, w: *wad.Wad) {
+    archive = w;
+    serial  = g.levelserial;
+    stop_all();
+    g.start_sound = start;
+}
+
+test set_volume__centre_and_sides {
+    var c: Channel;
+    # dead ahead: both sides nearly the full 120
+    set_volume(?c, 15, 128);
+    if (c.leftvol < 85 || c.leftvol > 95 || c.rightvol < 85 || c.rightvol > 95) { ret 1; }
+    # hard to the listener's left: the left side louder than the right
+    set_volume(?c, 15, 32);
+    if (c.leftvol <= c.rightvol) { ret 2; }
+    set_volume(?c, 15, 224);
+    if (c.rightvol <= c.leftvol) { ret 3; }
+    # silence stays silent
+    set_volume(?c, 0, 128);
+    if (c.leftvol != 0 || c.rightvol != 0) { ret 4; }
+    ret 0;
+}
+
+test mix__plays_a_channel_to_its_end {
+    var samples: [8]u8 = [8]u8{128, 255, 1, 128, 200, 60, 128, 128};
+    stop_all();
+    channels[0].sfx      = 1;
+    channels[0].data     = ?samples[0];
+    channels[0].len      = 6;
+    channels[0].pos      = 0;
+    channels[0].step     = 65536;
+    channels[0].leftvol  = 127;
+    channels[0].rightvol = 0;
+
+    var out: [16]i16;
+    mix(?out[0], 8);
+    # the midpoint is silence; full scale up and down; the right side is off
+    if (out[0] != 0 || out[1] != 0)     { ret 1; }
+    if (out[2] != 32512 || out[3] != 0) { ret 2; }
+    if (out[4] != 0 - 32512)            { ret 3; }
+    # six samples and the channel is free, and what follows is silence
+    if (playing() != 0)               { ret 4; }
+    if (out[12] != 0 || out[14] != 0) { ret 5; }
+    ret 0;
+}

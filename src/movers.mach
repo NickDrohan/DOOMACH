@@ -408,7 +408,7 @@ fun move_plane(g: *Game, secnum: i32, speed: Fixed, dest: Fixed, crush: bool, fl
 pub fun floor_think(g: *Game, floor: *FloorMove) {
     val res: i32 = move_plane(g, floor.sector, floor.speed, floor.floordestheight, floor.crush, 0, floor.direction);
 
-    if ((g.leveltime & 7) == 0) { defs.sound(g, nil, info.SFX_STNMOV); }
+    if ((g.leveltime & 7) == 0) { defs.sector_sound(g, floor.sector, info.SFX_STNMOV); }
 
     if (res == PASTDEST) {
         val sector: *level.Sector = sec(g, floor.sector);
@@ -427,7 +427,7 @@ pub fun floor_think(g: *Game, floor: *FloorMove) {
             }
         }
         world.remove_thinker(?floor.thinker);
-        defs.sound(g, nil, info.SFX_PSTOP);
+        defs.sector_sound(g, floor.sector, info.SFX_PSTOP);
     }
 }
 
@@ -694,16 +694,16 @@ pub fun door_think(g: *Game, door: *Door) {
             if (door.kind == BLAZE_RAISE) {
                 # time to go back down
                 door.direction = -1;
-                defs.sound(g, nil, info.SFX_BDCLS);
+                defs.sector_sound(g, door.sector, info.SFX_BDCLS);
             }
             or (door.kind == NORMAL) {
                 # time to go back down
                 door.direction = -1;
-                defs.sound(g, nil, info.SFX_DORCLS);
+                defs.sector_sound(g, door.sector, info.SFX_DORCLS);
             }
             or (door.kind == CLOSE_30_THEN_OPEN) {
                 door.direction = 1;
-                defs.sound(g, nil, info.SFX_DOROPN);
+                defs.sector_sound(g, door.sector, info.SFX_DOROPN);
             }
         }
     }
@@ -714,7 +714,7 @@ pub fun door_think(g: *Game, door: *Door) {
             if (door.kind == RAISE_IN_5_MINS) {
                 door.direction = 1;
                 door.kind      = NORMAL;
-                defs.sound(g, nil, info.SFX_DOROPN);
+                defs.sector_sound(g, door.sector, info.SFX_DOROPN);
             }
         }
     }
@@ -726,7 +726,7 @@ pub fun door_think(g: *Game, door: *Door) {
                 sector.specialdata = nil;
                 # unlink and free
                 world.remove_thinker(?door.thinker);
-                defs.sound(g, nil, info.SFX_BDCLS);
+                defs.sector_sound(g, door.sector, info.SFX_BDCLS);
             }
             or (door.kind == NORMAL || door.kind == CLOSE) {
                 sector.specialdata = nil;
@@ -742,7 +742,7 @@ pub fun door_think(g: *Game, door: *Door) {
             if (door.kind != BLAZE_CLOSE && door.kind != CLOSE) {
                 # do not go back up!
                 door.direction = 1;
-                defs.sound(g, nil, info.SFX_DOROPN);
+                defs.sector_sound(g, door.sector, info.SFX_DOROPN);
             }
         }
     }
@@ -795,28 +795,28 @@ pub fun do_door(g: *Game, tag: i32, kind: i32) bool {
             door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
             door.direction = -1;
             door.speed     = VDOORSPEED * 4;
-            defs.sound(g, nil, info.SFX_BDCLS);
+            defs.sector_sound(g, secnum, info.SFX_BDCLS);
         }
         or (kind == CLOSE) {
             door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
             door.direction = -1;
-            defs.sound(g, nil, info.SFX_DORCLS);
+            defs.sector_sound(g, secnum, info.SFX_DORCLS);
         }
         or (kind == CLOSE_30_THEN_OPEN) {
             door.topheight = sector.ceilingheight;
             door.direction = -1;
-            defs.sound(g, nil, info.SFX_DORCLS);
+            defs.sector_sound(g, secnum, info.SFX_DORCLS);
         }
         or (kind == BLAZE_RAISE || kind == BLAZE_OPEN) {
             door.direction = 1;
             door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
             door.speed     = VDOORSPEED * 4;
-            if (door.topheight != sector.ceilingheight) { defs.sound(g, nil, info.SFX_BDOPN); }
+            if (door.topheight != sector.ceilingheight) { defs.sector_sound(g, secnum, info.SFX_BDOPN); }
         }
         or (kind == NORMAL || kind == OPEN) {
             door.direction = 1;
             door.topheight = find_lowest_ceiling_surrounding(g, secnum) - 4 * 65536;
-            if (door.topheight != sector.ceilingheight) { defs.sound(g, nil, info.SFX_DOROPN); }
+            if (door.topheight != sector.ceilingheight) { defs.sector_sound(g, secnum, info.SFX_DOROPN); }
         }
     }
     ret rtn;
@@ -930,11 +930,11 @@ pub fun vertical_door(g: *Game, linenum: i32, thing: *Mobj) {
     # for proper sound
     if (special == 117 || special == 118) {
         # blazing door raise / open
-        defs.sound(g, nil, info.SFX_BDOPN);
+        defs.sector_sound(g, secnum, info.SFX_BDOPN);
     }
     or {
         # normal door sound, locked door sound
-        defs.sound(g, nil, info.SFX_DOROPN);
+        defs.sector_sound(g, secnum, info.SFX_DOROPN);
     }
 
     # new door thinker
@@ -1010,14 +1010,14 @@ pub fun ceiling_think(g: *Game, ceiling: *Ceiling) {
         # up
         val res: i32 = move_plane(g, ceiling.sector, ceiling.speed, ceiling.topheight, 0, 1, ceiling.direction);
 
-        if ((g.leveltime & 7) == 0 && ceiling.kind != SILENT_CRUSH_AND_RAISE) { defs.sound(g, nil, info.SFX_STNMOV); }
+        if ((g.leveltime & 7) == 0 && ceiling.kind != SILENT_CRUSH_AND_RAISE) { defs.sector_sound(g, ceiling.sector, info.SFX_STNMOV); }
 
         if (res == PASTDEST) {
             if (ceiling.kind == RAISE_TO_HIGHEST) {
                 remove_active_ceiling(g, ceiling);
             }
             or (ceiling.kind == SILENT_CRUSH_AND_RAISE) {
-                defs.sound(g, nil, info.SFX_PSTOP);
+                defs.sector_sound(g, ceiling.sector, info.SFX_PSTOP);
                 ceiling.direction = -1;
             }
             or (ceiling.kind == FAST_CRUSH_AND_RAISE || ceiling.kind == CRUSH_AND_RAISE) {
@@ -1029,11 +1029,11 @@ pub fun ceiling_think(g: *Game, ceiling: *Ceiling) {
         # down
         val res: i32 = move_plane(g, ceiling.sector, ceiling.speed, ceiling.bottomheight, ceiling.crush, 1, ceiling.direction);
 
-        if ((g.leveltime & 7) == 0 && ceiling.kind != SILENT_CRUSH_AND_RAISE) { defs.sound(g, nil, info.SFX_STNMOV); }
+        if ((g.leveltime & 7) == 0 && ceiling.kind != SILENT_CRUSH_AND_RAISE) { defs.sector_sound(g, ceiling.sector, info.SFX_STNMOV); }
 
         if (res == PASTDEST) {
             if (ceiling.kind == SILENT_CRUSH_AND_RAISE) {
-                defs.sound(g, nil, info.SFX_PSTOP);
+                defs.sector_sound(g, ceiling.sector, info.SFX_PSTOP);
                 ceiling.speed     = CEILSPEED;
                 ceiling.direction = 1;
             }
@@ -1173,18 +1173,18 @@ pub fun plat_think(g: *Game, plat: *Plat) {
         val res: i32 = move_plane(g, plat.sector, plat.speed, plat.high, plat.crush, 0, 1);
 
         if (plat.kind == RAISE_AND_CHANGE || plat.kind == RAISE_TO_NEAREST_AND_CHANGE) {
-            if ((g.leveltime & 7) == 0) { defs.sound(g, nil, info.SFX_STNMOV); }
+            if ((g.leveltime & 7) == 0) { defs.sector_sound(g, plat.sector, info.SFX_STNMOV); }
         }
 
         if (res == CRUSHED && !plat.crush) {
             plat.count  = plat.wait;
             plat.status = PLAT_DOWN;
-            defs.sound(g, nil, info.SFX_PSTART);
+            defs.sector_sound(g, plat.sector, info.SFX_PSTART);
         }
         or (res == PASTDEST) {
             plat.count  = plat.wait;
             plat.status = PLAT_WAITING;
-            defs.sound(g, nil, info.SFX_PSTOP);
+            defs.sector_sound(g, plat.sector, info.SFX_PSTOP);
 
             if (plat.kind == BLAZE_DWUS || plat.kind == DOWN_WAIT_UP_STAY || plat.kind == RAISE_AND_CHANGE ||
                 plat.kind == RAISE_TO_NEAREST_AND_CHANGE) {
@@ -1198,7 +1198,7 @@ pub fun plat_think(g: *Game, plat: *Plat) {
         if (res == PASTDEST) {
             plat.count  = plat.wait;
             plat.status = PLAT_WAITING;
-            defs.sound(g, nil, info.SFX_PSTOP);
+            defs.sector_sound(g, plat.sector, info.SFX_PSTOP);
         }
     }
     or (plat.status == PLAT_WAITING) {
@@ -1210,7 +1210,7 @@ pub fun plat_think(g: *Game, plat: *Plat) {
             or {
                 plat.status = PLAT_DOWN;
             }
-            defs.sound(g, nil, info.SFX_PSTART);
+            defs.sector_sound(g, plat.sector, info.SFX_PSTART);
         }
     }
 }
@@ -1267,7 +1267,7 @@ pub fun do_plat(g: *Game, linenum: i32, kind: i32, amount: i32) bool {
             # NO MORE DAMAGE, IF APPLICABLE
             sector.special = 0;
 
-            defs.sound(g, nil, info.SFX_STNMOV);
+            defs.sector_sound(g, secnum, info.SFX_STNMOV);
         }
         or (kind == RAISE_AND_CHANGE) {
             plat.speed       = PLATSPEED / 2;
@@ -1276,7 +1276,7 @@ pub fun do_plat(g: *Game, linenum: i32, kind: i32, amount: i32) bool {
             plat.wait        = 0;
             plat.status      = PLAT_UP;
 
-            defs.sound(g, nil, info.SFX_STNMOV);
+            defs.sector_sound(g, secnum, info.SFX_STNMOV);
         }
         or (kind == DOWN_WAIT_UP_STAY || kind == BLAZE_DWUS) {
             plat.speed = PLATSPEED * 4;
@@ -1288,7 +1288,7 @@ pub fun do_plat(g: *Game, linenum: i32, kind: i32, amount: i32) bool {
             plat.high   = sector.floorheight;
             plat.wait   = 35 * PLATWAIT;
             plat.status = PLAT_DOWN;
-            defs.sound(g, nil, info.SFX_PSTART);
+            defs.sector_sound(g, secnum, info.SFX_PSTART);
         }
         or (kind == PERPETUAL_RAISE) {
             plat.speed = PLATSPEED;
@@ -1303,7 +1303,7 @@ pub fun do_plat(g: *Game, linenum: i32, kind: i32, amount: i32) bool {
             plat.wait   = 35 * PLATWAIT;
             plat.status = defs.p_random(g) & 1;
 
-            defs.sound(g, nil, info.SFX_PSTART);
+            defs.sector_sound(g, secnum, info.SFX_PSTART);
         }
 
         # P_AddActivePlat

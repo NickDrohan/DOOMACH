@@ -16,6 +16,7 @@ python products/doom/harness/topng.py frame.ppm frame.png 3         # PPM to PNG
 $out play products/doom/data/DOOM1.WAD        # play the first episode in a window
 $out play products/doom/data/DOOM1.WAD 5 4    # ... from E1M5 on "Ultra-Violence"
 $out demo products/doom/data/DOOM1.WAD DEMO1  # run a built-in demo headless
+$out wav products/doom/data/DOOM1.WAD DEMO1 demo1.wav   # ... and write what it sounds like
 bash products/doom/check.sh             # acceptance gates
 ```
 
@@ -47,7 +48,7 @@ Each step lands with its gates before the next begins.
 | 2 | Map loading: vertexes, lines, sectors, BSP, blockmap | all nine maps dump identically to an independent Python reader | **done** |
 | 3 | Scalar renderer | twelve still viewpoints and four views from inside the demos, pinned by hash; debug and release identical | **done** |
 | 4 | Playsim and demo playback | all three shareware demos run to their last tic in sync | **done** |
-| 5 | Win32 window, input, sound effects | playable | **playable**; no sound yet |
+| 5 | Win32 window, input, sound effects | playable | **done**; no music |
 | 6 | AVX2 renderer | every demo frame identical to scalar; measured speedup | |
 | 7 | SPIR-V compute renderer and Vulkan host | every demo frame identical to scalar | |
 
@@ -74,20 +75,24 @@ a SPIR-V 1.6 module for `vulkan1.3` in both profiles. That module has not been v
 | Esc | quit |
 
 It is the game: monsters, weapons, doors, lifts, switches, keys, secrets, damaging floors,
-teleporters, pickups, the status bar and the red and gold screen flashes. Finishing a level goes
-straight to the next.
+teleporters, pickups, the status bar, the red and gold screen flashes, and sound effects placed
+in stereo by where they come from. Finishing a level goes straight to the next.
 
-What is missing, all of it around the game rather than in it: **sound and music**, the menus,
+What is missing, all of it around the game rather than in it: music, the menus,
 the intermission and ending screens, the automap, saved games. The marine's face on the status
 bar shows how hurt he is and nothing else. Nightmare skill does not speed the demons up as it
 should, because the state table is a constant here and the original edits it in place.
 
 The window procedure Windows calls is a plain Mach function, the frame goes to the screen as an
-8-bit image through `StretchDIBits`, and nothing links but user32, gdi32 and kernel32.
+8-bit image through `StretchDIBits`, sound goes out through `waveOut` in four short blocks that
+the play loop refills as the device finishes them, and nothing links but user32, gdi32, winmm and
+kernel32. Up to eight effects mix at once, at the 11,025 Hz the WAD stores them at.
 
 How far it has been checked: the simulation by the demos below; the renderer and status bar by
 looking at frames captured from the running window; the mapping from held keys to commands by a
-unit test. The path from the real keyboard to those held keys has been read, not exercised.
+unit test; the mixer by writing a demo's sound to a file and finding the WAD's own samples in it.
+Whether sound actually reaches the speakers has not been checked by anything: the device opens
+and the game runs, and the rest takes ears. The path from the real keyboard to those held keys has been read, not exercised.
 
 ## How it is laid out
 
@@ -98,7 +103,8 @@ any animation frame can run code from anywhere. So the port has a real layering,
 | module | from | what |
 | --- | --- | --- |
 | `root` | `d_main.c`, `i_*.c` | commands, the play loop |
-| `win`, `st` | `i_video.c`, `st_stuff.c` | the window; the status bar |
+| `win`, `st` | `i_video.c`, `st_stuff.c` | the window and sound device; the status bar |
+| `sound`, `sfx` | `s_sound.c`, `i_sound.c`, `sounds.c` | channels, distance and stereo, the mixer |
 | `game` | `g_game.c`, `p_setup.c` | sessions, levels, demos, keys to commands |
 | `tick` | `p_tick.c`, `p_user.c` | one tic; the player; thinker dispatch |
 | `enemy`, `pspr` | `p_enemy.c`, `p_pspr.c` | what monsters and weapons do |
@@ -143,7 +149,10 @@ lift. The three C files that are circular among themselves and cannot be pulled 
   both profiles;
 - four views from inside those demos, with monsters, items and the weapon in hand, matching
   `fixtures/shots.sha256` in both profiles;
-- a demo the WAD does not hold rejected with exit 3.
+- a demo the WAD does not hold rejected with exit 3;
+- the first demo's sound, 143 seconds of it: the demo ending exactly where it does with sound
+  off, debug and release mixing identical files, the file matching `fixtures/sound.sha256`, and
+  the pistol's lump found in it sample for sample by `harness/wavcheck.py`.
 
 **What the demo gates do and do not establish.** A demo is one player's recorded commands. The
 simulation is deterministic and draws every random number from one table, so if anything at all

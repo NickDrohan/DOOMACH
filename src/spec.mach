@@ -174,19 +174,19 @@ fun change_switch_texture(g: *Game, linenum: i32, use_again: bool) {
     var i: i32 = 0;
     for (i < g.numswitches * 2) {
         if (g.switchlist[i] == side.toptex) {
-            defs.sound(g, nil, sound);
+            defs.sector_sound(g, line.frontsector, sound);
             side.toptex = g.switchlist[i ^ 1];
             if (use_again) { start_button(g, linenum, WHERE_TOP, g.switchlist[i], BUTTONTIME); }
             ret;
         }
         if (g.switchlist[i] == side.midtex) {
-            defs.sound(g, nil, sound);
+            defs.sector_sound(g, line.frontsector, sound);
             side.midtex = g.switchlist[i ^ 1];
             if (use_again) { start_button(g, linenum, WHERE_MIDDLE, g.switchlist[i], BUTTONTIME); }
             ret;
         }
         if (g.switchlist[i] == side.bottomtex) {
-            defs.sound(g, nil, sound);
+            defs.sector_sound(g, line.frontsector, sound);
             side.bottomtex = g.switchlist[i ^ 1];
             if (use_again) { start_button(g, linenum, WHERE_BOTTOM, g.switchlist[i], BUTTONTIME); }
             ret;
@@ -958,7 +958,7 @@ pub fun update_specials(g: *Game) {
                 or {
                     side.bottomtex = b.btexture;
                 }
-                defs.sound(g, nil, info.SFX_SWTCHN);
+                defs.sector_sound(g, g.lv.lines[b.line].frontsector, info.SFX_SWTCHN);
                 var blank: defs.Button;
                 @b = blank;
             }

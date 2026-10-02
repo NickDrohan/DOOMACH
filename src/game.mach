@@ -144,6 +144,7 @@ fun load_level(s: *Session) bool {
     g.players[g.consoleplayer].viewz = 1;
 
     # everything of the old level goes at once
+    g.levelserial = g.levelserial + 1;
     defs.free_level(g);
     world.init_thinkers(g);
 
