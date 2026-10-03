@@ -161,21 +161,42 @@ if [[ -n "$python" ]]; then
     gate "all thirteen songs play as the python reader reads them" 0 songs_match
 fi
 
+# The music as the game plays it: the songs' messages through the built-in
+# OPL2 synthesizer and the WAD's GENMIDI instruments. Debug and release must
+# render the same samples, and the samples are pinned, so that how the music
+# sounds changes only on purpose (the synthesizer's own pitch and envelope
+# timing are unit tests in opl.mach).
+mkdir -p "$work/opl-debug" "$work/opl-release"
+render_songs() {
+    local exe="$1" dir="$2" m
+    for m in D_E1M1 D_INTRO; do
+        "$exe" muswav "$wad" "$m" "$dir/$m.wav" 20 || return 1
+    done
+}
+gate "the synthesizer renders E1M1 and the title music (debug)" 0 render_songs "$debug" "$work/opl-debug"
+gate "and in release" 0 render_songs "$release" "$work/opl-release"
+same_wavs() { cmp -s "$work/opl-debug/D_E1M1.wav" "$work/opl-release/D_E1M1.wav" && cmp -s "$work/opl-debug/D_INTRO.wav" "$work/opl-release/D_INTRO.wav"; }
+gate "debug and release synthesize the same samples" 0 same_wavs
+opl_is_pinned() { (cd "$work/opl-release" && sha256sum -c --status "$here/fixtures/opl.sha256"); }
+gate "the synthesized music matches fixtures/opl.sha256" 0 opl_is_pinned
+
 # The front end: title, menus, the sound menu's sliders, an intermission
 # counting up and moving on, the end-of-episode text, and the quit prompt,
 # driven by a script of keys and tics with no window, in both profiles.
-frontwalk="5 key:a key:enter key:enter key:enter 30 shot key:esc 2 shot key:down key:enter 2 shot
+frontwalk="5 key:a key:enter key:enter key:enter 30 shot key:esc 2 shot key:down key:down key:enter 2 shot
     key:down key:down key:enter key:right key:right key:right 2 shot key:esc 70 exit 1 60 shot 500 shot
     fire 20 shot 60 shot map:8 10 exit 1 100 shot 2000 shot
-    key:a key:down key:down key:down key:down key:down key:enter 2 shot"
+    key:a key:down key:down key:down key:down key:down key:enter 2 shot
+    key:N key:up key:up key:up key:up key:up key:enter 2 shot
+    key:down key:down key:down key:enter key:K key:Q key:7 2 shot"
 mkdir -p "$work/front-debug" "$work/front-release"
 # shellcheck disable=SC2086
 gate "the scripted front-end walk runs (debug)" 0 "$debug" script "$wad" "$work/front-debug/s" $frontwalk
 # shellcheck disable=SC2086
 gate "the scripted front-end walk runs (release)" 0 "$release" script "$wad" "$work/front-release/s" $frontwalk
 front_is_pinned() { (cd "$1" && sha256sum -c --status "$here/fixtures/front.sha256"); }
-gate "the eleven front-end screens match the committed hashes" 0 front_is_pinned "$work/front-debug"
-gate "release draws the same eleven screens" 0 front_is_pinned "$work/front-release"
+gate "the thirteen front-end screens match the committed hashes" 0 front_is_pinned "$work/front-debug"
+gate "release draws the same thirteen screens" 0 front_is_pinned "$work/front-release"
 
 # Co-op. Two games in one process fed the same bot players' commands must
 # agree every tic, with a forced death and respawn at tic 100; debug and
@@ -211,8 +232,127 @@ gate "networked host finished its 3500 tics" 0 test "$hostexit" = 0
 gate "networked joiner finished its 3500 tics" 0 test "$joinexit" = 0
 same "the host ends where one-process co-op ends" "$work/net-host.txt" "$here/fixtures/coop2.expected"
 same "the joiner ends where one-process co-op ends" "$work/net-join.txt" "$here/fixtures/coop2.expected"
+report="$here/out/windows-x86_64/release/bin/doom-desync.txt"
+rm -f "$report"
 read -r hostexit joinexit <<<"$(netpair 5142 corrupt)"
 gate "a game that goes out of step is caught by the host" 0 test "$hostexit" = 3
 gate "and by the joiner" 0 test "$joinexit" = 3
+# and leaves a report beside the program, for a player to send in
+report_says() { grep -q "went out of step" "$report" && grep -q "map E1M1" "$report" && grep -q "^build " "$report"; }
+gate "the desync leaves doom-desync.txt saying where" 0 report_says
+
+# The relay. Games that never see each other's addresses meet in a room by
+# its code, and every datagram goes through the relay; they must still end
+# where one-process co-op ends. room <tag> <relay port> <players> <map> <tics>
+# hosts a room, joins every other seat by the code the host prints, and
+# leaves each player's last line in $work/<tag>.<seat>.
+relay_exe="$here/out/windows-x86_64/release/bin/relay.exe"
+# the relay is not the default artifact, so it is built here by name: a gate
+# must never run against a relay left over from an older source
+gate "the relay builds (release, Windows)" 0 "$mach" build "$here" --artifact relay --profile release --quiet
+gate "the relay builds (release, Linux, as Fly runs it)" 0 "$mach" build "$here" --artifact relay --target linux-x86_64 --profile release --quiet
+room() {
+    local tag="$1" rport="$2" players="$3" map="$4" tics="$5" extra="${6:-}"
+    # shellcheck disable=SC2086
+    "$release" netplay "$wad" host "$players" "$map" "$tics" 0 "relay=127.0.0.1:$rport" $extra >"$work/$tag.out" 2>&1 &
+    local hostpid=$! code="" k
+    for k in $(seq 1 40); do
+        code="$(awk '/^room / {print $2}' "$work/$tag.out")"
+        [[ -n "$code" ]] && break
+        sleep 0.25
+    done
+    local pids=()
+    for k in $(seq 2 "$players"); do
+        # shellcheck disable=SC2086
+        "$release" netplay "$wad" join "$code" "$tics" 0 "relay=127.0.0.1:$rport" $extra >"$work/$tag.$k" 2>&1 &
+        pids+=($!)
+    done
+    for k in "${pids[@]}"; do wait "$k"; done
+    wait "$hostpid"
+    tail -1 "$work/$tag.out" >"$work/$tag.1"
+}
+"$relay_exe" 5143 >"$work/relay1.log" 2>&1 &
+relaypid=$!
+"$relay_exe" 5144 --impair 7 5 5 5 >"$work/relay2.log" 2>&1 &
+impairedpid=$!
+"$relay_exe" 5145 --delay 60 20 >"$work/relay3.log" 2>&1 &
+farpid=$!
+sleep 1
+room pair 5143 2 1 3500
+same "through the relay, the host ends where one-process co-op ends" "$work/pair.1" "$here/fixtures/coop2.expected"
+same "and so does the joiner" "$work/pair.2" "$here/fixtures/coop2.expected"
+
+# Two rooms at once on one relay: a datagram crossing between them would put
+# both out of step.
+room left 5143 2 1 3500 &
+leftpid=$!
+room right 5143 2 1 3500
+wait "$leftpid"
+for tag in left right; do
+    for k in 1 2; do
+        same "two rooms at once: room $tag, player $k ends as pinned" "$work/$tag.$k" "$here/fixtures/coop2.expected"
+    done
+done
+
+# Four players through a relay that drops, duplicates and reorders five in a
+# hundred of the datagrams it sends.
+room four 5144 4 3 7000
+for k in 1 2 3 4; do
+    same "four players through a lossy relay: player $k ends as pinned" "$work/four.$k" "$here/fixtures/coop4.expected"
+done
+
+# Far apart: a relay 60 to 80 ms from each player, both playing by the clock
+# at 35 tics a second as the window does. They must stay in step and end
+# where one-process co-op ends, and the playout cushion must keep the picture
+# moving: a frozen frame (a step of the clock with no tic to play) on fewer
+# than one step in twenty, a loose bound so that a busy machine does not fail
+# it by chance.
+room far 5145 2 1 700 paced
+coop_end "$release" 2 1 700 >"$work/coop700"
+for k in 1 2; do
+    tail -1 "$work/far.$k" >"$work/far.$k.end"
+    same "60 ms apart, by the clock: player $k ends as one-process co-op does" "$work/far.$k.end" "$work/coop700"
+done
+smooth() { awk '/^paced:/ { exit !($6 * 20 < $2) }' "$1"; }
+gate "60 ms apart: the host's picture froze on fewer than 1 step in 20" 0 smooth "$work/far.out"
+gate "and the joiner's" 0 smooth "$work/far.2"
+
+# Across a level: every machine leaves E1M1 at tic 300 and plays the
+# intermission through the window's own ticker into E1M2, while one of them
+# alone presses Space on the intermission screen, as a player does. A key on
+# one machine once hurried only that machine's intermission, and the first
+# real two-player game went out of step at the start of E1M2.
+"$release" netplay "$wad" host 2 1 1400 0 "relay=127.0.0.1:5143" levels >"$work/levels.1" 2>&1 &
+levelspid=$!
+levelscode=""
+for k in $(seq 1 40); do
+    levelscode="$(awk '/^room / {print $2}' "$work/levels.1")"
+    [[ -n "$levelscode" ]] && break
+    sleep 0.25
+done
+"$release" netplay "$wad" join "$levelscode" 1400 0 "relay=127.0.0.1:5143" levels press >"$work/levels.2" 2>&1
+wait "$levelspid"
+tail -1 "$work/levels.1" >"$work/levels.1.end"
+tail -1 "$work/levels.2" >"$work/levels.2.end"
+on_e1m2() { grep -q "^end tic 1400 .* map E1M2 " "$1"; }
+gate "across a level, with Space pressed on one machine: the host reaches E1M2 in step" 0 on_e1m2 "$work/levels.1.end"
+gate "and so does the joiner" 0 on_e1m2 "$work/levels.2.end"
+same "both on the same world" "$work/levels.1.end" "$work/levels.2.end"
+
+# Turned away, quickly, with the reason: a code no room has, and a WAD that
+# is not the host's.
+"$release" netplay "$wad" host 2 1 3500 0 "relay=127.0.0.1:5143" >"$work/wait.out" 2>&1 &
+waitpid=$!
+sleep 1
+waitcode="$(awk '/^room / {print $2}' "$work/wait.out")"
+gate "an unknown room code is refused" 3 "$release" netplay "$wad" join 2222ZZ 3500 0 "relay=127.0.0.1:5143"
+cp "$work/gate.err" "$work/nocode.err"
+gate "  saying so" 0 grep -q "no room with that code" "$work/nocode.err"
+"$python" -c 'import sys; b = bytearray(open(sys.argv[1], "rb").read()); b[100000] ^= 0xFF; open(sys.argv[2], "wb").write(b)' "$wad" "$work/other.wad"
+gate "a joiner with a different WAD (or build) is refused" 3 "$release" netplay "$work/other.wad" join "$waitcode" 3500 0 "relay=127.0.0.1:5143"
+cp "$work/gate.err" "$work/otherwad.err"
+gate "  saying so" 0 grep -q "different version" "$work/otherwad.err"
+kill "$waitpid" "$relaypid" "$impairedpid" "$farpid" 2>/dev/null
+wait "$waitpid" "$relaypid" "$impairedpid" "$farpid" 2>/dev/null
 
 gates_done

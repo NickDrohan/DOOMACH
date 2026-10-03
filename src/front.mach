@@ -14,6 +14,7 @@ use std.types.bool.bool;
 use std.types.string.str;
 
 use doom.defs;
+use rp: doom.relayproto;
 use doom.game;
 use doom.info;
 use doom.music;
@@ -38,6 +39,8 @@ val MENU_OPTIONS: i32 = 3;
 val MENU_SOUND:   i32 = 4;
 val MENU_READ1:   i32 = 5;
 val MENU_READ2:   i32 = 6;
+val MENU_COOP:    i32 = 7;
+val MENU_CODE:    i32 = 8;
 
 # what a yes in answer to a message does
 val ASK_NONE:      i32 = 0;
@@ -85,7 +88,7 @@ pub rec Front {
     # the menu
     menuactive: bool;
     menu:       i32;
-    itemon:     [7]i32;
+    itemon:     [9]i32;
     skulltics:  i32;
     whichskull: i32;
     episode:    i32;
@@ -93,6 +96,8 @@ pub rec Front {
     # a message over everything, and what a yes to it does
     message:   str;
     messageyn: bool;
+    # the message is a network notice, on a panel of its own
+    panel:     bool;
     ask:       i32;
     skill:     i32;
 
@@ -128,9 +133,26 @@ pub rec Front {
     finalecount: i32;
     finalestage: i32;
 
+    # co-op from the menu: the seats a host is choosing a skill for, the code
+    # being typed, and what the menu asks the game loop to start (NET_HOST or
+    # NET_JOIN) with its players and skill
+    coopplayers: i32;
+    code:        [7]u8;
+    codelen:     i32;
+    netrequest:  i32;
+    netplayers:  i32;
+    netskill:    i32;
+    # a network game is being played; the menu cannot start another game
+    netgame:     bool;
+    # six hex digits naming this program and WAD, for players to compare
+    build:       [7]u8;
+
     # the player chose to quit
     quit: bool;
 }
+
+pub val NET_HOST: i32 = 1;
+pub val NET_JOIN: i32 = 2;
 
 fun sfx(s: *game.Session, effect: i32) {
     defs.sound(?s.g, nil, effect);
@@ -213,6 +235,12 @@ fun advance_demo(f: *Front, s: *game.Session) {
     }
 }
 
+# back to the title screen and its demos, as at the start
+pub fun to_title(f: *Front) {
+    f.netgame = 0;
+    start_title(f);
+}
+
 # start a game on a map, as the menu does on the first one
 pub fun start_game(f: *Front, s: *game.Session, skill: i32, map: i32) {
     f.menuactive = 0;
@@ -228,13 +256,15 @@ pub fun start_game(f: *Front, s: *game.Session, skill: i32, map: i32) {
 # --------------------------------------------------------------- the menus
 
 fun start_message(f: *Front, text: str, yn: bool, ask: i32) {
+    f.panel     = 0;
     f.message   = text;
     f.messageyn = yn;
     f.ask       = ask;
 }
 
 fun items_in(menu: i32) i32 {
-    if (menu == MENU_MAIN)    { ret 6; }
+    if (menu == MENU_MAIN)    { ret 7; }
+    if (menu == MENU_COOP)    { ret 4; }
     if (menu == MENU_EPISODE) { ret 3; }
     if (menu == MENU_SKILL)   { ret 5; }
     if (menu == MENU_OPTIONS) { ret 3; }
@@ -243,9 +273,11 @@ fun items_in(menu: i32) i32 {
 }
 
 # the menu a menu goes back to
-fun parent_of(menu: i32) i32 {
-    if (menu == MENU_EPISODE || menu == MENU_OPTIONS || menu == MENU_READ1) { ret MENU_MAIN; }
+fun parent_of(f: *Front, menu: i32) i32 {
+    if (menu == MENU_EPISODE || menu == MENU_OPTIONS || menu == MENU_READ1 || menu == MENU_COOP) { ret MENU_MAIN; }
+    if (menu == MENU_SKILL && f.coopplayers != 0)                          { ret MENU_COOP; }
     if (menu == MENU_SKILL)                                                 { ret MENU_EPISODE; }
+    if (menu == MENU_CODE)                                                  { ret MENU_COOP; }
     if (menu == MENU_SOUND)                                                 { ret MENU_OPTIONS; }
     if (menu == MENU_READ2)                                                 { ret MENU_READ1; }
     ret -1;
@@ -289,16 +321,24 @@ fun choose(f: *Front, s: *game.Session) {
     val item: i32 = f.itemon[f.menu];
 
     if (f.menu == MENU_MAIN) {
+        if ((item == 0 || item == 1) && f.netgame) {
+            start_message(f, "you can't start a new game\nwhile in a network game.\n\nto leave it: options, end game.\n\npress a key.", 0, ASK_NONE);
+            ret;
+        }
         if (item == 0) {
-            f.menu = MENU_EPISODE;
+            f.coopplayers = 0;
+            f.menu        = MENU_EPISODE;
         }
         or (item == 1) {
+            f.menu = MENU_COOP;
+        }
+        or (item == 2) {
             f.menu = MENU_OPTIONS;
         }
-        or (item == 2 || item == 3) {
+        or (item == 3 || item == 4) {
             start_message(f, "saving and loading games is not\nbuilt in this port yet.\n\npress a key.", 0, ASK_NONE);
         }
-        or (item == 4) {
+        or (item == 5) {
             f.menu = MENU_READ1;
         }
         or {
@@ -319,7 +359,27 @@ fun choose(f: *Front, s: *game.Session) {
             start_message(f, "are you sure? this skill level\nisn't even remotely fair.\n\npress y or n.", 1, ASK_NIGHTMARE);
             ret;
         }
-        start_game(f, s, item, 1);
+        begin(f, s, item);
+    }
+    or (f.menu == MENU_COOP) {
+        if (item < 3) {
+            # a host chooses the skill next, on the usual menu
+            f.coopplayers = item + 2;
+            f.menu        = MENU_SKILL;
+        }
+        or {
+            f.codelen = 0;
+            f.code[0] = 0;
+            f.menu    = MENU_CODE;
+        }
+    }
+    or (f.menu == MENU_CODE) {
+        if (f.codelen < rp.CODELEN) {
+            sfx(s, info.SFX_OOF);
+            ret;
+        }
+        f.menuactive = 0;
+        f.netrequest = NET_JOIN;
     }
     or (f.menu == MENU_OPTIONS) {
         if (item == 0) {
@@ -344,6 +404,42 @@ fun choose(f: *Front, s: *game.Session) {
     }
 }
 
+# a skill was chosen: a game alone, or, for a host, a co-op game for the
+# game loop to start
+fun begin(f: *Front, s: *game.Session, skill: i32) {
+    if (f.coopplayers == 0) {
+        start_game(f, s, skill, 1);
+        ret;
+    }
+    f.menuactive  = 0;
+    f.netrequest  = NET_HOST;
+    f.netplayers  = f.coopplayers;
+    f.netskill    = skill;
+    f.coopplayers = 0;
+}
+
+# a key while the room code is being typed: one of its symbols, or
+# backspace to take one back; ret whether the key was used
+fun type_code(f: *Front, s: *game.Session, key: i32) bool {
+    if (key == KEY_BACKSPACE && f.codelen > 0) {
+        f.codelen         = f.codelen - 1;
+        f.code[f.codelen] = 0;
+        sfx(s, info.SFX_STNMOV);
+        ret 1;
+    }
+    if (key < 0x30 || key > 0x5a) { ret 0; }
+    val c: u8 = rp.code_char(key::u8);
+    if (c == 0 || f.codelen >= rp.CODELEN) {
+        sfx(s, info.SFX_OOF);
+        ret 1;
+    }
+    f.code[f.codelen] = c;
+    f.codelen         = f.codelen + 1;
+    f.code[f.codelen] = 0;
+    sfx(s, info.SFX_STNMOV);
+    ret 1;
+}
+
 # the answer to a yes-or-no message
 fun answer(f: *Front, s: *game.Session, yes: bool) {
     val ask: i32 = f.ask;
@@ -355,7 +451,7 @@ fun answer(f: *Front, s: *game.Session, yes: bool) {
         f.quit = 1;
     }
     or (ask == ASK_NIGHTMARE) {
-        start_game(f, s, f.skill, 1);
+        begin(f, s, f.skill);
     }
     or (ask == ASK_ENDGAME) {
         start_title(f);
@@ -390,6 +486,10 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
             open_menu(f, s);
             ret;
         }
+        # in a network game every machine must leave the intermission on the
+        # same tic, so only the commands every machine plays may hurry it
+        # (fire or use, in net_ticker), never a key on one machine
+        if (f.netgame) { ret; }
         if (f.mode == MODE_WI && (key == KEY_ENTER || key == KEY_SPACE)) { f.acceleratestage = 1; }
         if (f.mode == MODE_FINALE && f.finalestage == 1)                 { start_title(f); }
         ret;
@@ -397,6 +497,7 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
 
     val menu: i32 = f.menu;
     val n:    i32 = items_in(menu);
+    if (menu == MENU_CODE && type_code(f, s, key)) { ret; }
 
     if (key == KEY_DOWN) {
         for {
@@ -425,7 +526,7 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
         sfx(s, info.SFX_SWTCHX);
     }
     or (key == KEY_BACKSPACE) {
-        val parent: i32 = parent_of(menu);
+        val parent: i32 = parent_of(f, menu);
         if (parent < 0) {
             f.menuactive = 0;
         }
@@ -456,11 +557,48 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         y = 64;
         video.draw_patch(screen, 94, 2, video.patch(d, "M_DOOM"));
         video.draw_patch(screen, x, y, video.patch(d, "M_NGAME"));
-        video.draw_patch(screen, x, y + LINEHEIGHT, video.patch(d, "M_OPTION"));
-        video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_LOADG"));
-        video.draw_patch(screen, x, y + LINEHEIGHT * 3, video.patch(d, "M_SAVEG"));
-        video.draw_patch(screen, x, y + LINEHEIGHT * 4, video.patch(d, "M_RDTHIS"));
-        video.draw_patch(screen, x, y + LINEHEIGHT * 5, video.patch(d, "M_QUITG"));
+        # the game has no picture for co-op: the words, in the small font
+        video.write_text(d, screen, x + 2, y + LINEHEIGHT + 4, "CO-OP ONLINE", -1);
+        video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_OPTION"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 3, video.patch(d, "M_LOADG"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 4, video.patch(d, "M_SAVEG"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 5, video.patch(d, "M_RDTHIS"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 6, video.patch(d, "M_QUITG"));
+    }
+    or (f.menu == MENU_COOP) {
+        x = 72;
+        y = 64;
+        video.shade(d, screen, 16, 30, 288, 146, 26);
+        centred(d, screen, 40, "CO-OP ONLINE");
+        video.write_text(d, screen, x, y + 4, "HOST A GAME FOR 2", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT + 4, "HOST A GAME FOR 3", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 2 + 4, "HOST A GAME FOR 4", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 3 + 4, "JOIN WITH A ROOM CODE", -1);
+        centred(d, screen, 140, "THE HOST GETS A CODE TO GIVE THE OTHERS.");
+        centred(d, screen, 152, "EVERYONE NEEDS THE SAME DOWNLOAD.");
+        var line: [20]u8 = [20]u8{'T', 'H', 'I', 'S', ' ', 'C', 'O', 'P', 'Y', ':', ' ', ' ', 0, 0, 0, 0, 0, 0, 0, 0};
+        var k:    i32    = 0;
+        for (k < 6 && f.build[k] != 0) {
+            line[12 + k] = f.build[k];
+            k            = k + 1;
+        }
+        if (k > 0) { centred(d, screen, 164, ?line[0]); }
+    }
+    or (f.menu == MENU_CODE) {
+        var shown: [12]u8;
+        var k:     i32 = 0;
+        for (k < rp.CODELEN) {
+            shown[k * 2] = '_';
+            if (k < f.codelen) { shown[k * 2] = f.code[k]; }
+            shown[k * 2 + 1] = ' ';
+            k                = k + 1;
+        }
+        shown[11] = 0;
+        video.shade(d, screen, 28, 48, 264, 100, 26);
+        centred(d, screen, 60, "ENTER THE ROOM CODE");
+        centred(d, screen, 90, ?shown[0]);
+        centred(d, screen, 130, "ENTER TO JOIN, BACKSPACE TO ERASE");
+        ret;
     }
     or (f.menu == MENU_EPISODE) {
         x = 48;
@@ -512,6 +650,11 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
     or {
         video.draw_patch(screen, x + SKULLXOFF, y - 5 + f.itemon[f.menu] * LINEHEIGHT, video.patch(d, "M_SKULL2"));
     }
+}
+
+# a line of the small font, centred across the screen
+fun centred(d: *rdata.Data, screen: *u8, y: i32, text: str) {
+    video.write_text(d, screen, 160 - video.text_width(d, text) / 2, y, text, -1);
 }
 
 # M_DrawThermo: a slider
@@ -947,6 +1090,7 @@ pub fun ticker(f: *Front, s: *game.Session, bar: *st.State, input: *game.Input) 
 pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i32, map: i32) bool {
     f.menuactive = 0;
     if (!game.coop_game(s, players, me, skill, map)) { ret 0; }
+    f.netgame = 1;
     f.mode = MODE_LEVEL;
     level_song(f, s);
     ret 1;
@@ -1000,6 +1144,7 @@ pub fun net_ticker(f: *Front, s: *game.Session, bar: *st.State, cmds: *defs.Ticc
 
 # show a message, such as the network's state, until replaced or cleared
 pub fun notice(f: *Front, text: str) {
+    f.panel     = 1;
     f.message   = text;
     f.messageyn = 0;
     f.ask       = ASK_NONE;
@@ -1029,6 +1174,7 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
 
     # a message replaces the menu while it is up, as in the original
     if (f.message != nil) {
+        if (f.panel) { video.shade_behind(s.d, screen, f.message); }
         video.write_centred(s.d, screen, f.message);
     }
     or (f.menuactive) {

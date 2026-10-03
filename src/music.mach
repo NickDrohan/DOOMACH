@@ -3,8 +3,8 @@
 # The music lumps (D_E1M1 and the rest) are MUS, a compact cousin of MIDI
 # that id's sound library played. This walks a song 140 ticks a second and
 # turns each MUS event into the MIDI channel message it means, handing the
-# message to whatever plays it: the Windows MIDI synthesizer in a game, a
-# list in a test, a file for someone to listen to. The translation follows
+# message to whatever plays it: the OPL2 synthesizer (opl.mach) in a game or
+# a WAV file, a list in a test. The translation follows
 # the one every source port uses (mus2mid); the original drove the sound card
 # directly.
 
@@ -20,7 +20,7 @@ val CONTROLLERS: [10]u8 = [10]u8{0, 0x00, 0x01, 0x07, 0x0a, 0x0b, 0x5b, 0x5d, 0x
 val SYSTEM: [5]u8 = [5]u8{0x78, 0x7b, 0x7e, 0x7f, 0x79};
 
 # receives one MIDI channel message: status in the low byte, then the two
-# data bytes, as Windows' midiOutShortMsg takes them
+# data bytes, as Windows' midiOutShortMsg packs them
 pub def Out: fun(u32);
 
 pub rec Song {

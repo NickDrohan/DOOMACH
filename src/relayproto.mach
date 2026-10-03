@@ -1,0 +1,133 @@
+# the relay's wire format, shared by the relay and the game
+#
+# Every datagram between a game and the relay starts with a 16-byte header,
+# little-endian, written byte by byte:
+#
+#   0  magic "MDR1"
+#   4  kind
+#   5  slot      the sender (game to relay) or the original sender of DATA
+#                (relay to game)
+#   6  dest      for DATA, the player it is for
+#   7  zero
+#   8  token     the sender's session token (game to relay), or the
+#                receiver's (relay to game); 8 bytes
+#
+# then a body that depends on the kind. See RELAY.md for the protocol. This
+# module knows nothing about Doom: the relay forwards game packets without
+# reading them.
+
+use std.types.bool.bool;
+
+pub val HEADER: i32 = 16;
+
+# the version of this protocol and of the game's network behaviour; two
+# machines with different versions are refused at the door
+pub val VERSION: u8 = 1;
+
+# game to relay
+pub val CREATE: u8 = 1;
+pub val JOIN:   u8 = 2;
+pub val STATUS: u8 = 5;
+pub val LEAVE:  u8 = 9;
+
+# relay to game
+pub val WELCOME: u8 = 3;
+pub val REFUSED: u8 = 4;
+pub val LOBBY:   u8 = 6;
+pub val START:   u8 = 7;
+pub val GONE:    u8 = 10;
+
+# both ways
+pub val DATA: u8 = 8;
+
+# why a create or join was refused
+pub val NO_ROOM:      u8 = 1;
+pub val ROOM_FULL:    u8 = 2;
+pub val STARTED:      u8 = 3;
+pub val WAD_MISMATCH: u8 = 4;
+pub val OLD_VERSION:  u8 = 5;
+pub val BUSY:         u8 = 6;
+
+pub val CODELEN: i32 = 6;
+
+# the 28 symbols a room code is spelled with: no 0, 1, I or O, and none of
+# the digits that look like letters in the game's font (2 Z, 5 S, 6 G, 8 B);
+# the first real code read aloud was misread exactly so
+pub val SYMBOLS:  i32 = 28;
+pub val ALPHABET: [28]u8 = [28]u8{
+    '3', '4', '7', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K',
+    'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'
+};
+
+pub fun put16(p: *u8, at: i32, v: u32) {
+    p[at]     = (v & 0xff)::u8;
+    p[at + 1] = ((v >> 8) & 0xff)::u8;
+}
+
+pub fun put32(p: *u8, at: i32, v: u32) {
+    p[at]     = (v & 0xff)::u8;
+    p[at + 1] = ((v >> 8) & 0xff)::u8;
+    p[at + 2] = ((v >> 16) & 0xff)::u8;
+    p[at + 3] = ((v >> 24) & 0xff)::u8;
+}
+
+pub fun put64(p: *u8, at: i32, v: u64) {
+    put32(p, at, (v & 0xffffffff)::u32);
+    put32(p, at + 4, (v >> 32)::u32);
+}
+
+pub fun get32(p: *u8, at: i32) u32 {
+    ret p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24);
+}
+
+pub fun get64(p: *u8, at: i32) u64 {
+    ret get32(p, at)::u64 | (get32(p, at + 4)::u64 << 32);
+}
+
+# write a header; ret where the body starts
+pub fun header(p: *u8, kind: u8, slot: i32, dest: i32, token: u64) i32 {
+    p[0] = 'M';
+    p[1] = 'D';
+    p[2] = 'R';
+    p[3] = '1';
+    p[4] = kind;
+    p[5] = slot::u8;
+    p[6] = dest::u8;
+    p[7] = 0;
+    put64(p, 8, token);
+    ret HEADER;
+}
+
+# whether a datagram starts with this protocol's header
+pub fun is_relay(p: *u8, len: i32) bool {
+    ret len >= HEADER && p[0] == 'M' && p[1] == 'D' && p[2] == 'R' && p[3] == '1';
+}
+
+# whether a character could be part of a room code; lower case is accepted
+# and read as upper
+pub fun code_char(c_in: u8) u8 {
+    var c: u8 = c_in;
+    if (c >= 'a' && c <= 'z') { c = c - 32; }
+    # a digit that looks like a letter is that letter
+    if (c == '2') { c = 'Z'; }
+    if (c == '5') { c = 'S'; }
+    if (c == '6') { c = 'G'; }
+    if (c == '8') { c = 'B'; }
+    var i: i32 = 0;
+    for (i < SYMBOLS) {
+        if (ALPHABET[i] == c) { ret c; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test header__round_trip {
+    var p: [16]u8;
+    val at: i32 = header(?p[0], DATA, 2, 3, 0x0123456789abcdef);
+    if (at != 16 || !is_relay(?p[0], 16)) { ret 1; }
+    if (p[4] != DATA || p[5] != 2 || p[6] != 3) { ret 2; }
+    if (get64(?p[0], 8) != 0x0123456789abcdef) { ret 3; }
+    if (code_char('k') != 'K' || code_char('0') != 0 || code_char('O') != 0) { ret 4; }
+    if (code_char('5') != 'S' || code_char('2') != 'Z' || code_char('8') != 'B' || code_char('6') != 'G') { ret 5; }
+    ret 0;
+}

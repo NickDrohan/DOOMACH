@@ -1,0 +1,46 @@
+# The co-op relay and the download page on Fly.io. Deploy with deploy.sh,
+# which builds and stages what the image copies. UDP needs a dedicated IPv4
+# address and a process bound to fly-global-services; see RELAY.md.
+app = "mach-doom-relay"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# the relay
+[[services]]
+  protocol = "udp"
+  internal_port = 5029
+  # Fly's proxy cannot wake a stopped machine for UDP: keep it running
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 5029
+
+# the page, served by hedge; Fly ends TLS
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.tcp_checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

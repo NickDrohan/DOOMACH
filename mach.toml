@@ -10,11 +10,17 @@ isa = "x86_64"
 os  = "windows"
 abi = "win64"
 
+[target.linux-x86_64]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
 [artifact.doom]
 kind = "bin"
 entry = "root.mach"
 out = "bin/doom{artifact.suffix}"
-targets = ["*"]
+targets = ["windows-x86_64"]
+default = true
 link = ["kernel32", "user32", "gdi32", "winmm", "ws2_32"]
 need = []
 
@@ -41,6 +47,14 @@ os = ["windows"]
 isa = ["*"]
 abi = ["*"]
 export = false
+
+[artifact.relay]
+kind = "bin"
+entry = "relay.mach"
+out = "bin/relay{artifact.suffix}"
+targets = ["windows-x86_64", "linux-x86_64"]
+link = ["kernel32", "ws2_32"]
+need = []
 
 [link.ws2_32]
 source = "system"

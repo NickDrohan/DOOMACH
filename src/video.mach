@@ -134,6 +134,25 @@ fun glyph(d: *rdata.Data, c_in: i32) *u8 {
     ret numbered(d, "STCFN", c, 3);
 }
 
+# darken a rectangle of the screen through one of the light tables, as a
+# panel for words to stand out on
+# ---
+# level: 0 for full light to 31 for nearly black
+pub fun shade(d: *rdata.Data, screen: *u8, x: i32, y: i32, w: i32, h: i32, level: i32) {
+    var yy: i32 = y;
+    for (yy < y + h) {
+        var xx: i32 = x;
+        for (xx < x + w) {
+            if (xx >= 0 && xx < SCREENWIDTH && yy >= 0 && yy < SCREENHEIGHT) {
+                val at: i32 = yy * SCREENWIDTH + xx;
+                screen[at] = d.colormaps[level * 256 + screen[at]::i32];
+            }
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+}
+
 # the height of one line of the small font
 pub fun line_height(d: *rdata.Data) i32 {
     ret height(glyph(d, 'A')) + 1;
@@ -181,6 +200,26 @@ pub fun write_text(d: *rdata.Data, screen: *u8, x: i32, y: i32, s: str, count: i
         draw_patch(screen, cx, cy, g);
         cx = cx + width(g);
     }
+}
+
+# a dark panel the size of a message that write_centred will write
+pub fun shade_behind(d: *rdata.Data, screen: *u8, s: str) {
+    val lh:    i32 = line_height(d);
+    var lines: i32 = 1;
+    var wide:  i32 = 0;
+    var start: i32 = 0;
+    var i:     i32 = 0;
+    for {
+        if (s[i] == '\n' || s[i] == 0) {
+            val w: i32 = text_width(d, ?s[start]);
+            if (w > wide) { wide = w; }
+            if (s[i] == 0) { brk; }
+            lines = lines + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    shade(d, screen, 160 - wide / 2 - 12, 100 - lines * lh / 2 - 10, wide + 24, lines * lh + 18, 26);
 }
 
 # the menus' messages: each line centred, the block centred on the screen

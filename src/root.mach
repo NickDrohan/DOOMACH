@@ -20,9 +20,12 @@
 use std.allocator;
 use std.allocator.page;
 use fs: std.filesystem;
+use std.collections.vector.Vector;
 use std.print;
 use std.runtime;
 use std.text.parse;
+use std.process.env;
+use std.crypto.hash.sha256;
 use std.types.bool.bool;
 use std.types.error.err;
 use std.types.option.opt;
@@ -36,8 +39,11 @@ use doom.front;
 use doom.game;
 use doom.level;
 use doom.music;
+use doom.opl;
 use doom.net;
 use doom.random;
+use doom.relaycore;
+use doom.relayproto;
 use doom.rdata;
 use doom.render;
 use doom.sound;
@@ -55,13 +61,17 @@ val EXIT_DATA:   i64 = 4;
 val EXIT_WRITE:  i64 = 5;
 val EXIT_WINDOW: i64 = 6;
 
+# the relay a game started from the menu meets the others through, unless
+# --relay or DOOM_RELAY names another
+val DEFAULT_RELAY: str = "mach-doom-relay.fly.dev";
+
 fun usage() i64 {
     print.eprintln("usage: doom wad <file>");
     print.eprintln("       doom map <file> <name>");
     print.eprintln("       doom frame <file> <name> <out.ppm> [<x> <y> <degrees>]");
     print.eprintln("       doom play <file> [<map 1-9> [<skill 1-5>]]");
-    print.eprintln("       doom host <file> [<players 2-4> [<map 1-9> [<skill 1-5>]]]");
-    print.eprintln("       doom join <file> <address>");
+    print.eprintln("       doom host <file> [<players 2-4> [<map 1-9> [<skill 1-5>]]] [--relay <address>]");
+    print.eprintln("       doom join <file> <address or room code> [--relay <address>]");
     print.eprintln("       doom demo <file> <lump> [<every>]");
     print.eprintln("       doom wav <file> <lump> <out.wav>");
     ret EXIT_USAGE;
@@ -283,31 +293,66 @@ fun play_net(argc: i64, argv: **u8, hosting: bool) i64 {
     if (sel got.err) { ret EXIT_DATA; }
     val n: *net.Net = got.ok;
 
-    if (hosting) {
-        # a last word "local" listens on this machine only, for trying it out
-        val local: bool = str_equals(argv[argc - 1], "local");
-        if (!net.open(n, net.PORT, local)) {
-            print.eprintlnf("doom: port {} could not be opened; is another game hosting?", net.PORT);
-            ret EXIT_WINDOW;
+    # the words after the WAD: numbers in order, --relay <where>, local
+    var numbers: [3]i64 = [3]i64{2, 1, 3};
+    var count:   i32    = 0;
+    var target:  str    = nil;
+    var local:   bool   = 0;
+    var i:       i64    = 3;
+    for (i < argc) {
+        if (str_equals(argv[i], "--relay")) {
+            i = i + 2;
+            cnt;
         }
-        var players: i64 = 2;
-        var map:     i64 = 1;
-        var skill:   i64 = 3;
-        if (argc >= 4)   { players = number(argv[3], 2); }
-        if (argc >= 5)   { map = number(argv[4], 1); }
-        if (argc >= 6)   { skill = number(argv[5], 3); }
+        if (str_equals(argv[i], "local")) {
+            local = 1;
+        }
+        or (hosting && count < 3) {
+            numbers[count] = number(argv[i], numbers[count]);
+            count          = count + 1;
+        }
+        or (!hosting && target == nil) {
+            target = argv[i];
+        }
+        i = i + 1;
+    }
+
+    # through a relay when one is named, or when joining by code
+    var relay:    net.Peer;
+    val joincode: bool = !hosting && target != nil && is_code(target);
+    val found: i32 = find_relay(argc, argv, ?relay);
+    if (found < 0) {
+        print.eprintln("doom: the relay's name could not be looked up");
+        ret EXIT_USAGE;
+    }
+    if (joincode && found == 0) {
+        print.eprintln("doom: joining by code needs a relay: add --relay <address> or set DOOM_RELAY");
+        ret EXIT_USAGE;
+    }
+
+    # only a host that others reach directly needs the known port
+    var port: u16 = net.PORT;
+    if (!hosting || found == 1) { port = 0; }
+    if (!net.open(n, port, local)) {
+        print.eprintlnf("doom: port {} could not be opened; is another game hosting?", net.PORT);
+        ret EXIT_WINDOW;
+    }
+
+    if (hosting) {
+        var players: i64 = numbers[0];
         if (players < 2) { players = 2; }
         if (players > 4) { players = 4; }
-        net.host(n, players::i32, (skill - 1)::i32, map::i32);
+        net.host(n, players::i32, (numbers[2] - 1)::i32, numbers[1]::i32);
+        if (found == 1) { net.use_relay(n, ?relay); }
     }
     or {
-        if (argc < 4) { ret usage(); }
-        if (!net.open(n, 0, 0)) {
-            print.eprintln("doom: a network port could not be opened");
-            ret EXIT_WINDOW;
+        if (target == nil) { ret usage(); }
+        if (joincode) {
+            net.use_relay(n, ?relay);
+            net.join_code(n, target);
         }
-        if (!net.join(n, argv[3])) {
-            print.eprintln("doom: that is not an address; give it as 192.168.1.20 or 192.168.1.20:5029");
+        or (!net.join(n, target)) {
+            print.eprintln("doom: that is neither an address nor a room code; give it as 192.168.1.20 or KQ7M2T");
             ret EXIT_USAGE;
         }
     }
@@ -316,7 +361,42 @@ fun play_net(argc: i64, argv: **u8, hosting: bool) i64 {
     ret code;
 }
 
-fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
+# where the relay is for a game started from the menu: as the command line
+# or DOOM_RELAY says, or the default
+fun menu_relay(argc: i64, argv: **u8, out: *net.Peer) bool {
+    val found: i32 = find_relay(argc, argv, out);
+    if (found != 0) { ret found == 1; }
+    if (!win.resolve_ipv4(DEFAULT_RELAY, ?out.octets[0])) { ret 0; }
+    out.port  = net.PORT;
+    out.known = 1;
+    ret 1;
+}
+
+# set up the co-op game the menu asked for, to host or to join by code
+# ---
+# ret: nil, or why it could not start, for the screen
+fun start_menu_net(argc: i64, argv: **u8, n: *net.Net, request: i32, f: *front.Front, wadhash: u64) str {
+    if (n == nil) { ret "there is not enough memory for a network game.\n\n(press a key)"; }
+    var blank: net.Net;
+    @n = blank;
+    var relay: net.Peer;
+    if (!menu_relay(argc, argv, ?relay)) {
+        ret "the relay could not be found.\nis this computer online?\n\n(press a key)";
+    }
+    if (!net.open(n, 0, 0)) { ret "the network could not be opened.\n\n(press a key)"; }
+    n.wadhash = wadhash;
+    if (request == front.NET_HOST) {
+        net.host(n, f.netplayers, f.netskill, 1);
+        net.use_relay(n, ?relay);
+    }
+    or {
+        net.use_relay(n, ?relay);
+        net.join_code(n, ?f.code[0]);
+    }
+    ret nil;
+}
+
+fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     var a:    allocator.Allocator;
     val made: err[allocator.Error] = page.make(?a);
     if (sel made.err) { ret EXIT_WAD; }
@@ -331,6 +411,13 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
         ret EXIT_DATA;
     }
     var d: rdata.Data = graphics.ok;
+
+    # the network game: one set up on the command line, or one the menu
+    # starts later, which leaves back to the title screen when it is over
+    var n:       *net.Net = given;
+    var menunet: *net.Net = nil;
+    val wadhash: u64      = game_hash(?a, ?w);
+    if (n != nil) { n.wadhash = wadhash; }
 
     val got: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
     if (sel got.err) { ret EXIT_DATA; }
@@ -350,12 +437,16 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
 
     var f: front.Front;
     front.init(?f);
+    build_code(wadhash, ?f.build[0]);
 
-    # a network game starts on a waiting screen
+    # a network game starts on a waiting screen, whose words change as the
+    # lobby fills
+    var waitbuf: [256]u8;
     if (n != nil) {
         f.mode        = front.MODE_FINALE;
         f.finalestage = 1;
-        front.notice(?f, "waiting for the other players...\n\n(esc to give up)");
+        waiting_text(n, ?waitbuf[0]);
+        front.notice(?f, ?waitbuf[0]);
     }
 
     # a map and skill on the command line skip the title screen
@@ -377,7 +468,7 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
     var song:       music.Song;
     var songserial: i32  = -1;
     var musvolume:  i32  = -1;
-    val hasmidi:    bool = win.midi_open();
+    val hasmusic:   bool = opl_init(?w);
     win.fine_timer(1);
 
     var bar:     st.State;
@@ -386,20 +477,64 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
 
     var gametic:    i32  = 0;
     var netstarted: bool = 0;
+    var stalled:    bool = 0;
+    var reported:   bool = 0;
+    var progress:   i64  = 0;
     val tic:        i64  = 1000000 / 35;
     var next:       i64  = win.micros(?window);
     var musicclock: i64  = next;
     for (win.pump(?window) && !f.quit) {
         # keys that act once when pressed: the menus, and the weapon keys
-        val key: i32 = win.take_key();
-        if (n != nil && !netstarted && key == front.KEY_ESCAPE) { brk; }
-        if (key != 0 && (n == nil || netstarted)) {
+        val key:     i32  = win.take_key();
+        val stopped: bool = n != nil && (!netstarted || stalled || n.desync || n.quit);
+        if (key != 0 && !stopped) {
             val playing: bool = f.mode == front.MODE_LEVEL && !f.menuactive && f.message == nil;
             if (playing && key >= '1' && key <= '7') {
                 weapon = key - '0';
             }
             or {
                 front.responder(?f, s, key);
+            }
+        }
+
+        # a network game is left with Esc while waiting or once it has
+        # stopped, or with the menu's End Game
+        if (n != nil && ((stopped && key == front.KEY_ESCAPE) || (netstarted && f.mode == front.MODE_PAGE))) {
+            if (given != nil) { brk; }
+            net.close(n);
+            n          = nil;
+            netstarted = 0;
+            stalled    = 0;
+            reported   = 0;
+            gametic    = 0;
+            front.to_title(?f);
+            f.message = nil;
+            cnt;
+        }
+
+        # the menu asked for a co-op game: reach the relay and wait there
+        if (f.netrequest != 0) {
+            val request: i32 = f.netrequest;
+            f.netrequest = 0;
+            if (n == nil && menunet == nil) {
+                val room: res[*net.Net, allocator.Error] = allocator.zallocate[net.Net](?a, 1);
+                if (sel room.ok) { menunet = room.ok; }
+            }
+            if (n == nil) {
+                val why: str = start_menu_net(argc, argv, menunet, request, ?f, wadhash);
+                if (why == nil) {
+                    n             = menunet;
+                    netstarted    = 0;
+                    stalled       = 0;
+                    gametic       = 0;
+                    f.mode        = front.MODE_FINALE;
+                    f.finalestage = 1;
+                    waiting_text(n, ?waitbuf[0]);
+                    front.notice(?f, ?waitbuf[0]);
+                }
+                or {
+                    front.notice(?f, why);
+                }
             }
         }
 
@@ -430,8 +565,13 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
                 if (!netstarted) {
                     if (net.gather(n)) {
                         netstarted = 1;
+                        progress   = now;
                         if (!front.start_coop(?f, s, n.players, n.me, n.skill, n.map)) { f.quit = 1; }
                         f.message = nil;
+                    }
+                    or {
+                        waiting_text(n, ?waitbuf[0]);
+                        front.notice(?f, ?waitbuf[0]);
                     }
                 }
                 or {
@@ -444,14 +584,28 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
                         net.add_command(n, ?cmd);
                     }
                     net.send_commands(n, gametic - 1);
-                    for (net.ready(n, gametic)) {
+                    for (!n.desync && !n.quit && !stalled && net.due(n, gametic) && net.ready(n, gametic)) {
                         var cmds: [4]defs.Ticcmd;
                         net.commands(n, gametic, ?cmds[0]);
                         front.net_ticker(?f, s, ?bar, ?cmds[0]);
                         net.record(n, gametic, game.checksum(s));
-                        gametic = gametic + 1;
+                        gametic  = gametic + 1;
+                        progress = now;
                     }
-                    if (n.desync) { front.notice(?f, "the games have gone out of step.\n\nthis one has stopped. (esc)"); }
+                    net.pace(n, gametic);
+                    # ten seconds with no tic from someone: say so, rather
+                    # than wait forever
+                    if (!stalled && !n.desync && !n.quit && now - progress > 10000000) {
+                        stalled = 1;
+                        front.notice(?f, "a player has stopped answering.\n\nthe game cannot go on without them. (esc)");
+                    }
+                    if (n.desync) {
+                        front.notice(?f, "the games have gone out of step.\nthis one has stopped. a report is in\ndoom-desync.txt beside doom.exe. (esc)");
+                        if (!reported) {
+                            desync_report(n, s, f.mode, gametic);
+                            reported = 1;
+                        }
+                    }
                     if (n.quit)   { front.notice(?f, "another player has left the game.\n\n(esc)"); }
                 }
             }
@@ -459,16 +613,14 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
             next  = next + tic;
             steps = steps + 1;
         }
-        # in a network game Esc on a stopped game leaves
-        if (n != nil && (n.desync || n.quit) && key == front.KEY_ESCAPE) { brk; }
         if (now >= next)                                                 { next = now; }
-        win.audio_pump(?audio, sound.mix);
+        win.audio_pump(?audio, mix_all);
 
         # the song the front end wants, at the volume the menu sets
-        if (hasmidi) {
+        if (hasmusic) {
             if (songserial != f.songserial) {
                 songserial = f.songserial;
-                music.stop(?song, win.midi_send);
+                music.stop(?song, opl.midi);
                 val found: opt[u32] = wad.find(?w, ?f.song[0]);
                 if (sel found.some) {
                     val looping: bool = f.song[2] != 'I' || f.song[3] != 'N' || f.song[4] != 'T' || f.song[5] != 'R';
@@ -478,13 +630,13 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
             }
             if (musvolume != f.musicvolume) {
                 musvolume = f.musicvolume;
-                music.set_volume(?song, musvolume * 127 / 15, win.midi_send);
+                music.set_volume(?song, musvolume * 127 / 15, opl.midi);
             }
             # music ticks are 1/140 s; carry the remainder so none are lost
             val ticks: i64 = (now - musicclock) * music.TICRATE::i64 / 1000000;
             if (ticks > 0) {
                 musicclock = musicclock + ticks * 1000000 / music.TICRATE::i64;
-                music.advance(?song, ticks::u32, win.midi_send);
+                music.advance(?song, ticks::u32, opl.midi);
             }
         }
 
@@ -503,8 +655,8 @@ fun play_with(argc: i64, argv: **u8, n: *net.Net) i64 {
             win.nap(1);
         }
     }
-    music.stop(?song, win.midi_send);
-    win.midi_close();
+    if (n != nil && given == nil) { net.close(n); }
+    music.stop(?song, opl.midi);
     win.fine_timer(0);
     win.audio_close(?audio);
     win.close(?window);
@@ -725,8 +877,21 @@ fun wav(argv: **u8) i64 {
         done = done + 1;
     }
 
-    # the 44-byte header of a 16-bit stereo PCM file
-    val data:   u32 = (done * per * 4)::u32;
+    val data: u32 = (done * per * 4)::u32;
+    wav_header(out, data);
+
+    val wrote: err[fs.FsError] = fs.write_bytes(argv[4], out, (44 + data)::usize, 0o644);
+    if (sel wrote.err) {
+        print.eprintln("doom: the sound could not be written");
+        ret EXIT_WRITE;
+    }
+    val p: *defs.Player = ?s.g.players[0];
+    print.printlnf("end tic {} sum {} health {} kills {}", s.g.gametic, game.checksum(s), p.health, p.killcount);
+    ret EXIT_OK;
+}
+
+# the 44-byte header of a 16-bit stereo PCM file at the mixing rate
+fun wav_header(out: *u8, data: u32) {
     val header: str = "RIFF....WAVEfmt ";
     var i:      i32 = 0;
     for (i < 16) {
@@ -744,14 +909,135 @@ fun wav(argv: **u8) i64 {
     out[38] = 't';
     out[39] = 'a';
     put32(out, 40, data);
+}
 
-    val wrote: err[fs.FsError] = fs.write_bytes(argv[4], out, (44 + data)::usize, 0o644);
+# a number as decimal text, at a place in a buffer; ret where it ends
+fun append_number(buf: *u8, at: i32, value: i64) i32 {
+    var digits: [24]u8;
+    var n:      i32 = 0;
+    var v:      i64 = value;
+    var end:    i32 = at;
+    if (v < 0) {
+        buf[end] = '-';
+        end      = end + 1;
+        v        = -v;
+    }
+    for {
+        digits[n] = ('0' + (v % 10)::i32)::u8;
+        n         = n + 1;
+        v         = v / 10;
+        if (v == 0) { brk; }
+    }
+    for (n > 0) {
+        n        = n - 1;
+        buf[end] = digits[n];
+        end      = end + 1;
+    }
+    buf[end] = 0;
+    ret end;
+}
+
+# when the games go out of step, a few lines about where, beside the
+# program, for a player to send to whoever can look into it
+fun desync_report(n: *net.Net, s: *game.Session, mode: i32, gametic: i32) {
+    var path: [512]u8;
+    if (!win.beside_exe("doom-desync.txt", ?path[0])) { ret; }
+    var text: [256]u8;
+    var at:   i32 = append(?text[0], 0, "doom in mach: the games went out of step\r\nat tic ");
+    at = append_number(?text[0], at, n.desynctic::i64);
+    at = append(?text[0], at, " (this game had played ");
+    at = append_number(?text[0], at, gametic::i64);
+    at = append(?text[0], at, ")\r\nplayer ");
+    at = append_number(?text[0], at, (n.me + 1)::i64);
+    at = append(?text[0], at, " of ");
+    at = append_number(?text[0], at, n.players::i64);
+    at = append(?text[0], at, ", against player ");
+    at = append_number(?text[0], at, (n.against + 1)::i64);
+    at = append(?text[0], at, "\r\nmap E1M");
+    at = append_number(?text[0], at, s.g.gamemap::i64);
+    at = append(?text[0], at, ", screen ");
+    at = append_number(?text[0], at, mode::i64);
+    at = append(?text[0], at, "\r\nmine ");
+    at = append_number(?text[0], at, n.mysum::i64);
+    at = append(?text[0], at, " theirs ");
+    at = append_number(?text[0], at, n.theirsum::i64);
+    at = append(?text[0], at, "\r\nbuild ");
+    var code: [7]u8;
+    build_code(n.wadhash, ?code[0]);
+    at = append(?text[0], at, ?code[0]);
+    at = append(?text[0], at, "\r\n");
+    fs.write_bytes(?path[0], ?text[0], at::usize, 0o644);
+}
+
+# the sound effects and the music, into one stretch of the output
+fun mix_all(out: *i16, frames: i32) {
+    sound.mix(out, frames);
+    opl.mix(out, frames, sound.RATE);
+}
+
+# the instruments for the music synthesizer, from the WAD
+fun opl_init(w: *wad.Wad) bool {
+    val found: opt[u32] = wad.find(w, "GENMIDI");
+    if (sel found.none) { ret 0; }
+    ret opl.init(wad.bytes(w, found.some), wad.lump(w, found.some).size);
+}
+
+# play a song through the music synthesizer into a WAV file, as the game
+# would at the menu's default music volume
+#
+#   doom muswav <wad> <song> <out.wav> <seconds>
+fun muswav(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    if (!opl_init(?w)) {
+        print.eprintln("doom: the WAD has no GENMIDI instruments");
+        ret EXIT_DATA;
+    }
+    val found: opt[u32] = wad.find(?w, argv[3]);
+    if (sel found.none) {
+        print.eprintln("doom: no such lump");
+        ret EXIT_MAP;
+    }
+    var song: music.Song;
+    if (!music.load(?song, wad.bytes(?w, found.some), wad.lump(?w, found.some).size, 1)) {
+        print.eprintln("doom: not a MUS lump");
+        ret EXIT_DATA;
+    }
+    music.set_volume(?song, 8 * 127 / 15, opl.midi);
+
+    var seconds: i32 = number(argv[5], 30)::i32;
+    if (seconds < 1)   { seconds = 1; }
+    if (seconds > 600) { seconds = 600; }
+    val frames: i32                       = sound.RATE * seconds;
+    val buffer: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, (44 + frames * 4)::usize);
+    if (sel buffer.err) { ret EXIT_WRITE; }
+    val out: *u8 = buffer.ok;
+
+    # a music tick at a time: 140 a second, the frames between them carried
+    # so that none are lost
+    var done:  i32 = 0;
+    var carry: i32 = 0;
+    music.advance(?song, 0, opl.midi);
+    for (done < frames) {
+        carry = carry + sound.RATE;
+        var n: i32 = carry / music.TICRATE;
+        carry = carry % music.TICRATE;
+        if (done + n > frames) { n = frames - done; }
+        opl.mix((?out[44 + done * 4]):~*i16, n, sound.RATE);
+        done = done + n;
+        music.advance(?song, 1, opl.midi);
+    }
+    wav_header(out, (frames * 4)::u32);
+    val wrote: err[fs.FsError] = fs.write_bytes(argv[4], out, (44 + frames * 4)::usize, 0o644);
     if (sel wrote.err) {
-        print.eprintln("doom: the sound could not be written");
+        print.eprintln("doom: the music could not be written");
         ret EXIT_WRITE;
     }
-    val p: *defs.Player = ?s.g.players[0];
-    print.printlnf("end tic {} sum {} health {} kills {}", s.g.gametic, game.checksum(s), p.health, p.killcount);
     ret EXIT_OK;
 }
 
@@ -892,6 +1178,127 @@ fun script(argc: i64, argv: **u8) i64 {
     }
     print.printlnf("mode {} map E{}M{} tic {} shots {}", f.mode, s.g.gameepisode, s.g.gamemap, s.g.gametic, shots);
     ret EXIT_OK;
+}
+
+# the first eight bytes of the WAD's SHA-256, which every machine in a network
+# game must share
+fun first64(data: *u8, len: usize) u64 {
+    var digest: [32]u8;
+    sha256.hash(data, len, ?digest[0]);
+    var h: u64 = 0;
+    var k: i32 = 0;
+    for (k < 8) {
+        h = (h << 8) | digest[k]::u64;
+        k = k + 1;
+    }
+    ret h;
+}
+
+# what two machines must share to play together: this program and its WAD,
+# hashed, so that two different downloads are turned away at the door rather
+# than going out of step later. The program's part is 0 if it cannot be read.
+fun game_hash(a: *allocator.Allocator, w: *wad.Wad) u64 {
+    var exe:  [512]u8;
+    var mine: u64 = 0;
+    if (win.exe_path(?exe[0])) {
+        val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?exe[0]);
+        if (sel bytes.ok) { mine = first64(bytes.ok.data, bytes.ok.len); }
+    }
+    ret first64(w.data, w.len) ^ (mine * 0x9e3779b97f4a7c15);
+}
+
+# a hash as six hex digits, for people to compare by eye
+fun build_code(h: u64, out: *u8) {
+    val digits: str = "0123456789ABCDEF";
+    var k: i32 = 0;
+    for (k < 6) {
+        out[k] = digits[((h >> (60 - k * 4)::u64) & 15)::i32];
+        k      = k + 1;
+    }
+    out[6] = 0;
+}
+
+# copy a string into a buffer; ret where it ends
+fun append(buf: *u8, at: i32, text: str) i32 {
+    var k: i32 = 0;
+    for (text[k] != 0 && at + k < 255) {
+        buf[at + k] = text[k];
+        k           = k + 1;
+    }
+    buf[at + k] = 0;
+    ret at + k;
+}
+
+# the waiting screen's words for where a network game has got to
+fun waiting_text(n: *net.Net, buf: *u8) {
+    var at: i32 = 0;
+    if (n.refused != 0) {
+        at = append(buf, at, net.refusal(n));
+        at = append(buf, at, "\n\n(esc)");
+        ret;
+    }
+    if (n.relaymode && n.token != 0) {
+        at = append(buf, at, "room code  ");
+        at = append(buf, at, ?n.code[0]);
+        at = append(buf, at, "\n\n");
+        if (n.host) { at = append(buf, at, "give the others this code.\n\n"); }
+        var count: [12]u8 = [12]u8{'p', 'l', 'a', 'y', 'e', 'r', 's', ' ', '0', '/', '0', 0};
+        count[8]  = ('0' + n.joined)::u8;
+        count[10] = ('0' + n.players)::u8;
+        at = append(buf, at, ?count[0]);
+        at = append(buf, at, "\n\n(esc to give up)");
+        ret;
+    }
+    if (n.relaymode) {
+        at = append(buf, at, "reaching the relay...\n\n(esc to give up)");
+        ret;
+    }
+    at = append(buf, at, "waiting for the other players...\n\n(esc to give up)");
+}
+
+# where the relay is: a --relay on the command line, or DOOM_RELAY in the
+# environment; an address, or a host name with an optional :port
+fun find_relay(argc: i64, argv: **u8, out: *net.Peer) i32 {
+    var name: str = nil;
+    var i:    i64 = 3;
+    for (i + 1 < argc) {
+        if (str_equals(argv[i], "--relay")) { name = argv[i + 1]; }
+        i = i + 1;
+    }
+    var envbuf: [256]u8;
+    if (name == nil) {
+        val got: res[opt[usize], env.EnvError] = env.get("DOOM_RELAY", ?envbuf[0], 256);
+        if (sel got.ok) {
+            if (sel got.ok.some) { name = ?envbuf[0]; }
+        }
+    }
+    if (name == nil) { ret 0; }
+    if (net.parse_address(name, out)) { ret 1; }
+
+    # a name: split off a port, then ask Windows
+    var host: [256]u8;
+    var port: i64 = net.PORT::i64;
+    var k:    i32 = 0;
+    for (name[k] != 0 && name[k] != ':' && k < 255) {
+        host[k] = name[k];
+        k       = k + 1;
+    }
+    host[k] = 0;
+    if (name[k] == ':') { port = number(?name[k + 1], net.PORT::i64); }
+    if (!win.resolve_ipv4(?host[0], ?out.octets[0])) { ret -1; }
+    out.port  = port::u16;
+    out.known = 1;
+    ret 1;
+}
+
+# whether a word looks like a room code rather than an address
+fun is_code(text: str) bool {
+    var k: i32 = 0;
+    for (k < 6) {
+        if (text[k] == 0 || relayproto.code_char(text[k]) == 0) { ret 0; }
+        k = k + 1;
+    }
+    ret text[6] == 0;
 }
 
 # a player who wanders: mostly forward, turning now and then, firing in bursts
@@ -1047,6 +1454,8 @@ fun coop(argc: i64, argv: **u8) i64 {
 #
 #   doom netplay <file> host <players 2-4> <map 1-9> <tics> [<port>]
 #   doom netplay <file> join <address> <tics> [<port>]
+#   doom netplay <file> host <players> <map> <tics> 0 relay=<address>
+#   doom netplay <file> join <code> <tics> 0 relay=<address>
 #
 # a last word "corrupt" makes this machine alone draw one random number more
 # at tic 500, which the others must notice
@@ -1069,6 +1478,21 @@ fun netplay(argc: i64, argv: **u8) i64 {
 
     val hosting: bool = str_equals(argv[3], "host");
     val corrupt: bool = str_equals(argv[argc - 1], "corrupt");
+    # "paced" plays at 35 tics a second, one command a tic, as the window
+    # does, and counts the tics it had to wait for the others' commands
+    var paced: bool = 0;
+    # "levels" leaves E1M1 at tic 300 on every machine and plays on through
+    # the intermission into E1M2, as the window does; "press" makes this
+    # machine alone press Space on the intermission, as a player would
+    var levels: bool = 0;
+    var press:  bool = 0;
+    var word:   i64  = 4;
+    for (word < argc) {
+        if (str_equals(argv[word], "paced"))  { paced = 1; }
+        if (str_equals(argv[word], "levels")) { levels = 1; }
+        if (str_equals(argv[word], "press"))  { press = 1; }
+        word = word + 1;
+    }
     var tics:    i32  = 0;
     var port:    u16  = net.PORT;
     if (hosting) {
@@ -1082,15 +1506,43 @@ fun netplay(argc: i64, argv: **u8) i64 {
         port = 0;
     }
 
-    if (!net.open(n, port, 1)) {
+    # relay=<address> anywhere after the fixed words plays through a relay
+    var relay:   net.Peer;
+    var viarelay: bool = 0;
+    var arg:      i64  = 4;
+    for (arg < argc) {
+        val word: str = argv[arg];
+        if (word[0] == 'r' && word[1] == 'e' && word[2] == 'l' && word[3] == 'a' && word[4] == 'y' && word[5] == '=') {
+            if (!net.parse_address(?word[6], ?relay)) {
+                print.eprintln("doom: that relay is not an address");
+                ret EXIT_USAGE;
+            }
+            viarelay = 1;
+        }
+        arg = arg + 1;
+    }
+
+    # on this machine's loopback, unless the relay is out on the network
+    val local: bool = !viarelay || relay.octets[0] == 127;
+    if (!net.open(n, port, local)) {
         print.eprintln("doom: the network port could not be opened");
         ret EXIT_WINDOW;
     }
+    n.wadhash = game_hash(?a, ?w);
+
     if (hosting) {
         var players: i32 = number(argv[4], 2)::i32;
         if (players < 2) { players = 2; }
         if (players > 4) { players = 4; }
         net.host(n, players, defs.SK_MEDIUM, number(argv[5], 1)::i32);
+        if (viarelay) { net.use_relay(n, ?relay); }
+    }
+    or (viarelay) {
+        net.use_relay(n, ?relay);
+        if (!net.join_code(n, argv[4])) {
+            print.eprintln("doom: that is not a room code");
+            ret EXIT_USAGE;
+        }
     }
     or {
         if (!net.join(n, argv[4])) {
@@ -1099,12 +1551,22 @@ fun netplay(argc: i64, argv: **u8) i64 {
         }
     }
 
-    # wait up to twenty seconds for everyone
-    var waited: i32 = 0;
+    # wait up to twenty seconds for everyone; a host on a relay says its code
+    # as soon as it has one, for whoever is to join
+    val began:  i64  = win.micros_now();
+    var said:   bool = 0;
     for (!net.gather(n)) {
+        if (n.refused != 0) {
+            print.eprintln(net.refusal(n));
+            net.close(n);
+            ret EXIT_MAP;
+        }
+        if (n.relaymode && n.host && n.token != 0 && !said) {
+            print.printlnf("room {}", ?n.code[0]);
+            said = 1;
+        }
         win.nap(5);
-        waited = waited + 5;
-        if (waited > 20000) {
+        if (win.micros_now() - began > 20000000) {
             print.eprintln("doom: nobody came");
             net.close(n);
             ret EXIT_MAP;
@@ -1120,19 +1582,41 @@ fun netplay(argc: i64, argv: **u8) i64 {
     var bot: Bot;
     bot.seed = (n.me * 7919 + 17)::u32;
 
+    # the window's own ticker, for the levels test
+    var f: front.Front;
+    front.init(?f);
+    f.mode    = front.MODE_LEVEL;
+    f.netgame = 1;
+    var bar:     st.State;
+    var pressed: bool = 0;
+
     var gametic: i32 = 0;
-    var idle:    i32 = 0;
+    var last:    i64 = win.micros_now();
+    var due:     i64 = last;
+    var steps:   i32 = 0;
+    var waited:  i32 = 0;
+    var behind:  i32 = 0;
+    var waiting: i32 = 0;
+    var longest: i32 = 0;
+    if (paced) { win.fine_timer(1); }
     for (gametic < tics && !n.desync && !n.quit) {
+        if (paced) {
+            for (win.micros_now() < due) { win.nap(1); }
+            due = due + 1000000 / 35;
+        }
         net.receive(n);
         for (net.wants_command(n, gametic) && n.maketic < tics) {
             var cmd: defs.Ticcmd;
             bot_ticcmd(?bot, n.maketic, ?cmd);
             net.add_command(n, ?cmd);
+            if (paced) { brk; }
         }
         net.send_commands(n, gametic - 1);
+        val before: i32 = gametic;
 
         var ran: bool = 0;
-        for (gametic < tics && net.ready(n, gametic)) {
+        # every command made, the last tics are due without waiting for more
+        for (gametic < tics && (!paced || net.due(n, gametic) || n.maketic == tics) && net.ready(n, gametic)) {
             var cmds: [4]defs.Ticcmd;
             net.commands(n, gametic, ?cmds[0]);
             # the same forced death as `doom coop`, on every machine
@@ -1140,23 +1624,56 @@ fun netplay(argc: i64, argv: **u8) i64 {
             # for the test that the desync alarm works: this machine alone
             # draws one random number more
             if (corrupt && gametic == 500) { defs.p_random(?s.g); }
-            game.ticker_cmds(s, ?cmds[0]);
+            if (levels) {
+                if (gametic == 300) { s.g.exited = 1; }
+                if (press && !pressed && f.mode == front.MODE_WI) {
+                    front.responder(?f, s, front.KEY_SPACE);
+                    pressed = 1;
+                }
+                front.net_ticker(?f, s, ?bar, ?cmds[0]);
+            }
+            or {
+                game.ticker_cmds(s, ?cmds[0]);
+            }
             net.record(n, gametic, game.checksum(s));
             gametic = gametic + 1;
             ran     = 1;
         }
 
+        # a step of the clock on which a due tic could not run, once play has
+        # begun, is a stutter a player would see
+        if (paced && gametic < tics) {
+            val stuck: bool = net.due(n, gametic) || n.maketic == tics;
+            net.pace(n, gametic);
+            if (before > 0) {
+                steps = steps + 1;
+                if (stuck) { behind = behind + 1; }
+                if (stuck && !ran) {
+                    waited  = waited + 1;
+                    waiting = waiting + 1;
+                    if (waiting > longest) { longest = waiting; }
+                }
+                or {
+                    waiting = 0;
+                }
+            }
+        }
+
         if (ran) {
-            idle = 0;
+            last = win.micros_now();
         }
         or {
-            win.nap(1);
-            idle = idle + 1;
-            if (idle > 20000) {
+            if (!paced) { win.nap(1); }
+            if (win.micros_now() - last > 10000000) {
                 print.eprintln("doom: the other machines stopped answering");
                 brk;
             }
         }
+    }
+
+    if (paced) {
+        win.fine_timer(0);
+        print.printlnf("paced: {} steps, {} behind, {} frozen, longest freeze {} tics, cushion {} at most {}", steps, behind, waited, longest, n.playout, n.widest);
     }
 
     # keep answering for a moment, so that a peer a tic behind can finish
@@ -1170,6 +1687,7 @@ fun netplay(argc: i64, argv: **u8) i64 {
     net.close(n);
 
     if (n.desync) {
+        desync_report(n, s, front.MODE_LEVEL, gametic);
         print.printlnf("desync at tic {}", n.desynctic);
         ret EXIT_MAP;
     }
@@ -1184,8 +1702,35 @@ fun netplay(argc: i64, argv: **u8) i64 {
     ret EXIT_OK;
 }
 
+# started by a double click: play with the DOOM1.WAD in the same folder,
+# and say in a box what is wrong if it cannot
+fun clicked() i64 {
+    win.drop_console();
+    var path: [512]u8;
+    if (!win.beside_exe("DOOM1.WAD", ?path[0])) {
+        win.alert("This folder's path is too long. Move the doom folder somewhere shorter.");
+        ret EXIT_WAD;
+    }
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, ?path[0]);
+    if (sel loaded.err) {
+        win.alert("DOOM1.WAD was not found next to doom.exe, or it is damaged.\n\nKeep the two files together in one folder.");
+        ret EXIT_WAD;
+    }
+    var args: [3]*u8;
+    args[0] = ?path[0];
+    args[1] = "play";
+    args[2] = ?path[0];
+    val code: i64 = play_with(3, ?args[0], nil);
+    if (code != EXIT_OK) { win.alert("Doom could not open its window or read its graphics."); }
+    ret code;
+}
+
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
+    if (argc == 1 && win.started_by_click())                                  { ret clicked(); }
     if (argc == 3 && str_equals(argv[1], "wad"))                              { ret list(argv[2]); }
     if (argc == 4 && str_equals(argv[1], "map"))                              { ret dump(argv[2], argv[3]); }
     if ((argc == 5 || argc == 8) && str_equals(argv[1], "frame"))             { ret frame(argc, argv); }
@@ -1193,9 +1738,10 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc >= 6 && str_equals(argv[1], "coop"))                             { ret coop(argc, argv); }
     if (argc >= 4 && str_equals(argv[1], "script"))                           { ret script(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "mus"))                              { ret mus(argv); }
+    if (argc == 6 && str_equals(argv[1], "muswav"))                           { ret muswav(argv); }
     if (argc == 5 && str_equals(argv[1], "wav"))                              { ret wav(argv); }
-    if (argc >= 3 && argc <= 7 && str_equals(argv[1], "host"))                { ret play_net(argc, argv, 1); }
-    if (argc == 4 && str_equals(argv[1], "join"))                             { ret play_net(argc, argv, 0); }
+    if (argc >= 3 && argc <= 9 && str_equals(argv[1], "host"))                { ret play_net(argc, argv, 1); }
+    if (argc >= 4 && argc <= 6 && str_equals(argv[1], "join"))                             { ret play_net(argc, argv, 0); }
     if (argc >= 3 && argc <= 5 && str_equals(argv[1], "play"))                { ret play(argc, argv); }
     if ((argc == 4 || argc == 5 || argc == 7) && str_equals(argv[1], "demo")) { ret demo(argc, argv); }
     ret usage();

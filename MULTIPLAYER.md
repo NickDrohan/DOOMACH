@@ -6,7 +6,22 @@ is a reason for one. **Built 2026-10-02**; what is and is not done is under "Whe
 
 ## Playing it
 
-On the machine that hosts, and on each machine that joins (each needs the same `DOOM1.WAD`):
+Each machine needs the same `DOOM1.WAD`. The easy way is the menu: Esc, "Co-op online", then
+"Host a game for 2" (3, 4) and a skill, or "Join with a room code". The host's screen shows a
+six-character code to send the others. It goes through the relay at `mach-doom-relay.fly.dev`
+(see [RELAY.md](RELAY.md)), or the one `--relay` or `DOOM_RELAY` names; Options, End Game leaves,
+and the others are told. From the command line, the same through the relay:
+
+```
+doom host <wad> [<players 2-4> [<map 1-9> [<skill 1-5>]]] --relay mach-doom-relay.fly.dev
+doom join <wad> <ROOM CODE> --relay mach-doom-relay.fly.dev
+```
+
+The host's waiting screen shows a six-character room code; the others join with it. Setting
+`DOOM_RELAY=mach-doom-relay.fly.dev` once saves typing `--relay` each time.
+
+Directly, with no relay, on a LAN (or across the internet if the host's router forwards UDP
+5029):
 
 ```
 doom host <wad> [<players 2-4> [<map 1-9> [<skill 1-5>]]]      # waits on UDP port 5029
@@ -14,8 +29,8 @@ doom join <wad> <host address>                                 # e.g. 192.168.1.
 ```
 
 The window shows a waiting message until everyone is in, then every machine starts the same map
-together. Windows will ask once whether to let the host accept connections on port 5029; it has
-to, for the others to reach it. Across the internet the host's router must forward UDP 5029.
+together. Played directly, Windows asks once whether to let the host accept connections on port
+5029; it has to, for the others to reach it. Through the relay nothing listens, so nothing asks.
 
 ## Why co-op on these maps needs no rebalancing
 
@@ -51,8 +66,32 @@ this needs: a demo is a stream of ticcmds, and the port reproduces it to the bit
 2. waits until it holds every player's ticcmd for tic `N`;
 3. runs tic `N` with all of them, renders, and goes round again.
 
-`delay` is a couple of tics (about 60 ms) so that a command is usually on the wire before it is
-needed. On a LAN that is invisible; across the internet it sets the feel, and is a setting.
+Each machine makes one command a tic by its own clock, and plays a tic only once its own
+commands are a **playout cushion** past it (`net.due`). That gives the others' commands the
+cushion's time to arrive, so a tic is played on its step of the clock rather than whenever the
+last command happens to land. The cushion starts at 2 tics (57 ms), grows by one when a step has
+to wait (at most every quarter second, so a far player settles within a second or so), and
+shrinks by one after five seconds in which every command arrived at least two tics early. Each
+machine sizes its own; the cushion decides only when a tic is played, never what it computes,
+so it cannot put the games out of step. The price of a cushion is input lag: a press shows
+cushion + 1 tics later, about 140 ms for players 50 ms apart.
+
+Without it, the first version played each tic the moment it could, kept only one tic in hand,
+and froze a frame whenever a packet came more than a tic late: one step in five, measured with
+nothing but 20 ms of jitter. Measured through a relay holding every datagram for a fixed delay
+plus up to 20 ms (`relay --delay`), two paced players for 700 tics:
+
+| one way | frozen frames (of ~700) | longest freeze | cushion settled at |
+| --- | --- | --- | --- |
+| 0 ms | 0 | 0 | 2 |
+| 25 ms | 1 | 1 tic | 3 |
+| 50 ms | 2 to 3 | 1 tic | 4 |
+| 75 ms | 3 to 4 | 1 tic | 5 |
+| 100 ms | 6 to 8 | 1 tic | 6 |
+| 150 ms | 10 | 2 tics | 7 to 8 |
+
+The freezes are all in the first second, while the cushion grows to fit. A gate holds two paced
+players 60 to 80 ms apart to fewer than one frozen frame in twenty.
 
 ### Packets
 
@@ -121,16 +160,30 @@ later network bug into one that can be told apart from a simulation bug.
 | 3 | Player colours | **done**: indigo, brown, red | seen in a frame; not pinned |
 | 4 | Two games in one process, same commands, compared every tic | **done**: `doom coop` | gates: two players on E1M1, four on E1M3, debug and release |
 | 5 | The network layer | **done**: `net.mach` over `std.net.udp` | gates: host and joiner as two processes match the one-process run; a deliberate divergence is caught by both |
-| 6 | `doom host` and `doom join` in a window | **done** | by hand on one machine over loopback: both windows reach E1M1 together. **Not tried on two computers.** |
-| 7 | Intermission advancing on every player's commands | **done** (`front.net_ticker`); it shows the joining machine's own stats only | not gated |
+| 6 | `doom host` and `doom join` in a window | **done** | by hand on one machine over loopback; a windowed joiner joined by code through the deployed relay. **Not yet tried on two computers.** |
+| 7 | Intermission advancing on every player's commands | **done** (`front.net_ticker`); it shows the joining machine's own stats only | gate: two processes leave E1M1, cross the intermission and reach E1M2 in step |
 
 Four processes, a host and three joiners, ran 7,000 tics of E1M3 over loopback and all four ended
 on the same checksum as the one-process run.
 
-Not done from the plan: the start packet does not carry the WAD's hash, so two machines with
-different WADs would simply go out of step (and say so) rather than be turned away; there is no
-timeout or retry when a player's machine vanishes mid-game beyond the "another player has left"
-message on a clean quit.
+**The first real game, 2026-10-03,** two players in different places through the relay, went
+out of step as E1M2 began. Enter or Space on the intermission hurried that machine's intermission
+alone: a key read by one machine, outside the commands every machine plays, so one machine began
+E1M2 tics before the other. In a network game only fire and use, which travel in the commands,
+now hurry it, and the end-of-episode text likewise ignores a local key. The level gate had run in
+one process, where both games saw the same key; it now runs as two processes with one of them
+pressing Space, which reproduced "desync at tic 335" before the fix. An audit of everything
+else one machine does alone (status bar, sound, rendering, menus) found nothing else that
+reaches the game: they read the world and keep their own random sequences.
+
+If a game ever goes out of step again, each machine writes `doom-desync.txt` beside `doom.exe`:
+the tic, the map, the screen, both checksums and the build.
+
+A joiner with a different WAD or build is turned away with the reason, directly and through the
+relay: the hello, create and join carry a hash of the WAD and of `doom.exe` itself, so two
+downloads of different builds cannot play together and go out of step later. The co-op menu
+shows the first six hex digits as "this copy", for players to compare. A player whose machine vanishes
+mid-game stops the others after ten seconds with "a player has stopped answering".
 
 ## Deliberately not in this plan
 

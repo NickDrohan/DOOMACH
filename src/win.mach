@@ -128,7 +128,10 @@ ext fun StretchDIBits(hdc: isize, xd: i32, yd: i32, wd: i32, hd: i32, xs: i32, y
 # what the window procedure has seen since the window opened. Windows calls
 # the procedure with no argument of ours, so this has to be module state.
 var closed:  bool;
-var lastkey: i32;
+# keys pressed and not yet taken, oldest first; a full queue drops new ones
+var keys:     [16]i32;
+var keyfirst: i32;
+var keycount: i32;
 
 fun window_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) isize {
     if (msg == WM_CLOSE || msg == WM_DESTROY) {
@@ -137,7 +140,10 @@ fun window_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) isize {
     }
     if (msg == WM_KEYDOWN) {
         # bit 30 of lparam is set for auto-repeat; only first presses count
-        if ((lparam & 0x40000000) == 0) { lastkey = wparam::i32; }
+        if ((lparam & 0x40000000) == 0 && keycount < 16) {
+            keys[(keyfirst + keycount) % 16] = wparam::i32;
+            keycount                         = keycount + 1;
+        }
         ret 0;
     }
     ret DefWindowProcA(hwnd, msg, wparam, lparam);
@@ -188,8 +194,9 @@ pub fun open(win: *Window, title: str, width: i32, height: i32) bool {
     win.info.biClrUsed  = 256;
 
     QueryPerformanceFrequency(?win.freq);
-    closed  = 0;
-    lastkey = 0;
+    closed   = 0;
+    keyfirst = 0;
+    keycount = 0;
     ret 1;
 }
 
@@ -220,10 +227,12 @@ pub fun pump(win: *Window) bool {
     ret !closed;
 }
 
-# the key most recently pressed, once; 0 when none has been since last asked
+# the oldest key pressed and not yet taken; 0 when there is none
 pub fun take_key() i32 {
-    val k: i32 = lastkey;
-    lastkey = 0;
+    if (keycount == 0) { ret 0; }
+    val k: i32 = keys[keyfirst];
+    keyfirst = (keyfirst + 1) % 16;
+    keycount = keycount - 1;
     ret k;
 }
 
@@ -375,47 +384,12 @@ pub fun audio_close(au: *Audio) {
     au.opened = 0;
 }
 
-# -------------------------------------------------------------------- MIDI
+# ------------------------------------------------------------------- timer
 
-val MIDI_MAPPER: u32 = 0xffffffff;
-
-#[library("winmm.dll")]
-ext fun midiOutOpen(handle: *isize, device: u32, callback: usize, instance: usize, flags: u32) u32;
-#[library("winmm.dll")]
-ext fun midiOutShortMsg(handle: isize, message: u32) u32;
-#[library("winmm.dll")]
-ext fun midiOutReset(handle: isize) u32;
-#[library("winmm.dll")]
-ext fun midiOutClose(handle: isize) u32;
 #[library("winmm.dll")]
 ext fun timeBeginPeriod(ms: u32) u32;
 #[library("winmm.dll")]
 ext fun timeEndPeriod(ms: u32) u32;
-
-# the MIDI synthesizer messages go to; module state, because the music player
-# hands over a message and nothing else
-var midi:       isize;
-var midiopened: bool;
-
-# open Windows' default MIDI output, its built-in General MIDI synthesizer
-# ---
-# ret: whether there is one; the game plays without music if not
-pub fun midi_open() bool {
-    midiopened = midiOutOpen(?midi, MIDI_MAPPER, 0, 0, 0) == 0;
-    ret midiopened;
-}
-
-# send one channel message, as music.Out
-pub fun midi_send(message: u32) {
-    if (midiopened) { midiOutShortMsg(midi, message); }
-}
-
-pub fun midi_close() {
-    if (!midiopened) { ret; }
-    midiOutReset(midi);
-    midiOutClose(midi);
-    midiopened = 0;
-}
 
 # ask Windows for a 1 ms timer for the life of the game, so that a short
 # sleep is short and music events land on time
@@ -426,4 +400,127 @@ pub fun fine_timer(on: bool) {
     or {
         timeEndPeriod(1);
     }
+}
+
+# ------------------------------------------------------------ name lookup
+
+val AF_INET:    i32 = 2;
+val SOCK_DGRAM: i32 = 2;
+
+rec ADDRINFOA {
+    ai_flags:     i32;
+    ai_family:    i32;
+    ai_socktype:  i32;
+    ai_protocol:  i32;
+    ai_addrlen:   usize;
+    ai_canonname: *u8;
+    ai_addr:      *u8;
+    ai_next:      *ADDRINFOA;
+}
+
+#[library("ws2_32.dll")]
+ext fun getaddrinfo(node: *u8, service: *u8, hints: *ADDRINFOA, out: **ADDRINFOA) i32;
+#[library("ws2_32.dll")]
+ext fun freeaddrinfo(info: *ADDRINFOA);
+#[library("ws2_32.dll")]
+ext fun WSAStartup(version: u16, data: *u8) i32;
+
+# the IPv4 address of a host name, as Windows' own resolver finds it
+# ---
+# host:   the name, such as doom-relay.fly.dev
+# octets: four bytes to fill
+# ret:    whether the name has an IPv4 address
+pub fun resolve_ipv4(host: str, octets: *u8) bool {
+    # Winsock counts its starts, so this is safe before or after a socket
+    var wsadata: [512]u8;
+    if (WSAStartup(0x0202, ?wsadata[0]) != 0) { ret 0; }
+    var hints: ADDRINFOA;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    var found: *ADDRINFOA;
+    if (getaddrinfo(host, nil, ?hints, ?found) != 0 || found == nil) { ret 0; }
+    # a sockaddr_in: family, port, then the four bytes of the address
+    val sa: *u8 = found.ai_addr;
+    octets[0] = sa[4];
+    octets[1] = sa[5];
+    octets[2] = sa[6];
+    octets[3] = sa[7];
+    freeaddrinfo(found);
+    ret 1;
+}
+
+# a monotonic clock in microseconds, needing no window
+pub fun micros_now() i64 {
+    var count: i64 = 0;
+    var freq:  i64 = 1;
+    QueryPerformanceFrequency(?freq);
+    QueryPerformanceCounter(?count);
+    ret count / freq * 1000000 + (count % freq) * 1000000 / freq;
+}
+
+# ------------------------------------------------------- started by a click
+
+#[library("kernel32.dll")]
+ext fun GetModuleFileNameA(module: isize, path: *u8, size: u32) u32;
+#[library("kernel32.dll")]
+ext fun GetConsoleProcessList(list: *u32, count: u32) u32;
+#[library("kernel32.dll")]
+ext fun FreeConsole() i32;
+#[library("user32.dll")]
+ext fun MessageBoxA(hwnd: isize, text: *u8, caption: *u8, kind: u32) i32;
+
+# this program's own path
+# ---
+# out: where to write it, with room for 512 bytes
+# ret: whether it fitted
+pub fun exe_path(out: *u8) bool {
+    val len: u32 = GetModuleFileNameA(0, out, 512);
+    ret len != 0 && len < 512;
+}
+
+# a file's path in the folder this program is in
+# ---
+# name: the file's name
+# out:  where to write the path, with room for 512 bytes
+# ret:  whether it fitted
+pub fun beside_exe(name: str, out: *u8) bool {
+    val len: u32 = GetModuleFileNameA(0, out, 512);
+    if (len == 0 || len >= 512) { ret 0; }
+    # cut after the last backslash, then add the name
+    var at: i32 = len::i32;
+    for (at > 0 && out[at - 1] != '\\') { at = at - 1; }
+    var k: i32 = 0;
+    for (name[k] != 0) {
+        if (at + k >= 511) { ret 0; }
+        out[at + k] = name[k];
+        k           = k + 1;
+    }
+    out[at + k] = 0;
+    ret 1;
+}
+
+#[library("kernel32.dll")]
+ext fun GetStdHandle(which: u32) isize;
+#[library("kernel32.dll")]
+ext fun GetFileType(handle: isize) u32;
+
+# whether the program was started by a double click: Windows then gives it a
+# console of its own, which output goes to. From a terminal the console is
+# shared, and from a script output goes to a pipe or a file.
+pub fun started_by_click() bool {
+    var list: [4]u32;
+    if (GetConsoleProcessList(?list[0], 4) != 1) { ret 0; }
+    # STD_OUTPUT_HANDLE, and FILE_TYPE_CHAR for a console
+    ret GetFileType(GetStdHandle(0xfffffff5)) == 2;
+}
+
+# let go of the console a double click came with, so that only the game's
+# window shows
+pub fun drop_console() {
+    FreeConsole();
+}
+
+# a message in a box, for when there is no console to print to
+pub fun alert(text: str) {
+    MessageBoxA(0, text, "Doom in Mach", 0x10);
 }

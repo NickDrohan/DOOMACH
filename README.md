@@ -3,6 +3,9 @@
 A port of id Software's Doom engine to Mach, built so that the port asks hard questions of the
 language rather than just transliterating C.
 
+**To just play it:** download it from <https://mach-doom-relay.fly.dev/>, unzip, double-click
+`doom.exe`. Co-op with friends is on the main menu under "Co-op online".
+
 ```bash
 scripts/bootstrap.sh                    # compiler 6.9.0, std, shareware WAD, id's source
 scripts/mach build products/doom --profile release
@@ -18,10 +21,18 @@ $out play products/doom/data/DOOM1.WAD 5 4    # ... or straight into E1M5 on "Ul
 $out demo products/doom/data/DOOM1.WAD DEMO1  # run a built-in demo headless
 $out wav products/doom/data/DOOM1.WAD DEMO1 demo1.wav   # ... and write what it sounds like
 $out mus products/doom/data/DOOM1.WAD D_E1M1  # a song's MIDI messages, one per line
+$out muswav products/doom/data/DOOM1.WAD D_E1M1 e1m1.wav 30   # ... and 30 s of it, synthesized
 $out host products/doom/data/DOOM1.WAD 2      # co-op: host a game for two players...
 $out join products/doom/data/DOOM1.WAD 192.168.1.20   # ...and join it from another machine
+$out host products/doom/data/DOOM1.WAD 2 --relay mach-doom-relay.fly.dev   # across the internet: shows a room code
+$out join products/doom/data/DOOM1.WAD KQ7M2T --relay mach-doom-relay.fly.dev  # ...which the friend joins with
 bash products/doom/check.sh             # acceptance gates
+bash products/doom/package.sh           # the download: out/package/doom-in-mach.zip
+bash products/doom/deploy.sh            # the relay, the page and the download, to Fly.io
 ```
+
+`doom.exe` with no arguments, started by a double click, plays with the `DOOM1.WAD` beside it and
+lets its console go; from a terminal or a script it prints usage as before.
 
 ## The shape of it
 
@@ -51,7 +62,7 @@ Each step lands with its gates before the next begins.
 | 2 | Map loading: vertexes, lines, sectors, BSP, blockmap | all nine maps dump identically to an independent Python reader | **done** |
 | 3 | Scalar renderer | twelve still viewpoints and four views from inside the demos, pinned by hash; debug and release identical | **done** |
 | 4 | Playsim and demo playback | all three shareware demos run to their last tic in sync | **done** |
-| 5 | Win32 window, input, sound effects | playable | **done**; no music |
+| 5 | Win32 window, input, sound effects, music | playable | **done** |
 | 6 | AVX2 renderer | every demo frame identical to scalar; measured speedup | |
 | 7 | SPIR-V compute renderer and Vulkan host | every demo frame identical to scalar | |
 
@@ -93,15 +104,19 @@ should, because the state table is a constant here and the original edits it in 
 
 The window procedure Windows calls is a plain Mach function, the frame goes to the screen as an
 8-bit image through `StretchDIBits`, sound goes out through `waveOut` in four short blocks that
-the play loop refills as the device finishes them, and music goes to Windows' own General MIDI
-synthesizer through `midiOut`, translated from id's MUS format 140 ticks a second. Nothing links
-but user32, gdi32, winmm and kernel32. Up to eight effects mix at once, at the 11,025 Hz the WAD
-stores them at.
+the play loop refills as the device finishes them. The music is synthesized by the game itself:
+`opl.mach` emulates the Yamaha OPL2 FM chip that AdLib and Sound Blaster cards carried, and plays
+id's MUS songs (translated to MIDI messages 140 ticks a second) on its nine voices the way id's
+sound library did, with the instruments in the WAD's GENMIDI lump. So the music is the same on
+every machine and under Wine, where Windows' own MIDI synthesizer is usually silent. The chip
+runs at its own 49,716 Hz and is filtered down to the mix. Nothing links but user32, gdi32,
+winmm and kernel32. Up to eight effects mix at once, at the 11,025 Hz the WAD stores them at.
 
 How far it has been checked: the simulation by the demos below; the renderer and status bar by
 looking at frames captured from the running window; the mapping from held keys to commands by a
 unit test; the mixer by writing a demo's sound to a file and finding the WAD's own samples in it;
-the music by comparing every song's MIDI messages with an independent reader; the menus,
+the music by comparing every song's MIDI messages with an independent reader, the synthesizer
+by unit tests of its pitch and envelope timing and by pinned renderings (`doom muswav`); the menus,
 intermission and finale by a script of keys that photographs each screen. Whether sound and music
 actually reach the speakers has not been checked by anything: the devices open and the game
 runs, and the rest takes ears. The path from the real keyboard to those held keys has been read, not exercised.
@@ -109,8 +124,16 @@ runs, and the rest takes ears. The path from the real keyboard to those held key
 ## Co-op
 
 Two to four players on the first episode, over a LAN or the internet, in lockstep: every machine
-runs the same simulation and only the players' commands cross the network. Details, the packet
-format and what is and is not done are in [MULTIPLAYER.md](MULTIPLAYER.md).
+runs the same simulation and only the players' commands cross the network. In the window it is
+on the main menu: "Co-op online" hosts a game for two to four and shows a room code, or joins one
+by typing the code. Details, the packet format and what is and is not done are in
+[MULTIPLAYER.md](MULTIPLAYER.md).
+
+Across the internet the games meet through a small relay, also written in Mach (`relay`, built
+for Windows and as a static Linux binary), which keeps rooms by six-character code and forwards
+each datagram to the player it names. It runs on Fly.io beside the download page, which
+[hedge](https://github.com/briar-systems/hedge), a web server written in Mach, serves; the
+protocol and how to deploy both are in [RELAY.md](RELAY.md).
 
 ## How it is laid out
 
@@ -124,7 +147,9 @@ any animation frame can run code from anywhere. So the port has a real layering,
 | `front` | `d_main.c`, `m_menu.c`, `wi_stuff.c`, `f_finale.c` | title and demos, menus, intermission, finale |
 | `win`, `st`, `video` | `i_video.c`, `st_stuff.c`, `v_video.c` | the window and sound devices; the status bar; pictures and text |
 | `sound`, `sfx`, `music` | `s_sound.c`, `i_sound.c`, `sounds.c`, `mus2mid` | effects: channels, distance and stereo, the mixer; MUS to MIDI |
-| `net` | `d_net.c`, `i_net.c` | lockstep co-op over UDP |
+| `opl`, `opltab` | the OPL2 chip, DMX's driver | the music synthesizer: the chip, and MIDI played on it with GENMIDI's instruments |
+| `net` | `d_net.c`, `i_net.c` | lockstep co-op over UDP, directly or through the relay |
+| `relay`, `relaycore`, `relayproto` | new | the relay server: rooms, tokens, forwarding; the wire format both sides share |
 | `game` | `g_game.c`, `p_setup.c` | sessions, levels, demos, co-op, keys to commands |
 | `tick` | `p_tick.c`, `p_user.c` | one tic; the player; thinker dispatch |
 | `enemy`, `pspr` | `p_enemy.c`, `p_pspr.c` | what monsters and weapons do |
@@ -180,6 +205,10 @@ lift. The three C files that are circular among themselves and cannot be pulled 
   `fixtures/coop*.expected` pins them in both profiles;
 - the network: a host and a joiner as two processes over loopback ending exactly where the
   one-process run ends, and a joiner that secretly draws one random number more caught by both;
+- the relay: two players meeting by room code through a relay on loopback, two rooms at once on
+  one relay, and four players through a relay that drops, duplicates and reorders five datagrams
+  in a hundred, every player ending where the one-process run ends; an unknown code and a
+  different WAD turned away with the reason;
 - the first demo's sound, 143 seconds of it: the demo ending exactly where it does with sound
   off, debug and release mixing identical files, the file matching `fixtures/sound.sha256`, and
   the pistol's lump found in it sample for sample by `harness/wavcheck.py`.
@@ -275,7 +304,8 @@ applies to this directory only; the other products in the portfolio are unaffect
 
 Low-detail mode and view sizes other than the standard one with the status bar.
 
-Deathmatch, and networking beyond lockstep co-op. Music (sound effects only). Doom II, Heretic, Hexen, or any source
-port extension — the target is the shareware episode behaving as the original did. Targets other
-than windows-x86_64: the simulation is integer-only and ought to reproduce elsewhere, but nothing
-here tests that.
+Deathmatch, and networking beyond lockstep co-op. Doom II, Heretic, Hexen, or any source
+port extension — the target is the shareware episode behaving as the original did. The game on
+targets other than windows-x86_64: the simulation is integer-only and ought to reproduce
+elsewhere, but nothing here tests that. (The relay alone is also built for linux-x86_64, which is
+where it runs.)

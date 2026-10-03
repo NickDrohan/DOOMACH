@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doom in Mach</title>
+<meta name="description" content="The shareware episode of Doom, rewritten in the Mach programming language, with co-op over the internet.">
+<style>
+  :root {
+    --bg: #f6f3ee;
+    --fg: #1d1a17;
+    --muted: #5d564e;
+    --rule: #ddd5ca;
+    --panel: #ffffff;
+    --accent: #b3201a;
+    --accent-fg: #ffffff;
+    --code-bg: #efe9e0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141110;
+      --fg: #ede7df;
+      --muted: #a39a90;
+      --rule: #2e2925;
+      --panel: #1d1917;
+      --accent: #d8362c;
+      --accent-fg: #ffffff;
+      --code-bg: #272220;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 17px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { font-size: 2.4rem; line-height: 1.1; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 { font-size: 1.25rem; margin: 40px 0 10px; }
+  p, li { color: var(--fg); }
+  .lede { color: var(--muted); font-size: 1.1rem; margin: 0 0 24px; }
+  .shot {
+    display: block; width: 100%; height: auto;
+    image-rendering: pixelated;
+    border-radius: 6px; border: 1px solid var(--rule);
+  }
+  .get {
+    margin: 24px 0 8px; padding: 20px;
+    background: var(--panel); border: 1px solid var(--rule); border-radius: 8px;
+    display: flex; flex-wrap: wrap; gap: 16px; align-items: center;
+  }
+  .button {
+    display: inline-block; padding: 12px 22px; border-radius: 6px;
+    background: var(--accent); color: var(--accent-fg);
+    font-weight: 600; text-decoration: none; font-size: 1.05rem;
+  }
+  .button:hover { filter: brightness(1.08); }
+  .button:focus-visible { outline: 3px solid var(--fg); outline-offset: 2px; }
+  .meta { color: var(--muted); font-size: 0.92rem; }
+  .hash { font-family: ui-monospace, Consolas, monospace; font-size: 0.78rem; word-break: break-all; color: var(--muted); }
+  ol, ul { padding-left: 22px; }
+  li { margin: 6px 0; }
+  kbd, code {
+    font-family: ui-monospace, Consolas, monospace; font-size: 0.88em;
+    background: var(--code-bg); border-radius: 4px; padding: 1px 5px;
+  }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  td:first-child { white-space: nowrap; width: 1%; padding-right: 16px; }
+  a { color: var(--accent); }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 0.88rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Doom in Mach</h1>
+  <p class="lede">The shareware episode of Doom (1993), <em>Knee-Deep in the Dead</em>, rewritten from
+  id Software's source in the Mach programming language. Play alone, or with up to three friends
+  over the internet.</p>
+
+  <img class="shot" src="shot.png" width="960" height="600" alt="The first room of E1M1, seen through the marine's eyes, with the status bar below">
+
+  <div class="get">
+    <a class="button" href="doom-in-mach.zip" download>Download</a>
+    <div>
+      <div class="meta">Windows 10 or 11, 64-bit, or Linux with Wine &middot; {{SIZE}} zip &middot; nothing to install</div>
+      <div class="hash">SHA-256 {{SHA256}}</div>
+    </div>
+  </div>
+
+  <h2>Playing</h2>
+  <ol>
+    <li>Unzip the download anywhere. Keep <code>doom.exe</code> and <code>DOOM1.WAD</code> together.</li>
+    <li>Double-click <code>doom.exe</code>.</li>
+    <li>Windows may say <em>Windows protected your PC</em>, because the program is not signed.
+      Click <strong>More info</strong>, then <strong>Run anyway</strong>. It asks once. If it asks
+      whether to let the game use the network, allow it.</li>
+  </ol>
+  <p><strong>On Linux</strong> it runs through Wine: unzip, then in a terminal in that folder run
+  <code>./doom.sh</code>. If Wine is missing it says how to install it
+  (<code>sudo dnf install wine</code>, <code>sudo apt install wine</code>, ...). Sound and music both work
+  under Wine.</p>
+  <table>
+    <tr><td><kbd>&uarr;</kbd> <kbd>&darr;</kbd> or <kbd>W</kbd> <kbd>S</kbd></td><td>move forward and back</td></tr>
+    <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>turn</td></tr>
+    <tr><td><kbd>A</kbd> <kbd>D</kbd></td><td>step sideways</td></tr>
+    <tr><td><kbd>Ctrl</kbd> or <kbd>F</kbd></td><td>fire</td></tr>
+    <tr><td><kbd>Space</kbd> or <kbd>E</kbd></td><td>open doors, press switches</td></tr>
+    <tr><td><kbd>Shift</kbd></td><td>run</td></tr>
+    <tr><td><kbd>1</kbd>&ndash;<kbd>7</kbd></td><td>choose a weapon</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td>the menu</td></tr>
+  </table>
+
+  <h2>Co-op with friends</h2>
+  <p>Two to four players, anywhere, on Windows and Linux together. Everyone needs the same
+  download: an older copy is turned away with &ldquo;different version&rdquo;, and the Co-op screen
+  shows a six-character <em>this copy</em> code to compare.</p>
+  <ul>
+    <li><strong>One person hosts:</strong> <kbd>Esc</kbd>, <em>Co-op online</em>, <em>Host a game for 2</em>
+      (or 3, or 4), then a skill. A room code like <code>KQ7M2T</code> appears. Send it to the others.</li>
+    <li><strong>Everyone else joins:</strong> <kbd>Esc</kbd>, <em>Co-op online</em>, <em>Join with a room code</em>,
+      type the code, press <kbd>Enter</kbd>.</li>
+  </ul>
+  <p>The game starts on E1M1 as soon as everyone is in. No router or firewall settings: the games meet
+  through a small relay server on this site. Every player's game runs in lockstep, so a slow connection
+  makes everyone wait for it; it plays best within a country. To leave: <kbd>Esc</kbd>, <em>Options</em>,
+  <em>End Game</em>.</p>
+
+  <h2>What this is</h2>
+  <p>A port of id Software's 1997 source release to <a href="https://github.com/briar-systems/mach">Mach</a>,
+  with no C and no libraries beyond what Windows ships. The music comes from an emulation of the
+  OPL2 FM chip on the AdLib and Sound Blaster cards DOS Doom played it on. The game reproduces the original's three demo
+  recordings tic for tic, which is how it is known to behave like the original. The relay server and this
+  page's web server, <a href="https://github.com/briar-systems/hedge">hedge</a>, are written in Mach too.</p>
+
+  <footer>
+    <p>The program is free software under the GNU General Public License, version 2 or later.
+    Its complete source is inside the download and also here: <a href="source.zip">source.zip</a>.</p>
+    <p><code>DOOM1.WAD</code> is id Software's shareware Doom 1.9 data file, which id allows to be given away
+    unchanged and free of charge; it is not covered by the GPL. Doom is a trademark of id Software. This is
+    a fan project, not made or endorsed by id Software.</p>
+  </footer>
+</main>
+</body>
+</html>

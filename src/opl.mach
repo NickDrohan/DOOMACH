@@ -1,0 +1,658 @@
+# opl: the music as DOS Doom played it on an AdLib or Sound Blaster
+#
+# Two parts. The first is the Yamaha OPL2 (YM3812) chip: nine voices of two
+# operators each, every operator a sine-family wave with its own envelope,
+# the first able to modulate the second's phase (FM) or simply add to it. It
+# works as the chip does, in a logarithmic domain: a phase becomes an
+# attenuation through a log-sine table, the envelope adds to it, and an
+# exponent table turns the sum back into an amplitude. It runs at the chip's
+# own 49716 Hz, is low-pass filtered down to the game's mixing rate, and
+# loses its DC offset as a sound card's output capacitor took it away.
+#
+# The second is the driver that plays MIDI messages on those nine voices the
+# way id's sound library did: an instrument per channel from the WAD's
+# GENMIDI lump (percussion from instruments 128 on), a voice per note, the
+# oldest note giving way when all nine are busy, pitch bend, channel volume.
+#
+# Because the game makes the sound itself, the music is the same wherever
+# the game runs, Wine included, and needs no MIDI device.
+
+use std.types.bool.bool;
+use std.types.string.str;
+
+use t: doom.opltab;
+
+val VOICES: i32 = 9;
+
+# envelope stages
+val EG_ATTACK:  i32 = 0;
+val EG_DECAY:   i32 = 1;
+val EG_SUSTAIN: i32 = 2;
+val EG_RELEASE: i32 = 3;
+val EG_OFF:     i32 = 4;
+
+val ENV_MAX: i32 = 511;
+
+# GENMIDI: an eight-byte magic, then 175 instruments of 36 bytes
+val GENMIDI_INSTRUMENTS: i32 = 175;
+val INSTRUMENT_SIZE:     i32 = 36;
+val FLAG_FIXED:          i32 = 1;
+val FLAG_DOUBLE:         i32 = 4;
+
+# one operator: its settings, as the chip's registers hold them, and its state
+rec Op {
+    am:   bool;
+    vib:  bool;
+    egt:  bool;
+    ksr:  bool;
+    mult: i32;
+    ksl:  i32;
+    tl:   i32;
+    ar:   i32;
+    dr:   i32;
+    sl:   i32;
+    rr:   i32;
+    wave: i32;
+
+    phase: u32;
+    env:   i32;
+    stage: i32;
+    count: i32;
+    out:   i32;
+    prev:  i32;
+}
+
+rec Voice {
+    mod:      Op;
+    car:      Op;
+    feedback: i32;
+    additive: bool;
+    fnum:     i32;
+    block:    i32;
+
+    # what the driver put here: the channel and key that started it, the
+    # instrument's own levels, its pitch offsets, and when it started
+    playing: bool;
+    channel: i32;
+    key:     i32;
+    note:    i32;
+    finetune: i32;
+    modtl:   i32;
+    cartl:   i32;
+    velocity: i32;
+    started: i64;
+}
+
+rec Channel {
+    program: i32;
+    volume:  i32;
+    # pitch bend in 1/32 semitones
+    bend:    i32;
+}
+
+rec Synth {
+    ready:    bool;
+    genmidi:  *u8;
+    voices:   [9]Voice;
+    channels: [16]Channel;
+    clock:    i64;
+
+    # the two low-frequency oscillators
+    tremolo:    i32;
+    tremolopos: i32;
+    vibpos:     i32;
+    lfoclock:   i32;
+
+    # resampling to the mixing rate: chip samples owed, the last 64 of them
+    # for the low-pass filter, and the DC blocker's memory
+    frac:    i32;
+    history: [64]i32;
+    at:      i32;
+    dcin:    i32;
+    dcout:   i32;
+}
+
+var synth: Synth;
+
+# ------------------------------------------------------------------ the chip
+
+# an attenuation (log2 in 1/256ths, plus envelope) back to an amplitude
+fun calcexp(level_in: i32) i32 {
+    var level: i32 = level_in;
+    if (level > 0x1fff) { level = 0x1fff; }
+    ret ((t.EXP[level & 0xff] | 0x400) << 1) >> (level >> 8);
+}
+
+# one sample of a waveform at a 10-bit phase, attenuated by an envelope
+fun wave(kind: i32, phase_in: i32, env: i32) i32 {
+    val phase: i32 = phase_in & 0x3ff;
+    var level: i32 = 0;
+    if ((phase & 0x100) != 0) {
+        level = t.LOGSIN[(phase & 0xff) ^ 0xff];
+    }
+    or {
+        level = t.LOGSIN[phase & 0xff];
+    }
+    val upper: bool = (phase & 0x200) != 0;
+    # half-sine: silent on the lower half; quarter-sine: silent on every
+    # second quarter
+    if (kind == 1 && upper)                      { ret 0; }
+    if (kind == 3 && (phase & 0x100) != 0)        { ret 0; }
+    val amp: i32 = calcexp(level + (env << 3));
+    # sine is negative on the lower half; the others are not
+    if (kind == 0 && upper) { ret -amp; }
+    ret amp;
+}
+
+# key scaling of rate: how much a high note quickens its envelope
+fun rate_offset(op: *Op, v: *Voice) i32 {
+    val ksv: i32 = (v.block << 1) | ((v.fnum >> 9) & 1);
+    if (op.ksr) { ret ksv; }
+    ret ksv >> 2;
+}
+
+# advance an envelope by one sample
+fun envelope(op: *Op, v: *Voice) {
+    if (op.stage == EG_OFF) { ret; }
+    var rate: i32 = 0;
+    if (op.stage == EG_ATTACK) {
+        rate = op.ar;
+    }
+    or (op.stage == EG_DECAY) {
+        rate = op.dr;
+    }
+    or (op.stage == EG_SUSTAIN) {
+        # a sustaining sound holds; a percussive one goes on fading
+        if (op.egt) { ret; }
+        rate = op.rr;
+    }
+    or {
+        rate = op.rr;
+    }
+    if (rate == 0) { ret; }
+    var r: i32 = rate * 4 + rate_offset(op, v);
+    if (r > 63) { r = 63; }
+
+    if (op.stage == EG_ATTACK && r >= 60) {
+        op.env   = 0;
+        op.stage = EG_DECAY;
+        ret;
+    }
+
+    # steps owed: a rate of 4 steps once in 4096 samples, each 4 more twice
+    # as often, with the low two bits between
+    op.count = op.count + ((4 + (r & 3)) << (r >> 2));
+    for (op.count >= 32768) {
+        op.count = op.count - 32768;
+        if (op.stage == EG_ATTACK) {
+            op.env = op.env - (op.env >> 3) - 1;
+            if (op.env <= 0) {
+                op.env   = 0;
+                op.stage = EG_DECAY;
+                brk;
+            }
+        }
+        or {
+            op.env = op.env + 1;
+            if (op.stage == EG_DECAY && op.env >= op.sl) {
+                op.env   = op.sl;
+                op.stage = EG_SUSTAIN;
+                brk;
+            }
+            if (op.env >= ENV_MAX) {
+                op.env   = ENV_MAX;
+                op.stage = EG_OFF;
+                brk;
+            }
+        }
+    }
+}
+
+# the attenuation the chip adds for high notes, in envelope steps
+fun key_scale(op: *Op, v: *Voice) i32 {
+    if (op.ksl == 0) { ret 0; }
+    var k: i32 = (t.KSLROM[v.fnum >> 6] << 2) - ((8 - v.block) << 5);
+    if (k < 0) { k = 0; }
+    # register values 1, 2 and 3 are 3, 1.5 and 6 dB an octave
+    if (op.ksl == 1) { ret k >> 1; }
+    if (op.ksl == 2) { ret k >> 2; }
+    ret k;
+}
+
+# one sample of one operator
+# ---
+# modulation: added to the 10-bit phase
+fun operate(op: *Op, v: *Voice, modulation: i32) i32 {
+    # vibrato bends the f-number a little, up and down, about six times a
+    # second
+    var f: i32 = v.fnum;
+    if (op.vib) {
+        var r: i32 = (f >> 7) & 7;
+        if ((synth.vibpos & 3) == 0) {
+            r = 0;
+        }
+        or ((synth.vibpos & 1) != 0) {
+            r = r >> 1;
+        }
+        r = r >> 1;
+        if ((synth.vibpos & 4) != 0) { r = -r; }
+        f = f + r;
+    }
+    # the chip halves twice: once for the f-number, once for the doubled
+    # multiplier
+    val inc: u32 = ((((f << v.block) >> 1) * t.MULT2[op.mult]) >> 1)::u32;
+    op.phase = (op.phase + inc) & 0x7ffff;
+
+    envelope(op, v);
+    var att: i32 = op.env + (op.tl << 2) + key_scale(op, v);
+    if (op.am) { att = att + synth.tremolo; }
+    if (att > ENV_MAX) { att = ENV_MAX; }
+
+    op.prev = op.out;
+    op.out  = wave(op.wave, (op.phase >> 9)::i32 + modulation, att);
+    ret op.out;
+}
+
+# one sample of one voice
+fun voice_sample(v: *Voice) i32 {
+    if (v.mod.stage == EG_OFF && v.car.stage == EG_OFF) { ret 0; }
+    var fb: i32 = 0;
+    if (v.feedback != 0) { fb = (v.mod.prev + v.mod.out) >> (9 - v.feedback); }
+    val m: i32 = operate(?v.mod, v, fb);
+    if (v.additive) { ret m + operate(?v.car, v, 0); }
+    ret operate(?v.car, v, m);
+}
+
+# one sample of the whole chip
+fun chip_sample() i32 {
+    # the tremolo: a triangle of 210 steps, one step every 64 samples, about
+    # 3.7 Hz and 1 dB deep; the vibrato: 8 steps, one every 1024 samples
+    synth.lfoclock = synth.lfoclock + 1;
+    if ((synth.lfoclock & 63) == 0) {
+        synth.tremolopos = (synth.tremolopos + 1) % 210;
+        if (synth.tremolopos < 105) {
+            synth.tremolo = synth.tremolopos >> 4;
+        }
+        or {
+            synth.tremolo = (210 - synth.tremolopos) >> 4;
+        }
+    }
+    if ((synth.lfoclock & 1023) == 0) { synth.vibpos = (synth.vibpos + 1) & 7; }
+
+    var sum: i32 = 0;
+    var i:   i32 = 0;
+    for (i < VOICES) {
+        sum = sum + voice_sample(?synth.voices[i]);
+        i   = i + 1;
+    }
+    ret sum;
+}
+
+fun key_on(op: *Op) {
+    op.stage = EG_ATTACK;
+    op.phase = 0;
+    op.count = 0;
+}
+
+fun key_off(op: *Op) {
+    if (op.stage != EG_OFF) { op.stage = EG_RELEASE; }
+}
+
+# ---------------------------------------------------------------- the driver
+
+fun instrument(n: i32) *u8 {
+    ret ?synth.genmidi[8 + n * INSTRUMENT_SIZE];
+}
+
+# an operator's settings from GENMIDI's six bytes: the 0x20, 0x60, 0x80,
+# 0xe0 and 0x40 registers, the last split into scaling and level
+fun set_op(op: *Op, d: *u8) {
+    val c: i32 = d[0]::i32;
+    op.am   = (c & 0x80) != 0;
+    op.vib  = (c & 0x40) != 0;
+    op.egt  = (c & 0x20) != 0;
+    op.ksr  = (c & 0x10) != 0;
+    op.mult = c & 15;
+    op.ar   = d[1]::i32 >> 4;
+    op.dr   = d[1]::i32 & 15;
+    var sl: i32 = d[2]::i32 >> 4;
+    # the top sustain level means silence: 93 dB, past the rest
+    if (sl == 15) { sl = 31; }
+    op.sl   = sl << 4;
+    op.rr   = d[2]::i32 & 15;
+    op.wave = d[3]::i32 & 3;
+    op.ksl  = (d[4]::i32 >> 6) & 3;
+    op.tl   = d[5]::i32 & 63;
+}
+
+# set a voice's pitch from its note, its channel's bend and its tuning
+fun set_pitch(v: *Voice) {
+    var total: i32 = v.note * 32 + synth.channels[v.channel].bend + v.finetune;
+    if (total < 0) { total = 0; }
+    var octave: i32 = total / 384;
+    var f:      i32 = t.FNUM[total % 384];
+    # the table is octave 5 at block 4
+    var block: i32 = octave - 1;
+    for (block < 0) {
+        f     = f >> 1;
+        block = block + 1;
+    }
+    for (block > 7) {
+        f     = f << 1;
+        block = block - 1;
+    }
+    if (f > 1023) { f = 1023; }
+    v.fnum  = f;
+    v.block = block;
+}
+
+# set a voice's loudness from its note's velocity and its channel's volume:
+# the carrier, and the modulator too when it is heard directly
+fun set_level(v: *Voice) {
+    val loud: i32 = v.velocity * synth.channels[v.channel].volume / 127;
+    val att:  i32 = t.VOLATT[loud];
+    v.car.tl = v.cartl + att;
+    if (v.car.tl > 63) { v.car.tl = 63; }
+    v.mod.tl = v.modtl;
+    if (v.additive) {
+        v.mod.tl = v.modtl + att;
+        if (v.mod.tl > 63) { v.mod.tl = 63; }
+    }
+}
+
+# a voice for a new note: a silent one, else the one released longest ago,
+# else the one playing longest
+fun take_voice() *Voice {
+    var best:  i32 = -1;
+    var score: i64 = 0;
+    var i:     i32 = 0;
+    for (i < VOICES) {
+        val v: *Voice = ?synth.voices[i];
+        var s: i64    = synth.clock - v.started;
+        if (v.car.stage == EG_OFF)  { s = s + 4000000000; }
+        or (!v.playing)              { s = s + 2000000000; }
+        if (best < 0 || s > score) {
+            best  = i;
+            score = s;
+        }
+        i = i + 1;
+    }
+    ret ?synth.voices[best];
+}
+
+# start one voice of an instrument
+# ---
+# d:        the instrument's voice: sixteen bytes
+# finetune: a pitch offset in 1/32 semitones, for an instrument's second voice
+fun start_voice(channel: i32, key: i32, note: i32, velocity: i32, d: *u8, finetune: i32) {
+    val v: *Voice = take_voice();
+    set_op(?v.mod, d);
+    set_op(?v.car, ?d[7]);
+    v.feedback = (d[6]::i32 >> 1) & 7;
+    v.additive = (d[6]::i32 & 1) != 0;
+    v.modtl    = v.mod.tl;
+    v.cartl    = v.car.tl;
+
+    # the voice's own offset, as a signed 16-bit number of semitones
+    var offset: i32 = d[14]::i32 | (d[15]::i32 << 8);
+    if (offset >= 32768) { offset = offset - 65536; }
+    var n: i32 = note + offset;
+    for (n < 0)  { n = n + 12; }
+    for (n > 95) { n = n - 12; }
+
+    v.playing  = 1;
+    v.channel  = channel;
+    v.key      = key;
+    v.note     = n;
+    v.finetune = finetune;
+    v.velocity = velocity;
+    synth.clock = synth.clock + 1;
+    v.started   = synth.clock;
+    set_pitch(v);
+    set_level(v);
+    key_on(?v.mod);
+    key_on(?v.car);
+}
+
+fun note_off(channel: i32, key: i32) {
+    var i: i32 = 0;
+    for (i < VOICES) {
+        val v: *Voice = ?synth.voices[i];
+        if (v.playing && v.channel == channel && v.key == key) {
+            v.playing = 0;
+            key_off(?v.mod);
+            key_off(?v.car);
+        }
+        i = i + 1;
+    }
+}
+
+fun note_on(channel: i32, key: i32, velocity: i32) {
+    if (velocity == 0) {
+        note_off(channel, key);
+        ret;
+    }
+    # percussion plays an instrument per key, from 128 on
+    var which: i32 = synth.channels[channel].program;
+    if (channel == 9) {
+        if (key < 35 || key > 81) { ret; }
+        which = 128 + key - 35;
+    }
+    if (which < 0 || which >= GENMIDI_INSTRUMENTS) { ret; }
+    val ins:   *u8 = instrument(which);
+    val flags: i32 = ins[0]::i32 | (ins[1]::i32 << 8);
+    var note:  i32 = key;
+    if ((flags & FLAG_FIXED) != 0) { note = ins[3]::i32; }
+
+    start_voice(channel, key, note, velocity, ?ins[4], 0);
+    if ((flags & FLAG_DOUBLE) != 0) {
+        start_voice(channel, key, note, velocity, ?ins[20], ins[2]::i32 / 2 - 64);
+    }
+}
+
+fun all_off(channel: i32) {
+    var i: i32 = 0;
+    for (i < VOICES) {
+        val v: *Voice = ?synth.voices[i];
+        if (v.channel == channel && v.playing) {
+            v.playing = 0;
+            key_off(?v.mod);
+            key_off(?v.car);
+        }
+        i = i + 1;
+    }
+}
+
+# every voice of a channel follows a change to it
+fun retune(channel: i32) {
+    var i: i32 = 0;
+    for (i < VOICES) {
+        val v: *Voice = ?synth.voices[i];
+        if (v.channel == channel && v.car.stage != EG_OFF) {
+            set_pitch(v);
+            set_level(v);
+        }
+        i = i + 1;
+    }
+}
+
+# play one MIDI channel message, as music.Out hands them: status in the low
+# byte, then the two data bytes
+pub fun midi(msg: u32) {
+    if (!synth.ready) { ret; }
+    val status:  i32 = (msg & 0xf0)::i32;
+    val channel: i32 = (msg & 0x0f)::i32;
+    val a:       i32 = ((msg >> 8) & 0x7f)::i32;
+    val b:       i32 = ((msg >> 16) & 0x7f)::i32;
+    val ch: *Channel = ?synth.channels[channel];
+
+    if (status == 0x90) {
+        note_on(channel, a, b);
+    }
+    or (status == 0x80) {
+        note_off(channel, a);
+    }
+    or (status == 0xc0) {
+        ch.program = a;
+    }
+    or (status == 0xe0) {
+        # 14 bits, centre 8192, two semitones either way
+        ch.bend = ((b << 7) | a) - 8192;
+        ch.bend = ch.bend * 64 / 8192;
+        retune(channel);
+    }
+    or (status == 0xb0) {
+        if (a == 7) {
+            ch.volume = b;
+            retune(channel);
+        }
+        or (a == 121) {
+            ch.volume = 100;
+            ch.bend   = 0;
+            retune(channel);
+        }
+        or (a == 120 || a == 123) {
+            all_off(channel);
+        }
+    }
+}
+
+# set up with the WAD's instruments; without them the music stays silent
+# ---
+# genmidi: the GENMIDI lump
+# len:     its size
+pub fun init(genmidi: *u8, len: u32) bool {
+    var blank: Synth;
+    synth = blank;
+    val magic: str = "#OPL_II#";
+    var k:     i32 = 0;
+    for (k < 8) {
+        if (len < 8 || genmidi[k] != magic[k]) { ret 0; }
+        k = k + 1;
+    }
+    if (len < (8 + GENMIDI_INSTRUMENTS * INSTRUMENT_SIZE)::u32) { ret 0; }
+    synth.genmidi = genmidi;
+    k = 0;
+    for (k < 16) {
+        synth.channels[k].volume = 100;
+        k                        = k + 1;
+    }
+    k = 0;
+    for (k < VOICES) {
+        synth.voices[k].mod.stage = EG_OFF;
+        synth.voices[k].car.stage = EG_OFF;
+        synth.voices[k].mod.env   = ENV_MAX;
+        synth.voices[k].car.env   = ENV_MAX;
+        k                         = k + 1;
+    }
+    synth.ready = 1;
+    ret 1;
+}
+
+# add the music to a stretch of the mix: stereo frames of 16-bit samples
+# ---
+# out:    the frames, already holding the sound effects
+# frames: how many
+# rate:   the mixing rate
+pub fun mix(out: *i16, frames: i32, rate: i32) {
+    if (!synth.ready) { ret; }
+    var f: i32 = 0;
+    for (f < frames) {
+        # the chip samples that fall within this frame, into the history
+        synth.frac = synth.frac + t.RATE;
+        for (synth.frac >= rate) {
+            synth.frac                = synth.frac - rate;
+            synth.history[synth.at]   = chip_sample();
+            synth.at                  = (synth.at + 1) & 63;
+        }
+        # the low-pass filter over the newest 63, so that the chip's high
+        # partials do not fold down into noise
+        var acc: i64 = 0;
+        var k:   i32 = 0;
+        for (k < 63) {
+            acc = acc + synth.history[(synth.at - 1 - k) & 63]::i64 * t.FIR[k]::i64;
+            k   = k + 1;
+        }
+        val x: i32 = (acc >> 15)::i32;
+        # a one-pole high-pass a few hertz up: the output capacitor
+        synth.dcout = x - synth.dcin + ((synth.dcout * 4064) >> 12);
+        synth.dcin  = x;
+
+        val v:    i32 = synth.dcout * 4 / 3;
+        var side: i32 = 0;
+        for (side < 2) {
+            var s: i32 = out[f * 2 + side]::i32 + v;
+            if (s > 32767)  { s = 32767; }
+            if (s < -32768) { s = -32768; }
+            out[f * 2 + side] = s::i16;
+            side              = side + 1;
+        }
+        f = f + 1;
+    }
+}
+
+# ------------------------------------------------------------------- tests
+
+# a plain sine at a pitch: count its zero crossings over one second
+fun crossings(note: i32) i32 {
+    var blank: Synth;
+    synth = blank;
+    synth.ready = 1;
+    synth.channels[0].volume = 127;
+    val v: *Voice = ?synth.voices[0];
+    # a silent modulator added to a full, held carrier: a pure sine
+    v.additive = 1;
+    v.mod.tl   = 63;
+    v.mod.stage = EG_OFF;
+    v.mod.env   = ENV_MAX;
+    v.car.mult  = 1;
+    v.car.ar    = 15;
+    v.car.egt   = 1;
+    v.channel   = 0;
+    v.note      = note;
+    set_pitch(v);
+    key_on(?v.car);
+    var last:  i32 = 0;
+    var count: i32 = 0;
+    var i:     i32 = 0;
+    for (i < t.RATE) {
+        val s: i32 = voice_sample(v);
+        if ((s >= 0) != (last >= 0)) { count = count + 1; }
+        last = s;
+        i    = i + 1;
+    }
+    ret count;
+}
+
+test opl__a440_is_440_hz {
+    # two crossings a cycle; within half a percent
+    val c: i32 = crossings(69);
+    if (c < 876 || c > 884) { ret 1; }
+    # and an octave up is twice as many, an octave down half
+    val up: i32 = crossings(81);
+    if (up < 1752 || up > 1768) { ret 2; }
+    val down: i32 = crossings(57);
+    if (down < 436 || down > 444) { ret 3; }
+    ret 0;
+}
+
+test opl__attack_one_takes_about_three_seconds {
+    var blank: Synth;
+    synth = blank;
+    var v:  Voice;
+    var op: Op;
+    op.ar  = 1;
+    op.env = ENV_MAX;
+    # a low note, which key scaling of rate leaves unhurried
+    v.fnum = 345;
+    v.block = 0;
+    key_on(?op);
+    var n: i32 = 0;
+    for (op.stage == EG_ATTACK && n < 10 * t.RATE) {
+        envelope(?op, ?v);
+        n = n + 1;
+    }
+    # the chip's documented attack time at rate 1 is 2.83 seconds
+    if (n < 2 * t.RATE || n > 4 * t.RATE) { ret 1; }
+    ret 0;
+}

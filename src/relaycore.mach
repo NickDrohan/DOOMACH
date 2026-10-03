@@ -1,0 +1,760 @@
+# the relay's rooms and routing, with no sockets in sight
+#
+# The relay process (relay.mach) feeds every datagram it receives to handle,
+# calls tick a few times a second, and sends whatever lands in the output
+# queue. Keeping the logic here, away from the socket, is what lets the unit
+# tests below drive a whole room by hand.
+#
+# What it guarantees:
+# - A player is identified by its session token, never by its address, and
+#   traffic goes only to addresses that have sent a valid token from there;
+#   so a spoofed request can make the relay answer a stranger once, with a
+#   reply no bigger than the request, and never more.
+# - DATA goes only to the one player it names, in the same room.
+# - Creates and joins are rate-limited per address, rooms are capped, and
+#   silent players and stale rooms are cleared on a timer.
+#
+# What it does not: encrypt or sign game traffic. Someone who can see the
+# packets between a player and the relay can read the token and act as that
+# player. That is the accepted cost of a first version without HTTPS.
+
+use std.types.bool.bool;
+
+use p: doom.relayproto;
+
+pub val MAXROOMS:   i32 = 256;
+pub val MAXPLAYERS: i32 = 4;
+pub val MAXPACKET:  i32 = 1200;
+val QUEUE:          i32 = 64;
+val RATESLOTS:      i32 = 64;
+
+# a lobby player silent this long is dropped; a playing one, this long
+pub val LOBBY_TIMEOUT: i64 = 15000;
+pub val PLAY_TIMEOUT:  i64 = 10000;
+# a room that never filled is closed after this long
+pub val ROOM_LIFETIME: i64 = 30 * 60 * 1000;
+# at most this many creates and joins from one address in each window
+val RATE_LIMIT:  i32 = 20;
+val RATE_WINDOW: i64 = 10000;
+
+# an IPv4 address and port
+pub rec Addr {
+    ip:   u32;
+    port: u16;
+}
+
+pub rec Slot {
+    used:      bool;
+    validated: bool;
+    token:     u64;
+    addr:      Addr;
+    nonce:     u32;
+    lastseen:  i64;
+}
+
+pub rec Room {
+    used:     bool;
+    started:  bool;
+    began:    i64;
+    code:     [6]u8;
+    players:  i32;
+    skill:    i32;
+    map:      i32;
+    wadhash:  u64;
+    created:  i64;
+    slots:    [4]Slot;
+}
+
+# a datagram to send
+pub rec Out {
+    to:   Addr;
+    len:  i32;
+    data: [1216]u8;
+}
+
+# something that happened to a room, for the log: no addresses, only the
+# room's code and seats
+pub val EV_OPENED:   u8 = 1;
+pub val EV_JOINED:   u8 = 2;
+pub val EV_STARTED:  u8 = 3;
+pub val EV_LEFT:     u8 = 4;
+pub val EV_TIMEDOUT: u8 = 5;
+pub val EV_CLOSED:   u8 = 6;
+pub val EV_REFUSED:  u8 = 7;
+val EVENTS:          i32 = 32;
+
+pub rec Event {
+    what:    u8;
+    code:    [6]u8;
+    # the seat, or the refusal's reason
+    slot:    i32;
+    players: i32;
+    # how long the room had been playing, in seconds, when it closed
+    played:  i64;
+}
+
+rec Rate {
+    ip:    u32;
+    start: i64;
+    count: i32;
+}
+
+pub def Random: fun() u64;
+
+pub rec Relay {
+    maxrooms: i32;
+    random:   Random;
+    rooms:    [256]Room;
+    out:      [64]Out;
+    nout:     i32;
+    rates:    [64]Rate;
+
+    # what has happened to rooms since the process last took the list
+    events:  [32]Event;
+    nevents: i32;
+
+    # what has happened, for the log
+    created:   i64;
+    started:   i64;
+    closed:    i64;
+    forwarded: i64;
+    refused:   i64;
+    dropped:   i64;
+}
+
+fun same_addr(a: *Addr, b: *Addr) bool {
+    ret a.ip == b.ip && a.port == b.port;
+}
+
+# a datagram to queue, or nil if the queue is full this round
+fun queue(r: *Relay, to: *Addr) *Out {
+    if (r.nout >= QUEUE) {
+        r.dropped = r.dropped + 1;
+        ret nil;
+    }
+    val o: *Out = ?r.out[r.nout];
+    r.nout = r.nout + 1;
+    o.to   = @to;
+    o.len  = 0;
+    ret o;
+}
+
+fun event(r: *Relay, what: u8, room: *Room, slot: i32) {
+    if (r.nevents >= EVENTS) { ret; }
+    val e: *Event = ?r.events[r.nevents];
+    r.nevents = r.nevents + 1;
+    e.what    = what;
+    e.slot    = slot;
+    e.players = 0;
+    e.played  = 0;
+    var k: i32 = 0;
+    for (k < p.CODELEN) {
+        e.code[k] = '-';
+        if (room != nil) { e.code[k] = room.code[k]; }
+        k = k + 1;
+    }
+    if (room != nil) { e.players = room.players; }
+}
+
+fun refuse(r: *Relay, to: *Addr, reason: u8) {
+    r.refused = r.refused + 1;
+    event(r, EV_REFUSED, nil, reason::i32);
+    val o: *Out = queue(r, to);
+    if (o == nil) { ret; }
+    val at: i32 = p.header(?o.data[0], p.REFUSED, 0, 0, 0);
+    o.data[at] = reason;
+    o.len      = at + 1;
+}
+
+fun welcome(r: *Relay, room: *Room, slot: i32) {
+    val s: *Slot = ?room.slots[slot];
+    val o: *Out  = queue(r, ?s.addr);
+    if (o == nil) { ret; }
+    val at: i32 = p.header(?o.data[0], p.WELCOME, slot, 0, s.token);
+    var k:  i32 = 0;
+    for (k < p.CODELEN) {
+        o.data[at + k] = room.code[k];
+        k              = k + 1;
+    }
+    o.data[at + 6] = room.players::u8;
+    o.data[at + 7] = room.skill::u8;
+    o.data[at + 8] = room.map::u8;
+    o.data[at + 9] = joined(room)::u8;
+    o.len          = at + 10;
+}
+
+fun joined(room: *Room) i32 {
+    var n: i32 = 0;
+    var i: i32 = 0;
+    for (i < MAXPLAYERS) {
+        if (room.slots[i].used) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun send_start(r: *Relay, room: *Room, slot: i32) {
+    val s: *Slot = ?room.slots[slot];
+    val o: *Out  = queue(r, ?s.addr);
+    if (o == nil) { ret; }
+    val at: i32 = p.header(?o.data[0], p.START, slot, 0, s.token);
+    o.data[at]     = room.players::u8;
+    o.data[at + 1] = room.skill::u8;
+    o.data[at + 2] = room.map::u8;
+    o.len          = at + 3;
+}
+
+fun send_lobby(r: *Relay, room: *Room, slot: i32) {
+    val s: *Slot = ?room.slots[slot];
+    val o: *Out  = queue(r, ?s.addr);
+    if (o == nil) { ret; }
+    val at: i32 = p.header(?o.data[0], p.LOBBY, slot, 0, s.token);
+    o.data[at]     = room.players::u8;
+    o.data[at + 1] = joined(room)::u8;
+    o.len          = at + 2;
+}
+
+# tell everyone left in a room that a player has gone
+fun send_gone(r: *Relay, room: *Room, gone: i32) {
+    var i: i32 = 0;
+    for (i < MAXPLAYERS) {
+        val s: *Slot = ?room.slots[i];
+        if (i != gone && s.used && s.validated) {
+            val o: *Out = queue(r, ?s.addr);
+            if (o != nil) {
+                val at: i32 = p.header(?o.data[0], p.GONE, gone, 0, s.token);
+                o.data[at] = gone::u8;
+                o.len      = at + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun close_room(r: *Relay, room: *Room, now: i64) {
+    val before: i32 = r.nevents;
+    event(r, EV_CLOSED, room, 0);
+    if (room.started && r.nevents > before) { r.events[before].played = (now - room.began) / 1000; }
+    var blank: Room;
+    @room    = blank;
+    r.closed = r.closed + 1;
+}
+
+fun remove_slot(r: *Relay, room: *Room, slot: i32, why: u8, now: i64) {
+    event(r, why, room, slot);
+    send_gone(r, room, slot);
+    var blank: Slot;
+    room.slots[slot] = blank;
+    if (joined(room) == 0) { close_room(r, room, now); }
+}
+
+# a game starts when every seat is taken and every player has shown the
+# relay it can be reached
+fun try_start(r: *Relay, room: *Room, now: i64) {
+    if (room.started || joined(room) != room.players) { ret; }
+    var i: i32 = 0;
+    for (i < room.players) {
+        if (!room.slots[i].validated) { ret; }
+        i = i + 1;
+    }
+    room.started = 1;
+    room.began   = now;
+    r.started    = r.started + 1;
+    event(r, EV_STARTED, room, 0);
+    i            = 0;
+    for (i < room.players) {
+        send_start(r, room, i);
+        i = i + 1;
+    }
+}
+
+# whether an address may create or join again now
+fun rate_ok(r: *Relay, ip: u32, now: i64) bool {
+    var oldest: i32 = 0;
+    var i:      i32 = 0;
+    for (i < RATESLOTS) {
+        val e: *Rate = ?r.rates[i];
+        if (e.ip == ip && e.start != 0) {
+            if (now - e.start > RATE_WINDOW) {
+                e.start = now;
+                e.count = 0;
+            }
+            e.count = e.count + 1;
+            ret e.count <= RATE_LIMIT;
+        }
+        if (r.rates[i].start < r.rates[oldest].start) { oldest = i; }
+        i = i + 1;
+    }
+    # a new address takes the slot used longest ago
+    r.rates[oldest].ip    = ip;
+    r.rates[oldest].start = now;
+    r.rates[oldest].count = 1;
+    ret 1;
+}
+
+fun find_code(r: *Relay, code: *u8) *Room {
+    var i: i32 = 0;
+    for (i < r.maxrooms) {
+        val room: *Room = ?r.rooms[i];
+        if (room.used) {
+            var k:    i32  = 0;
+            var same: bool = 1;
+            for (k < p.CODELEN) {
+                if (room.code[k] != code[k]) { same = 0; }
+                k = k + 1;
+            }
+            if (same) { ret room; }
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun new_code(r: *Relay, room: *Room) {
+    for {
+        var bits: u64 = r.random();
+        var k:    i32 = 0;
+        for (k < p.CODELEN) {
+            room.code[k] = p.ALPHABET[(bits % p.SYMBOLS::u64)::i32];
+            bits         = bits / p.SYMBOLS::u64;
+            k            = k + 1;
+        }
+        # unique among live rooms; the room itself is not live yet
+        room.used = 0;
+        if (find_code(r, ?room.code[0]) == nil) { brk; }
+    }
+}
+
+fun new_token(r: *Relay) u64 {
+    var t: u64 = r.random();
+    if (t == 0) { t = 1; }
+    ret t;
+}
+
+fun create(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
+    if (len < p.HEADER + 16) { ret; }
+    if (!rate_ok(r, from.ip, now)) {
+        refuse(r, from, p.BUSY);
+        ret;
+    }
+    val nonce: u32 = p.get32(d, p.HEADER + 12);
+
+    # a repeated create, its answer lost: the same room again
+    var i: i32 = 0;
+    for (i < r.maxrooms) {
+        val room: *Room = ?r.rooms[i];
+        if (room.used && room.slots[0].used && same_addr(?room.slots[0].addr, from) && room.slots[0].nonce == nonce) {
+            welcome(r, room, 0);
+            ret;
+        }
+        i = i + 1;
+    }
+
+    if (d[p.HEADER + 3] != p.VERSION) {
+        refuse(r, from, p.OLD_VERSION);
+        ret;
+    }
+
+    i = 0;
+    for (i < r.maxrooms) {
+        if (!r.rooms[i].used) { brk; }
+        i = i + 1;
+    }
+    if (i == r.maxrooms) {
+        refuse(r, from, p.BUSY);
+        ret;
+    }
+
+    val room: *Room = ?r.rooms[i];
+    var blank: Room;
+    @room = blank;
+    new_code(r, room);
+    room.used    = 1;
+    room.players = d[p.HEADER]::i32;
+    if (room.players < 2) { room.players = 2; }
+    if (room.players > MAXPLAYERS) { room.players = MAXPLAYERS; }
+    room.skill   = d[p.HEADER + 1]::i32;
+    room.map     = d[p.HEADER + 2]::i32;
+    room.wadhash = p.get64(d, p.HEADER + 4);
+    room.created = now;
+
+    val s: *Slot = ?room.slots[0];
+    s.used     = 1;
+    s.token    = new_token(r);
+    s.addr     = @from;
+    s.nonce    = nonce;
+    s.lastseen = now;
+    r.created  = r.created + 1;
+    event(r, EV_OPENED, room, 0);
+    welcome(r, room, 0);
+}
+
+fun join(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
+    if (len < p.HEADER + 20) { ret; }
+    if (!rate_ok(r, from.ip, now)) {
+        refuse(r, from, p.BUSY);
+        ret;
+    }
+
+    var code: [6]u8;
+    var k:    i32 = 0;
+    for (k < p.CODELEN) {
+        code[k] = p.code_char(d[p.HEADER + k]);
+        k       = k + 1;
+    }
+    val room: *Room = find_code(r, ?code[0]);
+    if (room == nil) {
+        refuse(r, from, p.NO_ROOM);
+        ret;
+    }
+    val nonce: u32 = p.get32(d, p.HEADER + 16);
+
+    # a repeated join, its answer lost: the same seat again
+    var i: i32 = 0;
+    for (i < MAXPLAYERS) {
+        val s: *Slot = ?room.slots[i];
+        if (s.used && same_addr(?s.addr, from) && s.nonce == nonce) {
+            welcome(r, room, i);
+            ret;
+        }
+        i = i + 1;
+    }
+
+    if (room.started) {
+        refuse(r, from, p.STARTED);
+        ret;
+    }
+    if (d[p.HEADER + 6] != p.VERSION) {
+        refuse(r, from, p.OLD_VERSION);
+        ret;
+    }
+    if (p.get64(d, p.HEADER + 8) != room.wadhash) {
+        refuse(r, from, p.WAD_MISMATCH);
+        ret;
+    }
+
+    i = 1;
+    for (i < room.players) {
+        if (!room.slots[i].used) { brk; }
+        i = i + 1;
+    }
+    if (i >= room.players) {
+        refuse(r, from, p.ROOM_FULL);
+        ret;
+    }
+
+    val s: *Slot = ?room.slots[i];
+    s.used     = 1;
+    s.token    = new_token(r);
+    s.addr     = @from;
+    s.nonce    = nonce;
+    s.lastseen = now;
+    event(r, EV_JOINED, room, i);
+    welcome(r, room, i);
+}
+
+# the room and seat a token belongs to, or nil
+fun find_token(r: *Relay, slot: i32, token: u64) *Room {
+    if (slot < 0 || slot >= MAXPLAYERS || token == 0) { ret nil; }
+    var i: i32 = 0;
+    for (i < r.maxrooms) {
+        val room: *Room = ?r.rooms[i];
+        if (room.used && room.slots[slot].used && room.slots[slot].token == token) { ret room; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# one datagram from a game
+# ---
+# r:    the relay
+# d:    the datagram
+# len:  its length
+# from: where it came from
+# now:  the time, in milliseconds
+pub fun handle(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
+    if (!p.is_relay(d, len) || len > MAXPACKET) {
+        r.dropped = r.dropped + 1;
+        ret;
+    }
+    val kind: u8 = d[4];
+    if (kind == p.CREATE) {
+        create(r, d, len, from, now);
+        ret;
+    }
+    if (kind == p.JOIN) {
+        join(r, d, len, from, now);
+        ret;
+    }
+
+    # everything else must carry a seat's token
+    val slot: i32   = d[5]::i32;
+    val room: *Room = find_token(r, slot, p.get64(d, 8));
+    if (room == nil) {
+        r.dropped = r.dropped + 1;
+        ret;
+    }
+    val s: *Slot = ?room.slots[slot];
+
+    # a token from a new address is the same player after its router
+    # changed its mapping; the token is the proof it can be reached there
+    s.addr      = @from;
+    s.validated = 1;
+    s.lastseen  = now;
+
+    if (kind == p.STATUS) {
+        if (room.started) {
+            send_start(r, room, slot);
+        }
+        or {
+            send_lobby(r, room, slot);
+            try_start(r, room, now);
+        }
+    }
+    or (kind == p.DATA) {
+        val dest: i32 = d[6]::i32;
+        if (!room.started || dest < 0 || dest >= room.players || dest == slot) {
+            r.dropped = r.dropped + 1;
+            ret;
+        }
+        val to: *Slot = ?room.slots[dest];
+        if (!to.used || !to.validated) {
+            r.dropped = r.dropped + 1;
+            ret;
+        }
+        val o: *Out = queue(r, ?to.addr);
+        if (o == nil) { ret; }
+        val at: i32 = p.header(?o.data[0], p.DATA, slot, dest, to.token);
+        var k:  i32 = p.HEADER;
+        for (k < len) {
+            o.data[k] = d[k];
+            k         = k + 1;
+        }
+        o.len       = len;
+        r.forwarded = r.forwarded + 1;
+        k           = at;
+    }
+    or (kind == p.LEAVE) {
+        remove_slot(r, room, slot, EV_LEFT, now);
+    }
+}
+
+# the timers: drop silent players, close rooms nobody filled
+pub fun tick(r: *Relay, now: i64) {
+    var i: i32 = 0;
+    for (i < r.maxrooms) {
+        val room: *Room = ?r.rooms[i];
+        i = i + 1;
+        if (!room.used) { cnt; }
+
+        var limit: i64 = LOBBY_TIMEOUT;
+        if (room.started) { limit = PLAY_TIMEOUT; }
+        var k: i32 = 0;
+        for (k < MAXPLAYERS && room.used) {
+            if (room.slots[k].used && now - room.slots[k].lastseen > limit) { remove_slot(r, room, k, EV_TIMEDOUT, now); }
+            k = k + 1;
+        }
+        if (room.used && !room.started && now - room.created > ROOM_LIFETIME) { close_room(r, room, now); }
+    }
+}
+
+# how many rooms are open
+pub fun open_rooms(r: *Relay) i32 {
+    var n: i32 = 0;
+    var i: i32 = 0;
+    for (i < r.maxrooms) {
+        if (r.rooms[i].used) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# ------------------------------------------------------------------- tests
+
+var testseed: u64;
+
+fun test_random() u64 {
+    testseed = testseed * 6364136223846793005 + 1442695040888963407;
+    ret testseed;
+}
+
+fun request(buf: *u8, kind: u8, slot: i32, dest: i32, token: u64) i32 {
+    ret p.header(buf, kind, slot, dest, token);
+}
+
+fun create_req(buf: *u8, players: i32, wad: u64, nonce: u32) i32 {
+    val at: i32 = request(buf, p.CREATE, 0, 0, 0);
+    buf[at]     = players::u8;
+    buf[at + 1] = 2;
+    buf[at + 2] = 1;
+    buf[at + 3] = p.VERSION;
+    p.put64(buf, at + 4, wad);
+    p.put32(buf, at + 12, nonce);
+    ret at + 16;
+}
+
+fun join_req(buf: *u8, code: *u8, wad: u64, nonce: u32) i32 {
+    val at: i32 = request(buf, p.JOIN, 0, 0, 0);
+    var k:  i32 = 0;
+    for (k < 6) {
+        buf[at + k] = code[k];
+        k           = k + 1;
+    }
+    buf[at + 6] = p.VERSION;
+    buf[at + 7] = 0;
+    p.put64(buf, at + 8, wad);
+    p.put32(buf, at + 16, nonce);
+    ret at + 20;
+}
+
+fun fresh(r: *Relay) {
+    var blank: Relay;
+    @r         = blank;
+    r.maxrooms = 8;
+    r.random   = test_random;
+    testseed   = 7;
+}
+
+test relay__room_fills_starts_and_routes {
+    var r: Relay;
+    fresh(?r);
+    var buf:  [64]u8;
+    var host: Addr = Addr{ip: 0x0a000001, port: 5000};
+    var gst:  Addr = Addr{ip: 0x0a000002, port: 6000};
+
+    # create: a welcome with a code and a token
+    handle(?r, ?buf[0], create_req(?buf[0], 2, 77, 1), ?host, 0);
+    if (r.nout != 1 || r.out[0].data[4] != p.WELCOME) { ret 1; }
+    var code: [6]u8;
+    var k:    i32 = 0;
+    for (k < 6) {
+        code[k] = r.out[0].data[16 + k];
+        k       = k + 1;
+    }
+    val htoken: u64 = p.get64(?r.out[0].data[0], 8);
+    r.nout = 0;
+
+    # the same create again, its answer lost: the same room, no new one
+    handle(?r, ?buf[0], create_req(?buf[0], 2, 77, 1), ?host, 10);
+    if (open_rooms(?r) != 1 || p.get64(?r.out[0].data[0], 8) != htoken) { ret 2; }
+    r.nout = 0;
+
+    # a different WAD is turned away
+    handle(?r, ?buf[0], join_req(?buf[0], ?code[0], 78, 9), ?gst, 20);
+    if (r.out[0].data[4] != p.REFUSED || r.out[0].data[16] != p.WAD_MISMATCH) { ret 3; }
+    r.nout = 0;
+
+    # the right one gets seat 1, in lower case too
+    k = 0;
+    for (k < 6) {
+        if (code[k] >= 'A' && code[k] <= 'Z') { code[k] = code[k] + 32; }
+        k = k + 1;
+    }
+    handle(?r, ?buf[0], join_req(?buf[0], ?code[0], 77, 2), ?gst, 30);
+    if (r.out[0].data[4] != p.WELCOME || r.out[0].data[5] != 1) { ret 4; }
+    val gtoken: u64 = p.get64(?r.out[0].data[0], 8);
+    r.nout = 0;
+
+    # nothing starts until both have shown they can be reached
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 0, 0, htoken), ?host, 40);
+    if (r.rooms[0].started) { ret 5; }
+    r.nout = 0;
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 1, 0, gtoken), ?gst, 50);
+    if (!r.rooms[0].started) { ret 6; }
+    r.nout = 0;
+
+    # data from the host to seat 1 reaches the guest only, marked as the
+    # host's, carrying the guest's token
+    val at: i32 = request(?buf[0], p.DATA, 0, 1, htoken);
+    buf[at]     = 0xab;
+    handle(?r, ?buf[0], at + 1, ?host, 60);
+    if (r.nout != 1 || !same_addr(?r.out[0].to, ?gst)) { ret 7; }
+    if (r.out[0].data[5] != 0 || r.out[0].data[16] != 0xab || p.get64(?r.out[0].data[0], 8) != gtoken) { ret 8; }
+    r.nout = 0;
+
+    # a wrong token goes nowhere
+    handle(?r, ?buf[0], request(?buf[0], p.DATA, 0, 1, htoken + 1), ?host, 70);
+    if (r.nout != 0) { ret 9; }
+
+    # the guest goes silent: after the timeout the host is told
+    tick(?r, 50 + PLAY_TIMEOUT + 1);
+    if (r.nout != 1 || r.out[0].data[4] != p.GONE || !same_addr(?r.out[0].to, ?host)) { ret 10; }
+    ret 0;
+}
+
+test relay__events_tell_the_story {
+    var r: Relay;
+    fresh(?r);
+    var buf:  [64]u8;
+    var host: Addr = Addr{ip: 1, port: 1};
+    var gst:  Addr = Addr{ip: 2, port: 2};
+
+    handle(?r, ?buf[0], create_req(?buf[0], 2, 5, 1), ?host, 0);
+    val htoken: u64 = p.get64(?r.out[0].data[0], 8);
+    var code: [6]u8;
+    var k:    i32 = 0;
+    for (k < 6) {
+        code[k] = r.out[0].data[16 + k];
+        k       = k + 1;
+    }
+    handle(?r, ?buf[0], join_req(?buf[0], ?code[0], 6, 2), ?gst, 10);
+    handle(?r, ?buf[0], join_req(?buf[0], ?code[0], 5, 2), ?gst, 20);
+    val gtoken: u64 = p.get64(?r.out[r.nout - 1].data[0], 8);
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 0, 0, htoken), ?host, 30);
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 1, 0, gtoken), ?gst, 40);
+    handle(?r, ?buf[0], request(?buf[0], p.LEAVE, 1, 0, gtoken), ?gst, 5040);
+    handle(?r, ?buf[0], request(?buf[0], p.LEAVE, 0, 0, htoken), ?host, 7040);
+
+    val want: [7]u8 = [7]u8{EV_OPENED, EV_REFUSED, EV_JOINED, EV_STARTED, EV_LEFT, EV_LEFT, EV_CLOSED};
+    if (r.nevents != 7) { ret 1; }
+    k = 0;
+    for (k < 7) {
+        if (r.events[k].what != want[k]) { ret 2 + k; }
+        k = k + 1;
+    }
+    if (r.events[1].slot != p.WAD_MISMATCH::i32 || r.events[2].slot != 1 || r.events[4].slot != 1) { ret 10; }
+    if (r.events[6].played != 7 || r.events[6].code[0] != code[0]) { ret 11; }
+    ret 0;
+}
+
+test relay__rooms_do_not_mix {
+    var r: Relay;
+    fresh(?r);
+    var buf: [64]u8;
+    var a:   Addr = Addr{ip: 1, port: 1};
+    var b:   Addr = Addr{ip: 2, port: 2};
+
+    handle(?r, ?buf[0], create_req(?buf[0], 2, 5, 1), ?a, 0);
+    val ta: u64 = p.get64(?r.out[0].data[0], 8);
+    r.nout = 0;
+    handle(?r, ?buf[0], create_req(?buf[0], 2, 5, 1), ?b, 0);
+    if (open_rooms(?r) != 2) { ret 1; }
+    r.nout = 0;
+
+    # a's token names seat 0 of a's room; it cannot speak as seat 1 anywhere
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 1, 0, ta), ?a, 5);
+    if (r.nout != 0 || r.dropped == 0) { ret 2; }
+
+    # an unknown code is refused
+    var nocode: [6]u8 = [6]u8{'2', '2', '2', '2', '2', '2'};
+    handle(?r, ?buf[0], join_req(?buf[0], ?nocode[0], 5, 3), ?a, 6);
+    if (r.out[0].data[16] != p.NO_ROOM) { ret 3; }
+    ret 0;
+}
+
+test relay__rate_limit {
+    var r: Relay;
+    fresh(?r);
+    var buf: [64]u8;
+    var a:   Addr = Addr{ip: 9, port: 9};
+    var nocode: [6]u8 = [6]u8{'2', '2', '2', '2', '2', '2'};
+    var i: i32 = 0;
+    for (i < 25) {
+        r.nout = 0;
+        handle(?r, ?buf[0], join_req(?buf[0], ?nocode[0], 5, i::u32), ?a, 100);
+        i = i + 1;
+    }
+    # the 25th guess within the window is turned away as busy, not checked
+    if (r.out[0].data[16] != p.BUSY) { ret 1; }
+    ret 0;
+}

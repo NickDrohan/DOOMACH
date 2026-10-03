@@ -19,9 +19,11 @@ use io_error: std.io.error;
 use std.net.ip;
 use socket_api: std.net.socket;
 use std.net.udp;
+use std.crypto.rand;
 
 use doom.defs;
 use doom.defs.Ticcmd;
+use rp: doom.relayproto;
 
 pub val PORT: u16 = 5029;
 
@@ -29,13 +31,24 @@ val KIND_COMMAND: u8 = 1;
 val KIND_START:   u8 = 2;
 val KIND_HELLO:   u8 = 3;
 val KIND_QUIT:    u8 = 4;
+val KIND_REFUSE:  u8 = 5;
 
 # commands kept per player, and the most a packet carries
 val BACKUP:  i32 = 128;
 val PERPACK: i32 = 16;
 
-# how far this machine's commands may run ahead of the tic being played
+# how far this machine's commands may run ahead of the tic being played,
+# beyond the playout cushion
 pub val LEAD: i32 = 4;
+
+# the playout cushion, in tics: a tic is played only once this machine's own
+# commands are that far past it, which gives the others' commands that long
+# to arrive. It starts here, grows by one after a wait (at most every
+# quarter second), and shrinks by one
+# after CALM steps in which commands kept arriving at least two tics early.
+val PLAYOUT_START: i32 = 2;
+val PLAYOUT_MAX:   i32 = 12;
+val CALM:          i32 = 175;
 
 # where a player is on the network: an IPv4 address and a port
 pub rec Peer {
@@ -68,6 +81,14 @@ pub rec Net {
     # how many of my own commands exist
     maketic: i32;
 
+    # the playout cushion; steps since it last grew, and steps in a row with
+    # room to spare; how many steps had to wait, and the largest cushion
+    playout:  i32;
+    sincegrew: i32;
+    calm:     i32;
+    waits:    i32;
+    widest:   i32;
+
     # my checksum of the world after each tic, by tic % BACKUP
     sums:    [128]u32;
     sumtics: [128]i32;
@@ -75,7 +96,28 @@ pub rec Net {
     # a peer's checksum disagreed with mine, at this tic; or a peer quit
     desync:    bool;
     desynctic: i32;
+    # the two checksums that disagreed, mine and the peer's, and whose
+    mysum:     u32;
+    theirsum:  u32;
+    against:   i32;
     quit:      bool;
+
+    # the WAD every machine must hold, as the first eight bytes of its hash
+    wadhash: u64;
+    # why the host or the relay turned this machine away, or 0
+    refused: u8;
+
+    # through a relay: where it is, this player's token, the room's code,
+    # how many have joined, and a count that paces the lobby messages
+    relaymode: bool;
+    relay:     Peer;
+    token:     u64;
+    code:      [7]u8;
+    joincode:  [6]u8;
+    joined:    i32;
+    nonce:     u32;
+    pace:      i32;
+    wrap:      [288]u8;
 
     packet: [256]u8;
 }
@@ -121,7 +163,69 @@ fun begin(n: *Net, kind: u8) i32 {
 
 fun send(n: *Net, peer: i32, len: i32) {
     if (!n.peers[peer].known) { ret; }
+    if (n.relaymode) {
+        # through the relay: the same datagram, in an envelope naming who it
+        # is for
+        val at: i32 = rp.header(?n.wrap[0], rp.DATA, n.me, peer, n.token);
+        var k:  i32 = 0;
+        for (k < len) {
+            n.wrap[at + k] = n.packet[k];
+            k              = k + 1;
+        }
+        udp.send_to(?n.sock, ?n.wrap[0], (at + len)::usize, endpoint_of(?n.relay));
+        ret;
+    }
     udp.send_to(?n.sock, ?n.packet[0], len::usize, endpoint_of(?n.peers[peer]));
+}
+
+# a message to the relay itself
+fun to_relay(n: *Net, len: i32) {
+    udp.send_to(?n.sock, ?n.wrap[0], len::usize, endpoint_of(?n.relay));
+}
+
+# read where a host or relay is: a.b.c.d with an optional :port, the port
+# the default when absent
+pub fun parse_address(text: str, out: *Peer) bool {
+    val parsed: res[ip.Endpoint, ip.ParseError] = ip.endpoint_parse(text);
+    var ep:     ip.Endpoint;
+    if (sel parsed.ok) {
+        ep = parsed.ok;
+    }
+    or {
+        val addr: res[ip.IPv4, ip.ParseError] = ip.ipv4_parse(text);
+        if (sel addr.err) { ret 0; }
+        ep = ip.endpoint_v4(addr.ok, PORT);
+    }
+    if (ep.addr.is_v6 != 0) { ret 0; }
+    set_peer(out, ?ep);
+    ret 1;
+}
+
+# play through a relay rather than directly
+# ---
+# n:     the network state, opened
+# relay: where the relay is
+pub fun use_relay(n: *Net, relay: *Peer) {
+    n.relaymode   = 1;
+    n.relay       = @relay;
+    n.relay.known = 1;
+    n.nonce       = rand.u32() | 1;
+}
+
+# join the room with a code, through the relay set by use_relay
+# ---
+# ret: whether the code is six of the code's symbols
+pub fun join_code(n: *Net, code: str) bool {
+    var k: i32 = 0;
+    for (k < rp.CODELEN) {
+        val c: u8 = rp.code_char(code[k]);
+        if (c == 0) { ret 0; }
+        n.joincode[k] = c;
+        k             = k + 1;
+    }
+    if (code[rp.CODELEN] != 0) { ret 0; }
+    n.host = 0;
+    ret 1;
 }
 
 fun reset(n: *Net) {
@@ -141,7 +245,12 @@ fun reset(n: *Net) {
         n.acked[i] = 0;
         i          = i + 1;
     }
-    n.maketic = 0;
+    n.maketic   = 0;
+    n.playout   = PLAYOUT_START;
+    n.widest    = PLAYOUT_START;
+    n.sincegrew = 0;
+    n.calm      = 0;
+    n.waits     = 0;
 }
 
 # open a socket on a port, without blocking on receives
@@ -166,12 +275,15 @@ pub fun close(n: *Net) {
     # say goodbye, more than once in case one is lost
     var k: i32 = 0;
     for (k < 3) {
-        val len: i32 = begin(n, KIND_QUIT);
-        var p:   i32 = 0;
-        for (p < n.players) {
-            if (p != n.me) { send(n, p, len); }
-            p = p + 1;
+        if (n.started) {
+            val len: i32 = begin(n, KIND_QUIT);
+            var p:   i32 = 0;
+            for (p < n.players) {
+                if (p != n.me) { send(n, p, len); }
+                p = p + 1;
+            }
         }
+        if (n.relaymode && n.token != 0) { to_relay(n, rp.header(?n.wrap[0], rp.LEAVE, n.me, 0, n.token)); }
         k = k + 1;
     }
     udp.socket_close(?n.sock);
@@ -255,6 +367,10 @@ fun handle(n: *Net, len: i32, from: *ip.Endpoint) {
     val kind:   u8  = n.packet[4];
     val sender: i32 = n.packet[5]::i32;
 
+    # hello and start belong to a direct game; through a relay they come
+    # without an address and are ignored
+    if ((kind == KIND_HELLO || kind == KIND_START) && from == nil) { ret; }
+
     if (kind == KIND_HELLO && n.host) {
         # a known joiner asking again has missed its start
         var p: i32 = 1;
@@ -266,6 +382,22 @@ fun handle(n: *Net, len: i32, from: *ip.Endpoint) {
             p = p + 1;
         }
         if (n.started) { ret; }
+
+        # a different build or WAD would only go out of step: turn it away
+        var why: u8 = 0;
+        if (len < 15 || n.packet[6] != rp.VERSION) {
+            why = rp.OLD_VERSION;
+        }
+        or (rp.get64(?n.packet[0], 7) != n.wadhash) {
+            why = rp.WAD_MISMATCH;
+        }
+        if (why != 0) {
+            val at: i32 = begin(n, KIND_REFUSE);
+            n.packet[at] = why;
+            udp.send_to(?n.sock, ?n.packet[0], (at + 1)::usize, @from);
+            ret;
+        }
+
         # a new joiner takes the next number
         p = 1;
         for (p < n.players) {
@@ -301,6 +433,11 @@ fun handle(n: *Net, len: i32, from: *ip.Endpoint) {
         ret;
     }
 
+    if (kind == KIND_REFUSE && !n.host && !n.started && len >= 7) {
+        n.refused = n.packet[6];
+        ret;
+    }
+
     if (kind == KIND_QUIT && n.started) {
         n.quit = 1;
         ret;
@@ -332,7 +469,72 @@ fun handle(n: *Net, len: i32, from: *ip.Endpoint) {
         if (checktic >= 0 && n.sumtics[checktic % BACKUP] == checktic && n.sums[checktic % BACKUP] != check && !n.desync) {
             n.desync    = 1;
             n.desynctic = checktic;
+            n.mysum     = n.sums[checktic % BACKUP];
+            n.theirsum  = check;
+            n.against   = sender;
         }
+    }
+}
+
+# a datagram from the relay
+fun from_relay(n: *Net, len: i32) {
+    if (!rp.is_relay(?n.wrap[0], len)) { ret; }
+    val kind: u8  = n.wrap[4];
+    val body: i32 = rp.HEADER;
+
+    if (kind == rp.WELCOME && len >= body + 10) {
+        n.token = rp.get64(?n.wrap[0], 8);
+        n.me    = n.wrap[5]::i32;
+        var k: i32 = 0;
+        for (k < rp.CODELEN) {
+            n.code[k] = n.wrap[body + k];
+            k         = k + 1;
+        }
+        n.code[6]  = 0;
+        n.players  = n.wrap[body + 6]::i32;
+        n.skill    = n.wrap[body + 7]::i32;
+        n.map      = n.wrap[body + 8]::i32;
+        n.joined   = n.wrap[body + 9]::i32;
+        n.pace     = 0;
+        ret;
+    }
+    if (kind == rp.REFUSED && len >= body + 1 && n.token == 0) {
+        n.refused = n.wrap[body];
+        ret;
+    }
+
+    # the rest is for this player only
+    if (n.token == 0 || rp.get64(?n.wrap[0], 8) != n.token) { ret; }
+
+    if (kind == rp.LOBBY && len >= body + 2) {
+        n.joined = n.wrap[body + 1]::i32;
+    }
+    or (kind == rp.START && len >= body + 3 && !n.started) {
+        n.players = n.wrap[body]::i32;
+        n.skill   = n.wrap[body + 1]::i32;
+        n.map     = n.wrap[body + 2]::i32;
+        if (n.players < 2 || n.players > 4 || n.me >= n.players) { ret; }
+        var q: i32 = 0;
+        for (q < n.players) {
+            n.peers[q].known = q != n.me;
+            q                = q + 1;
+        }
+        n.started = 1;
+    }
+    or (kind == rp.GONE && n.started) {
+        n.quit = 1;
+    }
+    or (kind == rp.DATA && n.started) {
+        # the game's own datagram, from the player the relay says sent it
+        val slot: i32 = n.wrap[5]::i32;
+        val size: i32 = len - body;
+        if (size < 6 || size > 256 || n.wrap[body + 5]::i32 != slot) { ret; }
+        var k: i32 = 0;
+        for (k < size) {
+            n.packet[k] = n.wrap[body + k];
+            k           = k + 1;
+        }
+        handle(n, size, nil);
     }
 }
 
@@ -341,10 +543,56 @@ pub fun receive(n: *Net) {
     if (!n.opened) { ret; }
     for {
         var from: ip.Endpoint;
-        val got:  res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.packet[0], 256, ?from);
+        if (n.relaymode) {
+            val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.wrap[0], 288, ?from);
+            if (sel got.err) { brk; }
+            # only the relay speaks to a game that uses one
+            if (same_peer(?n.relay, ?from)) { from_relay(n, got.ok::i32); }
+            cnt;
+        }
+        val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.packet[0], 256, ?from);
         if (sel got.err) { brk; }
         handle(n, got.ok::i32, ?from);
     }
+}
+
+# the lobby through a relay: create or join until welcomed, then report in
+# until the room is full and the relay says start
+fun gather_relay(n: *Net) bool {
+    if (n.started) { ret 1; }
+    if (n.refused != 0) { ret 0; }
+    n.pace = n.pace + 1;
+    if ((n.pace % 12) != 1) { ret 0; }
+
+    if (n.token == 0) {
+        if (n.host) {
+            val at: i32 = rp.header(?n.wrap[0], rp.CREATE, 0, 0, 0);
+            n.wrap[at]     = n.players::u8;
+            n.wrap[at + 1] = n.skill::u8;
+            n.wrap[at + 2] = n.map::u8;
+            n.wrap[at + 3] = rp.VERSION;
+            rp.put64(?n.wrap[0], at + 4, n.wadhash);
+            rp.put32(?n.wrap[0], at + 12, n.nonce);
+            to_relay(n, at + 16);
+        }
+        or {
+            val at: i32 = rp.header(?n.wrap[0], rp.JOIN, 0, 0, 0);
+            var k:  i32 = 0;
+            for (k < rp.CODELEN) {
+                n.wrap[at + k] = n.joincode[k];
+                k              = k + 1;
+            }
+            n.wrap[at + 6] = rp.VERSION;
+            n.wrap[at + 7] = 0;
+            rp.put64(?n.wrap[0], at + 8, n.wadhash);
+            rp.put32(?n.wrap[0], at + 16, n.nonce);
+            to_relay(n, at + 20);
+        }
+        ret 0;
+    }
+
+    to_relay(n, rp.header(?n.wrap[0], rp.STATUS, n.me, 0, n.token));
+    ret 0;
 }
 
 # while gathering players: the host checks whether everyone has arrived and
@@ -353,7 +601,9 @@ pub fun receive(n: *Net) {
 # ret: whether the game has started
 pub fun gather(n: *Net) bool {
     receive(n);
+    if (n.relaymode) { ret gather_relay(n); }
     if (n.started) { ret 1; }
+    if (n.refused != 0) { ret 0; }
 
     if (n.host) {
         var p: i32 = 1;
@@ -368,13 +618,73 @@ pub fun gather(n: *Net) bool {
         ret 1;
     }
 
-    send(n, 0, begin(n, KIND_HELLO));
+    # hello, with this build's version and the WAD it holds
+    val at: i32 = begin(n, KIND_HELLO);
+    n.packet[at] = rp.VERSION;
+    rp.put64(?n.packet[0], at + 1, n.wadhash);
+    send(n, 0, at + 9);
     ret 0;
+}
+
+# a line for the waiting screen about why this machine was turned away
+pub fun refusal(n: *Net) str {
+    val why: u8 = n.refused;
+    if (why == rp.NO_ROOM) { ret "there is no room with that code."; }
+    if (why == rp.ROOM_FULL) { ret "that room is full."; }
+    if (why == rp.STARTED) { ret "that game has already started."; }
+    if (why == rp.WAD_MISMATCH) { ret "the host has a different version of\nthe game or the WAD. everyone needs\nthe same download."; }
+    if (why == rp.OLD_VERSION) { ret "the host has a different version of this game."; }
+    if (why == rp.BUSY) { ret "the relay is busy; try again in a little while."; }
+    ret "the game could not be joined.";
 }
 
 # whether another of my commands may be made yet
 pub fun wants_command(n: *Net, gametic: i32) bool {
-    ret n.maketic < gametic + LEAD && n.maketic - n.have[n.me] < BACKUP - PERPACK;
+    ret n.maketic < gametic + n.playout + LEAD && n.maketic - n.have[n.me] < BACKUP - PERPACK;
+}
+
+# whether a tic is due to be played, on a machine that makes one command a
+# tic by the clock: once its own commands are the cushion past it
+pub fun due(n: *Net, tic: i32) bool {
+    ret tic + n.playout < n.maketic;
+}
+
+# after a step of the clock has played what it could: if a tic is still due,
+# the step waited, and the cushion grows; if commands keep arriving early,
+# it shrinks
+# ---
+# gametic: the next tic to play
+pub fun pace(n: *Net, gametic: i32) {
+    n.sincegrew = n.sincegrew + 1;
+    if (due(n, gametic)) {
+        n.waits = n.waits + 1;
+        n.calm  = 0;
+        # grow at most every quarter second, so that a far player settles in
+        # a second or so and one late packet costs one tic of cushion
+        if (n.playout < PLAYOUT_MAX && n.sincegrew >= 8) {
+            n.playout   = n.playout + 1;
+            n.sincegrew = 0;
+            if (n.playout > n.widest) { n.widest = n.playout; }
+        }
+        ret;
+    }
+    # how many tics past the next one every player's commands already reach
+    var early: i32 = BACKUP;
+    var p:     i32 = 0;
+    for (p < n.players) {
+        if (p != n.me && n.have[p] - gametic - 1 < early) { early = n.have[p] - gametic - 1; }
+        p = p + 1;
+    }
+    if (early >= 2) {
+        n.calm = n.calm + 1;
+    }
+    or {
+        n.calm = 0;
+    }
+    if (n.calm >= CALM && n.playout > 1) {
+        n.playout = n.playout - 1;
+        n.calm    = 0;
+    }
 }
 
 # hold my own command for the next tic

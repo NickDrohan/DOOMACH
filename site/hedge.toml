@@ -1,0 +1,25 @@
+# hedge serving the download page beside the relay. Fly's proxy ends TLS and
+# passes plain HTTP to port 8080.
+
+[server]
+name = "doom-site"
+
+[[listener]]
+name = "public"
+address = "0.0.0.0:8080"
+protocols = ["http/1.1"]
+
+[host.site]
+listener = "public"
+names = ["mach-doom-relay.fly.dev", "localhost"]
+
+[service.files]
+kind = "static"
+root = "/srv/site"
+index = "index.html"
+
+[[route]]
+name = "everything"
+host = "site"
+path = "/**"
+service = "files"

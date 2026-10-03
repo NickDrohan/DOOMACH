@@ -1,0 +1,324 @@
+# relay: the rendezvous server for co-op games across the internet
+#
+#   relay [<port>] [--impair <seed> <drop%> <dup%> <reorder%>] [--delay <ms> <jitter ms>]
+#
+# Games connect out to it, so no player needs to open a port. It keeps rooms
+# by code and forwards each game datagram to the one player it names; it
+# never reads the game inside them. Configuration comes from the command line
+# or, as Fly runs it, the environment:
+#
+#   RELAY_BIND_HOST   address or host name to listen on (default 0.0.0.0)
+#   RELAY_UDP_PORT    port (default 5029)
+#   RELAY_MAX_ROOMS   rooms open at once (default 32, at most 256)
+#
+# --impair makes it a bad network on purpose, for tests: it drops,
+# duplicates and reorders the datagrams it sends, from a seeded sequence.
+# --delay makes it a far one: every datagram it sends waits that long, plus
+# up to the jitter more, which also reorders them.
+#
+# Rooms live in memory only. Restarting the relay ends every game.
+
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+
+use io_error: std.io.error;
+use std.chrono.time;
+use std.crypto.rand;
+use std.net.dns;
+use dnstypes: std.net.resolve.types;
+use std.net.ip;
+use std.net.udp;
+use std.process.env;
+use std.text.parse;
+
+use core: doom.relaycore;
+
+fun number(s: str, fallback: i64) i64 {
+    val r: res[i64, parse.ParseError] = parse.parse_i64(s, 10);
+    if (sel r.ok) { ret r.ok; }
+    ret fallback;
+}
+
+# a setting from the environment, or nil
+fun setting(name: str, buf: *u8, cap: usize) str {
+    val got: res[opt[usize], env.EnvError] = env.get(name, buf, cap);
+    if (sel got.err) { ret nil; }
+    if (sel got.ok.none) { ret nil; }
+    ret buf;
+}
+
+fun random() u64 {
+    ret rand.u64();
+}
+
+fun millis() i64 {
+    val now: time.InstantClock = time.instant();
+    if (sel now.err) { ret 0; }
+    ret now.ok.sec * 1000 + now.ok.nsec / 1000000;
+}
+
+# the network made bad on purpose
+rec Impair {
+    on:      bool;
+    seed:    u64;
+    drop:    i32;
+    dup:     i32;
+    reorder: i32;
+    held:    bool;
+    heldout: core.Out;
+
+    # the network made far: datagrams waiting to go, and when each is due
+    delay:   i64;
+    jitter:  i64;
+    later:   [512]core.Out;
+    due:     [512]i64;
+    nlater:  i32;
+}
+
+fun chance(m: *Impair) i32 {
+    m.seed = m.seed * 6364136223846793005 + 1442695040888963407;
+    ret ((m.seed >> 33) % 100)::i32;
+}
+
+fun send_now(sock: *udp.Socket, o: *core.Out) {
+    val ep: ip.Endpoint = ip.endpoint((o.to.ip >> 24)::u8, (o.to.ip >> 16)::u8, (o.to.ip >> 8)::u8, o.to.ip::u8, o.to.port);
+    udp.send_to(sock, ?o.data[0], o.len::usize, ep);
+}
+
+# send, or with --delay, hold until due
+fun send_one(sock: *udp.Socket, o: *core.Out, m: *Impair, now: i64) {
+    if (m.delay == 0 && m.jitter == 0) {
+        send_now(sock, o);
+        ret;
+    }
+    # a full hold drops, as a congested link would
+    if (m.nlater >= 512) { ret; }
+    var wait: i64 = m.delay;
+    if (m.jitter > 0) { wait = wait + chance(m)::i64 * m.jitter / 100; }
+    m.later[m.nlater] = @o;
+    m.due[m.nlater]   = now + wait;
+    m.nlater          = m.nlater + 1;
+}
+
+# send whatever held datagrams are due, keeping the rest in order
+fun release(sock: *udp.Socket, m: *Impair, now: i64) {
+    var kept: i32 = 0;
+    var i:    i32 = 0;
+    for (i < m.nlater) {
+        if (m.due[i] <= now) {
+            send_now(sock, ?m.later[i]);
+        }
+        or {
+            if (kept != i) {
+                m.later[kept] = m.later[i];
+                m.due[kept]   = m.due[i];
+            }
+            kept = kept + 1;
+        }
+        i = i + 1;
+    }
+    m.nlater = kept;
+}
+
+# send what the core queued, through the impairment if any
+fun flush(sock: *udp.Socket, r: *core.Relay, m: *Impair, now: i64) {
+    var i: i32 = 0;
+    for (i < r.nout) {
+        val o: *core.Out = ?r.out[i];
+        i = i + 1;
+        if (!m.on) {
+            send_one(sock, o, m, now);
+            cnt;
+        }
+        if (chance(m) < m.drop) { cnt; }
+        if (!m.held && chance(m) < m.reorder) {
+            # keep this one back until after the next
+            m.heldout = @o;
+            m.held    = 1;
+            cnt;
+        }
+        send_one(sock, o, m, now);
+        if (chance(m) < m.dup) { send_one(sock, o, m, now); }
+        if (m.held) {
+            send_one(sock, ?m.heldout, m, now);
+            m.held = 0;
+        }
+    }
+    r.nout = 0;
+}
+
+fun event_name(what: u8) str {
+    if (what == core.EV_OPENED)   { ret "opened"; }
+    if (what == core.EV_JOINED)   { ret "joined"; }
+    if (what == core.EV_STARTED)  { ret "started"; }
+    if (what == core.EV_LEFT)     { ret "left"; }
+    if (what == core.EV_TIMEDOUT) { ret "timed out"; }
+    if (what == core.EV_CLOSED)   { ret "closed"; }
+    ret "refused";
+}
+
+fun refusal_name(reason: i32) str {
+    if (reason == 1) { ret "no such room"; }
+    if (reason == 2) { ret "room full"; }
+    if (reason == 3) { ret "already started"; }
+    if (reason == 4) { ret "different game or WAD"; }
+    if (reason == 5) { ret "different protocol version"; }
+    ret "busy or rate-limited";
+}
+
+# a line for each thing that happened to a room since the last call
+fun tell(r: *core.Relay) {
+    var i: i32 = 0;
+    for (i < r.nevents) {
+        val e: *core.Event = ?r.events[i];
+        var code: [7]u8;
+        var k:    i32 = 0;
+        for (k < 6) {
+            code[k] = e.code[k];
+            k       = k + 1;
+        }
+        code[6] = 0;
+        if (e.what == core.EV_REFUSED) {
+            print.printlnf("relay: refused: {}", refusal_name(e.slot));
+        }
+        or (e.what == core.EV_JOINED || e.what == core.EV_LEFT || e.what == core.EV_TIMEDOUT) {
+            print.printlnf("relay: room {} player {} {}", ?code[0], e.slot + 1, event_name(e.what));
+        }
+        or (e.what == core.EV_CLOSED) {
+            print.printlnf("relay: room {} closed after {} s of play", ?code[0], e.played);
+        }
+        or {
+            print.printlnf("relay: room {} {} for {} players", ?code[0], event_name(e.what), e.players);
+        }
+        i = i + 1;
+    }
+    r.nevents = 0;
+}
+
+fun report(r: *core.Relay) {
+    print.printlnf("relay: rooms {} created {} started {} closed {} forwarded {} refused {} dropped {}",
+        core.open_rooms(r), r.created, r.started, r.closed, r.forwarded, r.refused, r.dropped);
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var hostbuf: [256]u8;
+    var portbuf: [32]u8;
+    var roombuf: [32]u8;
+    var bindhost: str = setting("RELAY_BIND_HOST", ?hostbuf[0], 256);
+    if (bindhost == nil) { bindhost = "0.0.0.0"; }
+    var port: i64 = 5029;
+    val portenv: str = setting("RELAY_UDP_PORT", ?portbuf[0], 32);
+    if (portenv != nil) { port = number(portenv, 5029); }
+    var maxrooms: i64 = 32;
+    val roomenv: str = setting("RELAY_MAX_ROOMS", ?roombuf[0], 32);
+    if (roomenv != nil) { maxrooms = number(roomenv, 32); }
+    if (maxrooms < 1) { maxrooms = 1; }
+    if (maxrooms > core.MAXROOMS::i64) { maxrooms = core.MAXROOMS::i64; }
+
+    var m: Impair;
+    var i: i64 = 1;
+    for (i < argc) {
+        if (str_equals(argv[i], "--impair") && i + 4 < argc) {
+            m.on      = 1;
+            m.seed    = number(argv[i + 1], 1)::u64;
+            m.drop    = number(argv[i + 2], 0)::i32;
+            m.dup     = number(argv[i + 3], 0)::i32;
+            m.reorder = number(argv[i + 4], 0)::i32;
+            i         = i + 5;
+            cnt;
+        }
+        if (str_equals(argv[i], "--delay") && i + 2 < argc) {
+            m.delay  = number(argv[i + 1], 0);
+            m.jitter = number(argv[i + 2], 0);
+            i        = i + 3;
+            cnt;
+        }
+        port = number(argv[i], port);
+        i    = i + 1;
+    }
+
+    # the address to listen on: a literal, or a name such as Fly's
+    # fly-global-services, looked up as IPv4
+    var addr:   ip.IPv4;
+    val parsed: res[ip.IPv4, ip.ParseError] = ip.ipv4_parse(bindhost);
+    if (sel parsed.ok) {
+        addr = parsed.ok;
+    }
+    or {
+        val looked: res[bool, dnstypes.Error] = dns.resolve(bindhost, ?addr);
+        if (sel looked.err) {
+            print.eprintlnf("relay: cannot resolve {}", bindhost);
+            ret 1;
+        }
+        if (!looked.ok) {
+            print.eprintlnf("relay: cannot resolve {}", bindhost);
+            ret 1;
+        }
+    }
+
+    val bound: res[udp.Socket, io_error.Error] = udp.bind(ip.endpoint_v4(addr, port::u16));
+    if (sel bound.err) {
+        print.eprintlnf("relay: cannot listen on {}:{}", bindhost, port);
+        ret 1;
+    }
+    var sock: udp.Socket = bound.ok;
+    # a held datagram must not wait on a quiet socket
+    var timeout: u64 = 100;
+    if (m.delay > 0 || m.jitter > 0) { timeout = 1; }
+    udp.socket_set_recv_timeout(?sock, timeout);
+
+    var r: core.Relay;
+    r.maxrooms = maxrooms::i32;
+    r.random   = random;
+
+    print.printlnf("relay: listening on {}:{}, at most {} rooms", bindhost, port, maxrooms);
+    if (m.on) { print.printlnf("relay: impaired: drop {}% duplicate {}% reorder {}%", m.drop, m.dup, m.reorder); }
+    if (m.delay > 0 || m.jitter > 0) { print.printlnf("relay: delayed: {} ms plus up to {} ms", m.delay, m.jitter); }
+
+    var buf:      [1500]u8;
+    var lasttick: i64 = millis();
+    var lastlog:  i64 = lasttick;
+    var lastrooms: i32 = 0;
+    for {
+        var from: ip.Endpoint;
+        val got:  res[usize, io_error.Error] = udp.recv_from(?sock, ?buf[0], 1500, ?from);
+        val now:  i64 = millis();
+        # an IPv6 sender is not served; the relay listens on IPv4
+        if (sel got.ok) {
+            var a: core.Addr;
+            a.ip   = (from.addr.v4.octets[0]::u32 << 24) | (from.addr.v4.octets[1]::u32 << 16) |
+                (from.addr.v4.octets[2]::u32 << 8) | from.addr.v4.octets[3]::u32;
+            a.port = from.port;
+            if (from.addr.is_v6 == 0) {
+                core.handle(?r, ?buf[0], got.ok::i32, ?a, now);
+                flush(?sock, ?r, ?m, now);
+            }
+        }
+
+        if (now - lasttick >= 250) {
+            core.tick(?r, now);
+            flush(?sock, ?r, ?m, now);
+            lasttick = now;
+        }
+
+        release(?sock, ?m, now);
+        tell(?r);
+
+        # a line when the number of rooms changes, and once a minute
+        val rooms: i32 = core.open_rooms(?r);
+        if (rooms != lastrooms || now - lastlog >= 60000) {
+            report(?r);
+            lastrooms = rooms;
+            lastlog   = now;
+        }
+    }
+    ret 0;
+}
