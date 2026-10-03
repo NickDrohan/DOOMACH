@@ -374,3 +374,56 @@ pub fun audio_close(au: *Audio) {
     waveOutClose(au.handle);
     au.opened = 0;
 }
+
+# -------------------------------------------------------------------- MIDI
+
+val MIDI_MAPPER: u32 = 0xffffffff;
+
+#[library("winmm.dll")]
+ext fun midiOutOpen(handle: *isize, device: u32, callback: usize, instance: usize, flags: u32) u32;
+#[library("winmm.dll")]
+ext fun midiOutShortMsg(handle: isize, message: u32) u32;
+#[library("winmm.dll")]
+ext fun midiOutReset(handle: isize) u32;
+#[library("winmm.dll")]
+ext fun midiOutClose(handle: isize) u32;
+#[library("winmm.dll")]
+ext fun timeBeginPeriod(ms: u32) u32;
+#[library("winmm.dll")]
+ext fun timeEndPeriod(ms: u32) u32;
+
+# the MIDI synthesizer messages go to; module state, because the music player
+# hands over a message and nothing else
+var midi:       isize;
+var midiopened: bool;
+
+# open Windows' default MIDI output, its built-in General MIDI synthesizer
+# ---
+# ret: whether there is one; the game plays without music if not
+pub fun midi_open() bool {
+    midiopened = midiOutOpen(?midi, MIDI_MAPPER, 0, 0, 0) == 0;
+    ret midiopened;
+}
+
+# send one channel message, as music.Out
+pub fun midi_send(message: u32) {
+    if (midiopened) { midiOutShortMsg(midi, message); }
+}
+
+pub fun midi_close() {
+    if (!midiopened) { ret; }
+    midiOutReset(midi);
+    midiOutClose(midi);
+    midiopened = 0;
+}
+
+# ask Windows for a 1 ms timer for the life of the game, so that a short
+# sleep is short and music events land on time
+pub fun fine_timer(on: bool) {
+    if (on) {
+        timeBeginPeriod(1);
+    }
+    or {
+        timeEndPeriod(1);
+    }
+}

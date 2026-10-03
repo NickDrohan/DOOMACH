@@ -40,9 +40,6 @@ val S_ATTENUATOR: i32   = 1040;
 val NORM_SEP:       i32   = 128;
 val S_STEREO_SWING: Fixed = 96 * 65536;
 
-# the menu's sound volume runs 0 to 15; the mixer's 0 to 127
-val SFX_VOLUME: i32 = 15;
-
 rec Channel {
     # SFX_* being played, 0 when the channel is free
     sfx: i32;
@@ -65,6 +62,14 @@ rec Channel {
 var channels: [8]Channel;
 var archive:  *wad.Wad;
 var serial:   i32;
+
+# the menu's sound volume, 0 to 15; the mixer's runs 0 to 127
+var sfxvolume: i32;
+
+# set the volume of effects started from now on
+pub fun set_volume(v: i32) {
+    sfxvolume = v;
+}
 
 # S_StopChannel
 fun stop_channel(cnum: i32) {
@@ -130,16 +135,16 @@ fun adjust(g: *Game, listener: *Mobj, x: Fixed, y: Fixed) Params {
 
     # volume calculation
     if (approx_dist < S_CLOSE_DIST) {
-        p.volume = SFX_VOLUME;
+        p.volume = sfxvolume;
     }
     or (g.gamemap == 8) {
         # the boss level's sounds carry across the whole map
         if (approx_dist > S_CLIPPING_DIST) { approx_dist = S_CLIPPING_DIST; }
-        p.volume = 15 + ((SFX_VOLUME - 15) * ((S_CLIPPING_DIST - approx_dist) >> 16)) / S_ATTENUATOR;
+        p.volume = 15 + ((sfxvolume - 15) * ((S_CLIPPING_DIST - approx_dist) >> 16)) / S_ATTENUATOR;
     }
     or {
         # distance effect
-        p.volume = (SFX_VOLUME * ((S_CLIPPING_DIST - approx_dist) >> 16)) / S_ATTENUATOR;
+        p.volume = (sfxvolume * ((S_CLIPPING_DIST - approx_dist) >> 16)) / S_ATTENUATOR;
     }
 
     p.audible = p.volume > 0;
@@ -148,7 +153,7 @@ fun adjust(g: *Game, listener: *Mobj, x: Fixed, y: Fixed) Params {
 
 # I_UpdateSoundParams: separation, that is, orientation/stereo. range is
 # 1 - 256. the per-channel volumes run 0 to 127.
-fun set_volume(c: *Channel, volume_in: i32, sep_in: i32) {
+fun set_channel_volume(c: *Channel, volume_in: i32, sep_in: i32) {
     # the simulation's 0 to 15 onto the mixer's 0 to 127
     val volume: i32 = volume_in * 8;
     var sep:    i32 = sep_in + 1;
@@ -209,7 +214,7 @@ pub fun start(g: *Game, origin: ptr, ismobj: bool, x: Fixed, y: Fixed, sfxnum: i
     check_level(g);
 
     val listener: *Mobj = g.players[g.consoleplayer].mo;
-    var volume:   i32   = SFX_VOLUME;
+    var volume:   i32   = sfxvolume;
     var sep:      i32   = NORM_SEP;
 
     # check to see if it is audible, and if not, modify the params
@@ -260,7 +265,7 @@ pub fun start(g: *Game, origin: ptr, ismobj: bool, x: Fixed, y: Fixed, sfxnum: i
     c.len    = len - 32;
     c.pos    = 0;
     c.step   = (rate << 16) / RATE:~u32;
-    set_volume(c, volume, sep);
+    set_channel_volume(c, volume, sep);
 }
 
 # S_UpdateSounds: once a tic, move each playing noise to where its source and
@@ -288,7 +293,7 @@ pub fun update(g: *Game) {
             c.sfx = 0;
         }
         or {
-            set_volume(c, p.volume, p.sep);
+            set_channel_volume(c, p.volume, p.sep);
         }
     }
 }
@@ -359,24 +364,25 @@ pub fun playing() i32 {
 # g: the game
 # w: the archive the effects are read from, which must outlive the game
 pub fun install(g: *Game, w: *wad.Wad) {
-    archive = w;
-    serial  = g.levelserial;
+    archive   = w;
+    serial    = g.levelserial;
+    sfxvolume = 8;
     stop_all();
     g.start_sound = start;
 }
 
-test set_volume__centre_and_sides {
+test set_channel_volume__centre_and_sides {
     var c: Channel;
     # dead ahead: both sides nearly the full 120
-    set_volume(?c, 15, 128);
+    set_channel_volume(?c, 15, 128);
     if (c.leftvol < 85 || c.leftvol > 95 || c.rightvol < 85 || c.rightvol > 95) { ret 1; }
     # hard to the listener's left: the left side louder than the right
-    set_volume(?c, 15, 32);
+    set_channel_volume(?c, 15, 32);
     if (c.leftvol <= c.rightvol) { ret 2; }
-    set_volume(?c, 15, 224);
+    set_channel_volume(?c, 15, 224);
     if (c.rightvol <= c.leftvol) { ret 3; }
     # silence stays silent
-    set_volume(?c, 0, 128);
+    set_channel_volume(?c, 0, 128);
     if (c.leftvol != 0 || c.rightvol != 0) { ret 4; }
     ret 0;
 }

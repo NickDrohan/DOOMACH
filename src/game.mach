@@ -17,11 +17,14 @@ use doom.defs;
 use doom.defs.Game;
 use doom.defs.Player;
 use doom.defs.Ticcmd;
+use doom.fixed.Fixed;
 use doom.info;
 use doom.level;
 use doom.random;
 use doom.rdata;
+use doom.render;
 use doom.spec;
+use t: doom.tables;
 use doom.tick;
 use doom.wad;
 use doom.world;
@@ -70,7 +73,35 @@ pub rec Session {
 
     # the level could not be loaded; the session cannot continue
     broken: bool;
+
+    # a level was finished and the game waits on the intermission; world_done
+    # moves on. what the intermission shows is kept here.
+    completed: bool;
+    wi:        Finished;
 }
+
+# what a finished level reports to the intermission (wbstartstruct_t)
+pub rec Finished {
+    episode: i32;
+    # the map just left and the map going to, both counted from 1
+    last:      i32;
+    next:      i32;
+    didsecret: bool;
+    # the last map of the episode was finished: the finale, not a next map
+    finale:    bool;
+    maxkills:  i32;
+    maxitems:  i32;
+    maxsecret: i32;
+    kills:     i32;
+    items:     i32;
+    secret:    i32;
+    # tics the level took, and its par in seconds
+    time:    i32;
+    partime: i32;
+}
+
+# par times for the first episode's maps, in seconds
+val PARS: [10]i32 = [10]i32{0, 30, 75, 120, 90, 165, 180, 180, 30, 165};
 
 # set up a session; call once
 # ---
@@ -220,11 +251,61 @@ pub fun init_new(s: *Session, skill_in: i32, episode_in: i32, map_in: i32) bool 
 
     s.demoplayback = 0;
     s.demodone     = 0;
+    s.completed    = 0;
+    g.exited       = 0;
     g.gameepisode  = episode;
     g.gamemap      = map;
     g.gameskill    = skill;
 
     ret load_level(s);
+}
+
+# start a game for one player, undoing whatever a demo set up
+# ---
+# s:       the session
+# skill:   SK_BABY to SK_NIGHTMARE
+# episode: 1 in the shareware game
+# map:     1 to 9
+# ret:     whether the level loaded
+pub fun new_game(s: *Session, skill: i32, episode: i32, map: i32) bool {
+    val g: *Game = ?s.g;
+    g.deathmatch    = 0;
+    g.respawnparm   = 0;
+    g.fastparm      = 0;
+    g.nomonsters    = 0;
+    g.netgame       = 0;
+    g.consoleplayer = 0;
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        g.playeringame[i] = i == 0;
+        i                 = i + 1;
+    }
+    ret init_new(s, skill, episode, map);
+}
+
+# start a co-operative game for several players on one machine's view of it:
+# every machine in the game calls this with the same numbers
+# ---
+# s:       the session
+# players: how many, 1 to 4
+# me:      which of them this machine is, 0 to players - 1
+# skill:   SK_BABY to SK_NIGHTMARE
+# map:     1 to 9
+# ret:     whether the level loaded
+pub fun coop_game(s: *Session, players: i32, me: i32, skill: i32, map: i32) bool {
+    val g: *Game = ?s.g;
+    g.deathmatch    = 0;
+    g.respawnparm   = 0;
+    g.fastparm      = 0;
+    g.nomonsters    = 0;
+    g.netgame       = 1;
+    g.consoleplayer = me;
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        g.playeringame[i] = i < players;
+        i                 = i + 1;
+    }
+    ret init_new(s, skill, 1, map);
 }
 
 # G_DoPlayDemo: start playing a demo lump
@@ -281,7 +362,7 @@ fun read_demo_ticcmd(s: *Session, cmd: *Ticcmd) {
 }
 
 # G_BuildTiccmd: builds a ticcmd from all of the available inputs
-fun build_ticcmd(s: *Session, input: *Input, cmd: *Ticcmd) {
+pub fun build_ticcmd(s: *Session, input: *Input, cmd: *Ticcmd) {
     var blank: Ticcmd;
     @cmd = blank;
 
@@ -366,7 +447,8 @@ fun player_finish_level(g: *Game, player: i32) {
     p.bonuscount  = 0;
 }
 
-# G_DoCompleted and G_DoWorldDone, without the intermission between them
+# G_DoCompleted: the level is over; tidy the players and fill in what the
+# intermission shows
 fun completed(s: *Session) {
     val g:      *Game = ?s.g;
     val secret: bool  = g.exited == 2;
@@ -381,8 +463,7 @@ fun completed(s: *Session) {
     }
 
     # the level to go to: the secret exit leads to map 9, map 9 leads back
-    # to the level after the one with the secret exit, and the last level of
-    # the episode leads round to the first
+    # to the level after the one with the secret exit
     var next: i32 = g.gamemap + 1;
     if (secret) {
         next = 9;
@@ -402,29 +483,136 @@ fun completed(s: *Session) {
             next = 3;
         }
     }
-    or (g.gamemap == 8) {
-        next = 1;
-    }
 
-    g.gamemap = next;
+    val p: *Player = ?g.players[g.consoleplayer];
+    # leaving the secret map counts as having found it
+    if (g.gamemap == 9) { p.didsecret = 1; }
+    s.wi.episode   = g.gameepisode;
+    s.wi.last      = g.gamemap;
+    s.wi.next      = next;
+    s.wi.didsecret = p.didsecret || secret;
+    p.didsecret    = s.wi.didsecret;
+    s.wi.finale    = g.gamemap == 8;
+    s.wi.maxkills  = g.totalkills;
+    s.wi.maxitems  = g.totalitems;
+    s.wi.maxsecret = g.totalsecret;
+    s.wi.kills     = p.killcount;
+    s.wi.items     = p.itemcount;
+    s.wi.secret    = p.secretcount;
+    s.wi.time      = g.leveltime;
+    s.wi.partime   = 0;
+    if (g.gamemap >= 1 && g.gamemap <= 9) { s.wi.partime = PARS[g.gamemap]; }
+
+    g.exited    = 0;
+    s.completed = 1;
+}
+
+# G_DoWorldDone: the intermission is over; on to the next map
+pub fun world_done(s: *Session) {
+    s.completed = 0;
+    s.g.gamemap = s.wi.next;
     load_level(s);
 }
 
-# G_Ticker: make ticcmds for the players and advance the world one tic
+# G_CheckSpot: whether a player can be spawned at a start without a thing in
+# the way; leaves the dead body in the body queue and makes a fog if so
+fun check_spot(g: *Game, playernum: i32, mthing: *level.Thing) bool {
+    val x: Fixed = mthing.x::i32 << 16;
+    val y: Fixed = mthing.y::i32 << 16;
+
+    if (g.players[playernum].mo == nil) {
+        # first spawn of level, before corpses
+        var i: i32 = 0;
+        for (i < playernum) {
+            if (g.players[i].mo.x == x && g.players[i].mo.y == y) { ret 0; }
+            i = i + 1;
+        }
+        ret 1;
+    }
+
+    if (!world.check_position(g, g.players[playernum].mo, x, y)) { ret 0; }
+
+    # flush an old corpse if needed
+    if (g.bodyqueslot >= 32) { world.remove_mobj(g, g.bodyque[g.bodyqueslot % 32]); }
+    g.bodyque[g.bodyqueslot % 32] = g.players[playernum].mo;
+    g.bodyqueslot                 = g.bodyqueslot + 1;
+
+    # spawn a teleport fog
+    val ss: i32        = render.point_in_subsector(g.lv, x, y);
+    val an: u32        = (t.ANG45 * (mthing.angle::i32 / 45):~u32) >> t.ANGLETOFINESHIFT;
+    val mo: *defs.Mobj = world.spawn_mobj(g, x + 20 * t.FINESINE[an + 2048], y + 20 * t.FINESINE[an],
+        g.lv.sectors[g.lv.subsectors[ss].sector].floorheight, info.MT_TFOG);
+
+    if (g.players[g.consoleplayer].viewz != 1) {
+        # don't start sound on first frame
+        defs.sound(g, mo, info.SFX_TELEPT);
+    }
+    ret 1;
+}
+
+# G_DoReborn in a network game: the dead player comes back at a start, and
+# the level carries on for everyone else
+fun reborn_in_netgame(g: *Game, playernum: i32) {
+    # dissasociate the corpse
+    g.players[playernum].mo.player = nil;
+
+    # spawn at random spot if in death match; the deathmatch starts are not
+    # kept, so a deathmatch player comes back at their own start
+
+    if (check_spot(g, playernum, ?g.playerstarts[playernum])) {
+        world.spawn_player(g, ?g.playerstarts[playernum]);
+        ret;
+    }
+
+    # try to spawn at one of the other players spots
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (check_spot(g, playernum, ?g.playerstarts[i])) {
+            # fake as other player
+            g.playerstarts[i].kind = (playernum + 1)::i16;
+            world.spawn_player(g, ?g.playerstarts[i]);
+            # restore
+            g.playerstarts[i].kind = (i + 1)::i16;
+            ret;
+        }
+        i = i + 1;
+    }
+
+    # he's going to be inside something. too bad.
+    world.spawn_player(g, ?g.playerstarts[playernum]);
+}
+
+# G_Ticker: make the console player's ticcmd from the keyboard and advance
+# the world one tic
 # ---
 # s:     the session
 # input: what is held down, ignored while a demo plays
 pub fun ticker(s: *Session, input: *Input) {
+    var cmds: [4]Ticcmd;
+    if (!s.demoplayback) { build_ticcmd(s, input, ?cmds[s.g.consoleplayer]); }
+    ticker_cmds(s, ?cmds[0]);
+}
+
+# G_Ticker with every player's ticcmd given, as a network game has them
+# ---
+# s:    the session
+# cmds: four ticcmds, one per player; ignored while a demo plays
+pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
     val g: *Game = ?s.g;
-    if (s.broken) { ret; }
+    if (s.broken || s.completed) { ret; }
 
     # do player reborns if needed
     var i: i32 = 0;
     for (i < defs.MAXPLAYERS) {
         if (g.playeringame[i] && g.players[i].playerstate == defs.PST_REBORN) {
-            # reload the level from scratch
-            if (!load_level(s)) { ret; }
-            brk;
+            if (g.netgame) {
+                reborn_in_netgame(g, i);
+            }
+            or {
+                # reload the level from scratch
+                if (!load_level(s)) { ret; }
+                brk;
+            }
         }
         i = i + 1;
     }
@@ -437,7 +625,7 @@ pub fun ticker(s: *Session, input: *Input) {
             ret;
         }
         completed(s);
-        if (s.broken) { ret; }
+        ret;
     }
 
     # get commands
@@ -452,7 +640,7 @@ pub fun ticker(s: *Session, input: *Input) {
                 if (s.demodone) { ret; }
             }
             or {
-                build_ticcmd(s, input, cmd);
+                @cmd = cmds[i];
             }
         }
         i = i + 1;

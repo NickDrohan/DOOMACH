@@ -146,4 +146,73 @@ if [[ -n "$python" ]]; then
         "$python" "$here/harness/wavcheck.py" "$wad" "$work/debug.wav"
 fi
 
+# Music. Each of the WAD's thirteen songs, played once through, must give the
+# same MIDI messages at the same ticks as an independent reading of the MUS
+# format.
+if [[ -n "$python" ]]; then
+    songs_match() {
+        local m
+        for m in D_E1M1 D_E1M2 D_E1M3 D_E1M4 D_E1M5 D_E1M6 D_E1M7 D_E1M8 D_E1M9 D_INTER D_INTRO D_VICTOR D_INTROA; do
+            "$debug" mus "$wad" "$m" >"$work/$m.mus" || return 1
+            "$python" "$here/harness/musdump.py" "$wad" "$m" >"$work/$m.py" || return 1
+            cmp -s "$work/$m.mus" "$work/$m.py" || return 1
+        done
+    }
+    gate "all thirteen songs play as the python reader reads them" 0 songs_match
+fi
+
+# The front end: title, menus, the sound menu's sliders, an intermission
+# counting up and moving on, the end-of-episode text, and the quit prompt,
+# driven by a script of keys and tics with no window, in both profiles.
+frontwalk="5 key:a key:enter key:enter key:enter 30 shot key:esc 2 shot key:down key:enter 2 shot
+    key:down key:down key:enter key:right key:right key:right 2 shot key:esc 70 exit 1 60 shot 500 shot
+    fire 20 shot 60 shot map:8 10 exit 1 100 shot 2000 shot
+    key:a key:down key:down key:down key:down key:down key:enter 2 shot"
+mkdir -p "$work/front-debug" "$work/front-release"
+# shellcheck disable=SC2086
+gate "the scripted front-end walk runs (debug)" 0 "$debug" script "$wad" "$work/front-debug/s" $frontwalk
+# shellcheck disable=SC2086
+gate "the scripted front-end walk runs (release)" 0 "$release" script "$wad" "$work/front-release/s" $frontwalk
+front_is_pinned() { (cd "$1" && sha256sum -c --status "$here/fixtures/front.sha256"); }
+gate "the eleven front-end screens match the committed hashes" 0 front_is_pinned "$work/front-debug"
+gate "release draws the same eleven screens" 0 front_is_pinned "$work/front-release"
+
+# Co-op. Two games in one process fed the same bot players' commands must
+# agree every tic, with a forced death and respawn at tic 100; debug and
+# release must end where the pinned runs end.
+coop_end() { "$1" coop "$wad" "$2" "$3" "$4" 2>/dev/null | tail -1; }
+for build in debug release; do
+    exe="$debug"
+    [[ "$build" == release ]] && exe="$release"
+    coop_end "$exe" 2 1 3500 >"$work/coop2.$build"
+    coop_end "$exe" 4 3 7000 >"$work/coop4.$build"
+    same "two-player co-op on E1M1 ends where it is pinned ($build)" "$work/coop2.$build" "$here/fixtures/coop2.expected"
+    same "four-player co-op on E1M3 ends where it is pinned ($build)" "$work/coop4.$build" "$here/fixtures/coop4.expected"
+done
+
+# The network. A host and a joiner as two processes on this machine's
+# loopback, in lockstep over UDP, must end exactly where the one-process run
+# ends; and a joiner that secretly draws one random number more must be
+# caught by both, which exit 3.
+netpair() {
+    local port="$1" extra="$2"
+    "$release" netplay "$wad" host 2 1 3500 "$port" >"$work/net-host.txt" 2>&1 &
+    local hostpid=$!
+    sleep 1
+    # shellcheck disable=SC2086
+    "$release" netplay "$wad" join "127.0.0.1:$port" 3500 0 $extra >"$work/net-join.txt" 2>&1
+    local joinexit=$?
+    wait "$hostpid"
+    local hostexit=$?
+    echo "$hostexit $joinexit"
+}
+read -r hostexit joinexit <<<"$(netpair 5141 "")"
+gate "networked host finished its 3500 tics" 0 test "$hostexit" = 0
+gate "networked joiner finished its 3500 tics" 0 test "$joinexit" = 0
+same "the host ends where one-process co-op ends" "$work/net-host.txt" "$here/fixtures/coop2.expected"
+same "the joiner ends where one-process co-op ends" "$work/net-join.txt" "$here/fixtures/coop2.expected"
+read -r hostexit joinexit <<<"$(netpair 5142 corrupt)"
+gate "a game that goes out of step is caught by the host" 0 test "$hostexit" = 3
+gate "and by the joiner" 0 test "$joinexit" = 3
+
 gates_done

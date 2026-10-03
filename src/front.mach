@@ -1,0 +1,1043 @@
+# everything around the game: the title screen and the demos that play
+# behind it, the menus, the intermission between levels, and the text at the
+# end of the episode
+#
+# Ported, reduced, from d_main.c (the attract loop), m_menu.c, wi_stuff.c and
+# f_finale.c. The game itself is a game.Session; this decides when it runs,
+# starts and ends it, and draws whatever is on screen when it is not the view
+# through the marine's eyes.
+#
+# Left out: saving and loading (the menu says so), the screen size, detail
+# and mouse options, and the "melt" between screens.
+
+use std.types.bool.bool;
+use std.types.string.str;
+
+use doom.defs;
+use doom.game;
+use doom.info;
+use doom.music;
+use doom.rdata;
+use doom.render;
+use doom.sound;
+use doom.st;
+use doom.video;
+
+# what the screen is showing
+pub val MODE_PAGE:   i32 = 0;
+pub val MODE_DEMO:   i32 = 1;
+pub val MODE_LEVEL:  i32 = 2;
+pub val MODE_WI:     i32 = 3;
+pub val MODE_FINALE: i32 = 4;
+
+# the menus
+val MENU_MAIN:    i32 = 0;
+val MENU_EPISODE: i32 = 1;
+val MENU_SKILL:   i32 = 2;
+val MENU_OPTIONS: i32 = 3;
+val MENU_SOUND:   i32 = 4;
+val MENU_READ1:   i32 = 5;
+val MENU_READ2:   i32 = 6;
+
+# what a yes in answer to a message does
+val ASK_NONE:      i32 = 0;
+val ASK_QUIT:      i32 = 1;
+val ASK_NIGHTMARE: i32 = 2;
+val ASK_ENDGAME:   i32 = 3;
+
+# keys, as Windows numbers them
+pub val KEY_ENTER:     i32 = 0x0d;
+pub val KEY_ESCAPE:    i32 = 0x1b;
+pub val KEY_BACKSPACE: i32 = 0x08;
+pub val KEY_SPACE:     i32 = 0x20;
+pub val KEY_LEFT:      i32 = 0x25;
+pub val KEY_UP:        i32 = 0x26;
+pub val KEY_RIGHT:     i32 = 0x27;
+pub val KEY_DOWN:      i32 = 0x28;
+
+val LINEHEIGHT: i32 = 16;
+val SKULLXOFF:  i32 = -32;
+
+# the intermission's stages
+val WI_STATS:   i32 = 0;
+val WI_NEXTLOC: i32 = 1;
+val WI_NOSTATE: i32 = 2;
+
+val TEXTSPEED: i32 = 3;
+val TEXTWAIT:  i32 = 250;
+
+val E1TEXT: str = "Once you beat the big badasses and\nclean out the moon base you're supposed\nto win, aren't you? Aren't you? Where's\nyour fat reward and ticket home? What\nthe hell is this? It's not supposed to\nend this way!\n\nIt stinks like rotten meat, but looks\nlike the lost Deimos base.  Looks like\nyou're stuck on The Shores of Hell.\nThe only way out is through.\n\nTo continue the DOOM experience, play\nThe Shores of Hell and its amazing\nsequel, Inferno!\n";
+
+# where each map of the first episode is on the intermission's picture
+val LNODES: [18]i32 = [18]i32{185, 164, 148, 143, 69, 122, 209, 102, 116, 89, 166, 55, 71, 56, 135, 29, 71, 24};
+
+# the first episode's ten animated bits of background
+val ANIMS: [20]i32 = [20]i32{224, 104, 184, 160, 112, 136, 72, 112, 88, 96, 64, 48, 192, 40, 136, 16, 80, 16, 64, 24};
+
+pub rec Front {
+    mode: i32;
+
+    # the attract loop: which step, and how long a page stays up
+    demosequence: i32;
+    pagetic:      i32;
+    pagename:     str;
+
+    # the menu
+    menuactive: bool;
+    menu:       i32;
+    itemon:     [7]i32;
+    skulltics:  i32;
+    whichskull: i32;
+    episode:    i32;
+
+    # a message over everything, and what a yes to it does
+    message:   str;
+    messageyn: bool;
+    ask:       i32;
+    skill:     i32;
+
+    # settings, 0 to 15 for the volumes
+    sfxvolume:    i32;
+    musicvolume:  i32;
+    showmessages: bool;
+
+    # the song that should be playing, and a count that moves when it changes
+    song:       [9]u8;
+    songserial: i32;
+
+    # the intermission
+    wistate:         i32;
+    bcnt:            i32;
+    sp_state:        i32;
+    cnt:             i32;
+    cnt_kills:       i32;
+    cnt_items:       i32;
+    cnt_secret:      i32;
+    cnt_time:        i32;
+    cnt_par:         i32;
+    cnt_pause:       i32;
+    acceleratestage: bool;
+    pointeron:       bool;
+    attackdown:      bool;
+    usedown:         bool;
+    animctr:         [10]i32;
+    animnext:        [10]i32;
+    seed:            u32;
+
+    # the finale
+    finalecount: i32;
+    finalestage: i32;
+
+    # the player chose to quit
+    quit: bool;
+}
+
+fun sfx(s: *game.Session, effect: i32) {
+    defs.sound(?s.g, nil, effect);
+}
+
+fun want_song(f: *Front, name: str) {
+    var same: bool = 1;
+    var k:    i32  = 0;
+    for (k < 8) {
+        if (f.song[k] != name[k]) { same = 0; }
+        if (name[k] == 0)         { brk; }
+        k = k + 1;
+    }
+    if (same) { ret; }
+    k = 0;
+    for (k < 8) {
+        f.song[k] = name[k];
+        if (name[k] == 0) { brk; }
+        k = k + 1;
+    }
+    f.song[8]    = 0;
+    f.songserial = f.songserial + 1;
+}
+
+fun level_song(f: *Front, s: *game.Session) {
+    var name: [7]u8 = [7]u8{'D', '_', 'E', '1', 'M', '1', 0};
+    name[3] = ('0' + s.g.gameepisode)::u8;
+    name[5] = ('0' + s.g.gamemap)::u8;
+    want_song(f, ?name[0]);
+}
+
+fun random(f: *Front) i32 {
+    f.seed = f.seed * 1103515245 + 12345;
+    ret ((f.seed >> 16) & 0x7fff)::i32;
+}
+
+# set up the front end; the game starts on the title screen
+pub fun init(f: *Front) {
+    f.sfxvolume          = 8;
+    f.musicvolume        = 8;
+    f.showmessages       = 1;
+    f.itemon[MENU_SKILL] = 2;
+    f.seed               = 1;
+    start_title(f);
+}
+
+# D_StartTitle
+fun start_title(f: *Front) {
+    f.demosequence = -1;
+    f.menuactive   = 0;
+    f.mode         = MODE_PAGE;
+    f.pagetic      = 0;
+}
+
+# D_DoAdvanceDemo: title, demo, credits, demo, help, demo, and round again
+fun advance_demo(f: *Front, s: *game.Session) {
+    f.demosequence = (f.demosequence + 1) % 6;
+    f.mode         = MODE_PAGE;
+
+    if (f.demosequence == 0) {
+        f.pagetic  = 170;
+        f.pagename = "TITLEPIC";
+        want_song(f, "D_INTRO");
+    }
+    or (f.demosequence == 2) {
+        f.pagetic  = 200;
+        f.pagename = "CREDIT";
+    }
+    or (f.demosequence == 4) {
+        f.pagetic  = 200;
+        f.pagename = "HELP2";
+    }
+    or {
+        var name: [6]u8 = [6]u8{'D', 'E', 'M', 'O', '1', 0};
+        name[4] = ('1' + f.demosequence / 2)::u8;
+        if (game.play_demo(s, ?name[0])) {
+            f.mode = MODE_DEMO;
+            level_song(f, s);
+        }
+    }
+}
+
+# start a game on a map, as the menu does on the first one
+pub fun start_game(f: *Front, s: *game.Session, skill: i32, map: i32) {
+    f.menuactive = 0;
+    if (game.new_game(s, skill, 1, map)) {
+        f.mode = MODE_LEVEL;
+        level_song(f, s);
+    }
+    or {
+        start_title(f);
+    }
+}
+
+# --------------------------------------------------------------- the menus
+
+fun start_message(f: *Front, text: str, yn: bool, ask: i32) {
+    f.message   = text;
+    f.messageyn = yn;
+    f.ask       = ask;
+}
+
+fun items_in(menu: i32) i32 {
+    if (menu == MENU_MAIN)    { ret 6; }
+    if (menu == MENU_EPISODE) { ret 3; }
+    if (menu == MENU_SKILL)   { ret 5; }
+    if (menu == MENU_OPTIONS) { ret 3; }
+    if (menu == MENU_SOUND)   { ret 4; }
+    ret 1;
+}
+
+# the menu a menu goes back to
+fun parent_of(menu: i32) i32 {
+    if (menu == MENU_EPISODE || menu == MENU_OPTIONS || menu == MENU_READ1) { ret MENU_MAIN; }
+    if (menu == MENU_SKILL)                                                 { ret MENU_EPISODE; }
+    if (menu == MENU_SOUND)                                                 { ret MENU_OPTIONS; }
+    if (menu == MENU_READ2)                                                 { ret MENU_READ1; }
+    ret -1;
+}
+
+# whether a line of a menu can be chosen; the sound menu's sliders sit on
+# their own lines under their labels
+fun selectable(menu: i32, item: i32) bool {
+    if (menu == MENU_SOUND) { ret item == 0 || item == 2; }
+    ret 1;
+}
+
+fun open_menu(f: *Front, s: *game.Session) {
+    if (f.menuactive) { ret; }
+    f.menuactive = 1;
+    f.menu       = MENU_MAIN;
+    sfx(s, info.SFX_SWTCHN);
+}
+
+fun set_sfx_volume(f: *Front, v: i32) {
+    f.sfxvolume = v;
+    sound.set_volume(v);
+}
+
+# M_ChangeSfxVolume and its music twin: left lowers, right raises
+fun slide(f: *Front, item: i32, right: bool) {
+    if (item == 0) {
+        var v: i32 = f.sfxvolume;
+        if (right && v < 15) { v = v + 1; }
+        if (!right && v > 0) { v = v - 1; }
+        set_sfx_volume(f, v);
+    }
+    or {
+        if (right && f.musicvolume < 15) { f.musicvolume = f.musicvolume + 1; }
+        if (!right && f.musicvolume > 0) { f.musicvolume = f.musicvolume - 1; }
+    }
+}
+
+# what choosing a line of a menu does
+fun choose(f: *Front, s: *game.Session) {
+    val item: i32 = f.itemon[f.menu];
+
+    if (f.menu == MENU_MAIN) {
+        if (item == 0) {
+            f.menu = MENU_EPISODE;
+        }
+        or (item == 1) {
+            f.menu = MENU_OPTIONS;
+        }
+        or (item == 2 || item == 3) {
+            start_message(f, "saving and loading games is not\nbuilt in this port yet.\n\npress a key.", 0, ASK_NONE);
+        }
+        or (item == 4) {
+            f.menu = MENU_READ1;
+        }
+        or {
+            start_message(f, "are you sure you want to\nquit this great game?\n\n(press y to quit)", 1, ASK_QUIT);
+        }
+    }
+    or (f.menu == MENU_EPISODE) {
+        if (item != 0 && s.g.shareware) {
+            start_message(f, "this is the shareware version of doom.\n\nyou need to order the entire trilogy.\n\npress a key.", 0, ASK_NONE);
+            ret;
+        }
+        f.episode = item + 1;
+        f.menu    = MENU_SKILL;
+    }
+    or (f.menu == MENU_SKILL) {
+        if (item == defs.SK_NIGHTMARE) {
+            f.skill = item;
+            start_message(f, "are you sure? this skill level\nisn't even remotely fair.\n\npress y or n.", 1, ASK_NIGHTMARE);
+            ret;
+        }
+        start_game(f, s, item, 1);
+    }
+    or (f.menu == MENU_OPTIONS) {
+        if (item == 0) {
+            if (f.mode != MODE_LEVEL) {
+                sfx(s, info.SFX_OOF);
+                ret;
+            }
+            start_message(f, "are you sure you want to end the game?\n\npress y or n.", 1, ASK_ENDGAME);
+        }
+        or (item == 1) {
+            f.showmessages = !f.showmessages;
+        }
+        or {
+            f.menu = MENU_SOUND;
+        }
+    }
+    or (f.menu == MENU_READ1) {
+        f.menu = MENU_READ2;
+    }
+    or (f.menu == MENU_READ2) {
+        f.menuactive = 0;
+    }
+}
+
+# the answer to a yes-or-no message
+fun answer(f: *Front, s: *game.Session, yes: bool) {
+    val ask: i32 = f.ask;
+    f.message = nil;
+    f.ask     = ASK_NONE;
+    if (!yes) { ret; }
+
+    if (ask == ASK_QUIT) {
+        f.quit = 1;
+    }
+    or (ask == ASK_NIGHTMARE) {
+        start_game(f, s, f.skill, 1);
+    }
+    or (ask == ASK_ENDGAME) {
+        start_title(f);
+    }
+}
+
+# M_Responder and friends: a key was pressed
+# ---
+# f:   the front end
+# s:   the game
+# key: the key, as Windows numbers it
+pub fun responder(f: *Front, s: *game.Session, key: i32) {
+    # a message takes the key first
+    if (f.message != nil) {
+        if (f.messageyn) {
+            if (key == 'Y') {
+                answer(f, s, 1);
+            }
+            or (key == 'N' || key == KEY_ESCAPE) {
+                answer(f, s, 0);
+            }
+            ret;
+        }
+        f.message = nil;
+        sfx(s, info.SFX_SWTCHX);
+        ret;
+    }
+
+    if (!f.menuactive) {
+        # escape opens the menu; on the title and in the demos, any key does
+        if (key == KEY_ESCAPE || f.mode == MODE_PAGE || f.mode == MODE_DEMO) {
+            open_menu(f, s);
+            ret;
+        }
+        if (f.mode == MODE_WI && (key == KEY_ENTER || key == KEY_SPACE)) { f.acceleratestage = 1; }
+        if (f.mode == MODE_FINALE && f.finalestage == 1)                 { start_title(f); }
+        ret;
+    }
+
+    val menu: i32 = f.menu;
+    val n:    i32 = items_in(menu);
+
+    if (key == KEY_DOWN) {
+        for {
+            f.itemon[menu] = (f.itemon[menu] + 1) % n;
+            if (selectable(menu, f.itemon[menu])) { brk; }
+        }
+        sfx(s, info.SFX_PSTOP);
+    }
+    or (key == KEY_UP) {
+        for {
+            f.itemon[menu] = (f.itemon[menu] + n - 1) % n;
+            if (selectable(menu, f.itemon[menu])) { brk; }
+        }
+        sfx(s, info.SFX_PSTOP);
+    }
+    or ((key == KEY_LEFT || key == KEY_RIGHT) && menu == MENU_SOUND) {
+        slide(f, f.itemon[menu], key == KEY_RIGHT);
+        sfx(s, info.SFX_STNMOV);
+    }
+    or (key == KEY_ENTER) {
+        choose(f, s);
+        sfx(s, info.SFX_PISTOL);
+    }
+    or (key == KEY_ESCAPE) {
+        f.menuactive = 0;
+        sfx(s, info.SFX_SWTCHX);
+    }
+    or (key == KEY_BACKSPACE) {
+        val parent: i32 = parent_of(menu);
+        if (parent < 0) {
+            f.menuactive = 0;
+        }
+        or {
+            f.menu = parent;
+        }
+        sfx(s, info.SFX_SWTCHN);
+    }
+}
+
+# the menu's pictures, and the skull beside the chosen line
+fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
+    val d: *rdata.Data = s.d;
+    var x: i32         = 0;
+    var y: i32         = 0;
+
+    if (f.menu == MENU_READ1) {
+        video.draw_page(d, screen, "HELP1");
+        ret;
+    }
+    if (f.menu == MENU_READ2) {
+        video.draw_page(d, screen, "HELP2");
+        ret;
+    }
+
+    if (f.menu == MENU_MAIN) {
+        x = 97;
+        y = 64;
+        video.draw_patch(screen, 94, 2, video.patch(d, "M_DOOM"));
+        video.draw_patch(screen, x, y, video.patch(d, "M_NGAME"));
+        video.draw_patch(screen, x, y + LINEHEIGHT, video.patch(d, "M_OPTION"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_LOADG"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 3, video.patch(d, "M_SAVEG"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 4, video.patch(d, "M_RDTHIS"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 5, video.patch(d, "M_QUITG"));
+    }
+    or (f.menu == MENU_EPISODE) {
+        x = 48;
+        y = 63;
+        video.draw_patch(screen, 54, 38, video.patch(d, "M_EPISOD"));
+        video.draw_patch(screen, x, y, video.patch(d, "M_EPI1"));
+        video.draw_patch(screen, x, y + LINEHEIGHT, video.patch(d, "M_EPI2"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_EPI3"));
+    }
+    or (f.menu == MENU_SKILL) {
+        x = 48;
+        y = 63;
+        video.draw_patch(screen, 96, 14, video.patch(d, "M_NEWG"));
+        video.draw_patch(screen, 54, 38, video.patch(d, "M_SKILL"));
+        video.draw_patch(screen, x, y, video.patch(d, "M_JKILL"));
+        video.draw_patch(screen, x, y + LINEHEIGHT, video.patch(d, "M_ROUGH"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_HURT"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 3, video.patch(d, "M_ULTRA"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 4, video.patch(d, "M_NMARE"));
+    }
+    or (f.menu == MENU_OPTIONS) {
+        x = 60;
+        y = 37;
+        video.draw_patch(screen, 108, 15, video.patch(d, "M_OPTTTL"));
+        video.draw_patch(screen, x, y, video.patch(d, "M_ENDGAM"));
+        video.draw_patch(screen, x, y + LINEHEIGHT, video.patch(d, "M_MESSG"));
+        video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_SVOL"));
+        if (f.showmessages) {
+            video.draw_patch(screen, x + 120, y + LINEHEIGHT, video.patch(d, "M_MSGON"));
+        }
+        or {
+            video.draw_patch(screen, x + 120, y + LINEHEIGHT, video.patch(d, "M_MSGOFF"));
+        }
+    }
+    or (f.menu == MENU_SOUND) {
+        x = 80;
+        y = 64;
+        video.draw_patch(screen, 60, 38, video.patch(d, "M_SVOL"));
+        video.draw_patch(screen, x, y, video.patch(d, "M_SFXVOL"));
+        draw_thermo(d, screen, x, y + LINEHEIGHT, 16, f.sfxvolume);
+        video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_MUSVOL"));
+        draw_thermo(d, screen, x, y + LINEHEIGHT * 3, 16, f.musicvolume);
+    }
+
+    # the skull blinks beside the chosen line
+    if (f.whichskull == 0) {
+        video.draw_patch(screen, x + SKULLXOFF, y - 5 + f.itemon[f.menu] * LINEHEIGHT, video.patch(d, "M_SKULL1"));
+    }
+    or {
+        video.draw_patch(screen, x + SKULLXOFF, y - 5 + f.itemon[f.menu] * LINEHEIGHT, video.patch(d, "M_SKULL2"));
+    }
+}
+
+# M_DrawThermo: a slider
+fun draw_thermo(d: *rdata.Data, screen: *u8, x: i32, y: i32, width: i32, dot: i32) {
+    var xx: i32 = x;
+    video.draw_patch(screen, xx, y, video.patch(d, "M_THERML"));
+    xx = xx + 8;
+    var i: i32 = 0;
+    for (i < width) {
+        video.draw_patch(screen, xx, y, video.patch(d, "M_THERMM"));
+        xx = xx + 8;
+        i  = i + 1;
+    }
+    video.draw_patch(screen, xx, y, video.patch(d, "M_THERMR"));
+    video.draw_patch(screen, (x + 8) + dot * 8, y, video.patch(d, "M_THERMO"));
+}
+
+# ------------------------------------------------------------ intermission
+
+# WI_Start
+fun start_wi(f: *Front, s: *game.Session) {
+    f.mode            = MODE_WI;
+    f.wistate         = WI_STATS;
+    f.acceleratestage = 0;
+    f.bcnt            = 0;
+    f.sp_state        = 1;
+    f.cnt_kills       = -1;
+    f.cnt_items       = -1;
+    f.cnt_secret      = -1;
+    f.cnt_time        = -1;
+    f.cnt_par         = -1;
+    f.cnt_pause       = defs.TICRATE;
+    f.attackdown      = 1;
+    f.usedown         = 1;
+
+    if (s.wi.maxkills == 0)  { s.wi.maxkills = 1; }
+    if (s.wi.maxitems == 0)  { s.wi.maxitems = 1; }
+    if (s.wi.maxsecret == 0) { s.wi.maxsecret = 1; }
+
+    var j: i32 = 0;
+    for (j < 10) {
+        f.animctr[j]  = -1;
+        f.animnext[j] = 1 + random(f) % (defs.TICRATE / 3);
+        j             = j + 1;
+    }
+    want_song(f, "D_INTER");
+}
+
+# WI_updateStats: count each figure up, with a shot for every few
+fun wi_update_stats(f: *Front, s: *game.Session) {
+    val kills:  i32 = s.wi.kills * 100 / s.wi.maxkills;
+    val items:  i32 = s.wi.items * 100 / s.wi.maxitems;
+    val secret: i32 = s.wi.secret * 100 / s.wi.maxsecret;
+    val time:   i32 = s.wi.time / defs.TICRATE;
+
+    if (f.acceleratestage && f.sp_state != 10) {
+        f.acceleratestage = 0;
+        f.cnt_kills       = kills;
+        f.cnt_items       = items;
+        f.cnt_secret      = secret;
+        f.cnt_time        = time;
+        f.cnt_par         = s.wi.partime;
+        sfx(s, info.SFX_BAREXP);
+        f.sp_state = 10;
+    }
+
+    if (f.sp_state == 2) {
+        f.cnt_kills = f.cnt_kills + 2;
+        if ((f.bcnt & 3) == 0) { sfx(s, info.SFX_PISTOL); }
+        if (f.cnt_kills >= kills) {
+            f.cnt_kills = kills;
+            sfx(s, info.SFX_BAREXP);
+            f.sp_state = f.sp_state + 1;
+        }
+    }
+    or (f.sp_state == 4) {
+        f.cnt_items = f.cnt_items + 2;
+        if ((f.bcnt & 3) == 0) { sfx(s, info.SFX_PISTOL); }
+        if (f.cnt_items >= items) {
+            f.cnt_items = items;
+            sfx(s, info.SFX_BAREXP);
+            f.sp_state = f.sp_state + 1;
+        }
+    }
+    or (f.sp_state == 6) {
+        f.cnt_secret = f.cnt_secret + 2;
+        if ((f.bcnt & 3) == 0) { sfx(s, info.SFX_PISTOL); }
+        if (f.cnt_secret >= secret) {
+            f.cnt_secret = secret;
+            sfx(s, info.SFX_BAREXP);
+            f.sp_state = f.sp_state + 1;
+        }
+    }
+    or (f.sp_state == 8) {
+        if ((f.bcnt & 3) == 0) { sfx(s, info.SFX_PISTOL); }
+        f.cnt_time = f.cnt_time + 3;
+        if (f.cnt_time >= time) { f.cnt_time = time; }
+        f.cnt_par = f.cnt_par + 3;
+        if (f.cnt_par >= s.wi.partime) {
+            f.cnt_par = s.wi.partime;
+            if (f.cnt_time >= time) {
+                sfx(s, info.SFX_BAREXP);
+                f.sp_state = f.sp_state + 1;
+            }
+        }
+    }
+    or (f.sp_state == 10) {
+        if (f.acceleratestage) {
+            sfx(s, info.SFX_SGCOCK);
+            # WI_initShowNextLoc
+            f.wistate         = WI_NEXTLOC;
+            f.acceleratestage = 0;
+            f.cnt             = 4 * defs.TICRATE;
+        }
+    }
+    or ((f.sp_state & 1) != 0) {
+        f.cnt_pause = f.cnt_pause - 1;
+        if (f.cnt_pause == 0) {
+            f.sp_state  = f.sp_state + 1;
+            f.cnt_pause = defs.TICRATE;
+        }
+    }
+}
+
+# WI_Ticker
+fun wi_ticker(f: *Front, s: *game.Session, input: *game.Input) {
+    f.bcnt = f.bcnt + 1;
+
+    # WI_checkForAccelerate: a fresh press of fire or use hurries it along
+    if (input.fire) {
+        if (!f.attackdown) { f.acceleratestage = 1; }
+        f.attackdown = 1;
+    }
+    or {
+        f.attackdown = 0;
+    }
+    if (input.activate) {
+        if (!f.usedown) { f.acceleratestage = 1; }
+        f.usedown = 1;
+    }
+    or {
+        f.usedown = 0;
+    }
+
+    # WI_updateAnimatedBack
+    var j: i32 = 0;
+    for (j < 10) {
+        if (f.bcnt == f.animnext[j]) {
+            f.animctr[j] = f.animctr[j] + 1;
+            if (f.animctr[j] >= 3) { f.animctr[j] = 0; }
+            f.animnext[j] = f.bcnt + defs.TICRATE / 3;
+        }
+        j = j + 1;
+    }
+
+    if (f.wistate == WI_STATS) {
+        wi_update_stats(f, s);
+    }
+    or (f.wistate == WI_NEXTLOC) {
+        f.cnt = f.cnt - 1;
+        if (f.cnt == 0 || f.acceleratestage) {
+            f.wistate = WI_NOSTATE;
+            f.cnt     = 10;
+        }
+        or {
+            f.pointeron = (f.cnt & 31) < 20;
+        }
+    }
+    or {
+        f.cnt = f.cnt - 1;
+        if (f.cnt == 0) {
+            # G_WorldDone
+            game.world_done(s);
+            f.mode = MODE_LEVEL;
+            level_song(f, s);
+        }
+    }
+}
+
+# WI_drawNum: right-justified at x; ret where the number begins
+fun wi_draw_num(d: *rdata.Data, screen: *u8, x_in: i32, y: i32, n_in: i32, digits_in: i32) i32 {
+    val fontwidth: i32 = video.width(video.numbered(d, "WINUM", 0, 1));
+    var digits:    i32 = digits_in;
+    var n:         i32 = n_in;
+    var x:         i32 = x_in;
+
+    if (digits < 0) {
+        if (n == 0) {
+            # make variable-length zeros 1 digit long
+            digits = 1;
+        }
+        or {
+            # figure out # of digits in #
+            digits = 0;
+            var temp: i32 = n;
+            for (temp != 0) {
+                temp   = temp / 10;
+                digits = digits + 1;
+            }
+        }
+    }
+
+    # draw the new number
+    for (digits > 0) {
+        x = x - fontwidth;
+        video.draw_patch(screen, x, y, video.numbered(d, "WINUM", n % 10, 1));
+        n      = n / 10;
+        digits = digits - 1;
+    }
+    ret x;
+}
+
+# WI_drawPercent
+fun wi_draw_percent(d: *rdata.Data, screen: *u8, x: i32, y: i32, p: i32) {
+    if (p < 0) { ret; }
+    video.draw_patch(screen, x, y, video.patch(d, "WIPCNT"));
+    wi_draw_num(d, screen, x, y, p, -1);
+}
+
+# WI_drawTime: display level completion time and par, or "sucks" message if
+# overflow
+fun wi_draw_time(d: *rdata.Data, screen: *u8, x_in: i32, y: i32, t: i32) {
+    if (t < 0) { ret; }
+    val colon: *u8 = video.patch(d, "WICOLON");
+    var x:     i32 = x_in;
+
+    if (t <= 61 * 59) {
+        var div: i32 = 1;
+        for {
+            val n: i32 = (t / div) % 60;
+            x   = wi_draw_num(d, screen, x, y, n, 2) - video.width(colon);
+            div = div * 60;
+
+            # draw
+            if (div == 60 || t / div != 0) { video.draw_patch(screen, x, y, colon); }
+            if (t / div == 0)              { brk; }
+        }
+    }
+    or {
+        # "sucks"
+        val sucks: *u8 = video.patch(d, "WISUCKS");
+        video.draw_patch(screen, x - video.width(sucks), y, sucks);
+    }
+}
+
+fun wi_draw_background(f: *Front, d: *rdata.Data, screen: *u8) {
+    video.draw_page(d, screen, "WIMAP0");
+    var j: i32 = 0;
+    for (j < 10) {
+        if (f.animctr[j] >= 0) {
+            var name: [9]u8 = [9]u8{'W', 'I', 'A', '0', '0', '0', '0', '0', 0};
+            name[4] = ('0' + j / 10)::u8;
+            name[5] = ('0' + j % 10)::u8;
+            name[7] = ('0' + f.animctr[j])::u8;
+            video.draw_patch(screen, ANIMS[j * 2], ANIMS[j * 2 + 1], video.patch(d, ?name[0]));
+        }
+        j = j + 1;
+    }
+}
+
+fun level_name(d: *rdata.Data, map0: i32) *u8 {
+    ret video.numbered(d, "WILV0", map0, 1);
+}
+
+# WI_drawLF: the level just finished
+fun wi_draw_lf(d: *rdata.Data, screen: *u8, last0: i32) {
+    val name: *u8 = level_name(d, last0);
+    var y:    i32 = 2;
+    video.draw_patch(screen, (320 - video.width(name)) / 2, y, name);
+
+    # draw "Finished!"
+    y = y + (5 * video.height(name)) / 4;
+    val finished: *u8 = video.patch(d, "WIF");
+    video.draw_patch(screen, (320 - video.width(finished)) / 2, y, finished);
+}
+
+# WI_drawEL: "Entering" and the level about to be
+fun wi_draw_el(d: *rdata.Data, screen: *u8, next0: i32) {
+    val entering: *u8 = video.patch(d, "WIENTER");
+    val name:     *u8 = level_name(d, next0);
+    var y:        i32 = 2;
+    video.draw_patch(screen, (320 - video.width(entering)) / 2, y, entering);
+    y = y + (5 * video.height(name)) / 4;
+    video.draw_patch(screen, (320 - video.width(name)) / 2, y, name);
+}
+
+# WI_drawOnLnode: the first of two pictures that fits on screen there
+fun wi_draw_on_lnode(d: *rdata.Data, screen: *u8, n: i32, first: str, second: str) {
+    val x: i32 = LNODES[n * 2];
+    val y: i32 = LNODES[n * 2 + 1];
+    var p: *u8 = video.patch(d, first);
+    var i: i32 = 0;
+    for (i < 2) {
+        if (p != nil) {
+            val left:   i32 = x - ((p[4]::u16 | (p[5]::u16 << 8)):~i16)::i32;
+            val top:    i32 = y - ((p[6]::u16 | (p[7]::u16 << 8)):~i16)::i32;
+            val right:  i32 = left + video.width(p);
+            val bottom: i32 = top + video.height(p);
+            if (left >= 0 && right < 320 && top >= 0 && bottom < 200) {
+                video.draw_patch(screen, x, y, p);
+                ret;
+            }
+        }
+        p = video.patch(d, second);
+        i = i + 1;
+    }
+}
+
+fun wi_draw(f: *Front, s: *game.Session, screen: *u8) {
+    val d:     *rdata.Data = s.d;
+    val last0: i32         = s.wi.last - 1;
+    val next0: i32         = s.wi.next - 1;
+
+    wi_draw_background(f, d, screen);
+
+    if (f.wistate == WI_STATS) {
+        wi_draw_lf(d, screen, last0);
+
+        val lh: i32 = (3 * video.height(video.numbered(d, "WINUM", 0, 1))) / 2;
+        video.draw_patch(screen, 50, 50, video.patch(d, "WIOSTK"));
+        wi_draw_percent(d, screen, 320 - 50, 50, f.cnt_kills);
+        video.draw_patch(screen, 50, 50 + lh, video.patch(d, "WIOSTI"));
+        wi_draw_percent(d, screen, 320 - 50, 50 + lh, f.cnt_items);
+        video.draw_patch(screen, 50, 50 + 2 * lh, video.patch(d, "WISCRT2"));
+        wi_draw_percent(d, screen, 320 - 50, 50 + 2 * lh, f.cnt_secret);
+
+        video.draw_patch(screen, 16, 200 - 32, video.patch(d, "WITIME"));
+        wi_draw_time(d, screen, 160 - 16, 200 - 32, f.cnt_time);
+        video.draw_patch(screen, 160 + 16, 200 - 32, video.patch(d, "WIPAR"));
+        wi_draw_time(d, screen, 320 - 16, 200 - 32, f.cnt_par);
+        ret;
+    }
+
+    # WI_drawShowNextLoc: splats on the levels done, a pointer on the next
+    var last: i32 = last0;
+    if (last0 == 8) { last = next0 - 1; }
+    var i: i32 = 0;
+    for (i <= last) {
+        wi_draw_on_lnode(d, screen, i, "WISPLAT", "WISPLAT");
+        i = i + 1;
+    }
+    if (s.wi.didsecret) { wi_draw_on_lnode(d, screen, 8, "WISPLAT", "WISPLAT"); }
+    if (f.pointeron)    { wi_draw_on_lnode(d, screen, next0, "WIURH0", "WIURH1"); }
+
+    wi_draw_el(d, screen, next0);
+}
+
+# ------------------------------------------------------------------ finale
+
+# F_StartFinale
+fun start_finale(f: *Front) {
+    f.mode        = MODE_FINALE;
+    f.finalestage = 0;
+    f.finalecount = 0;
+    want_song(f, "D_VICTOR");
+}
+
+fun finale_ticker(f: *Front) {
+    f.finalecount = f.finalecount + 1;
+    var len: i32 = 0;
+    for (E1TEXT[len] != 0) { len = len + 1; }
+    if (f.finalestage == 0 && f.finalecount > len * TEXTSPEED + TEXTWAIT) {
+        f.finalecount = 0;
+        f.finalestage = 1;
+    }
+}
+
+fun finale_draw(f: *Front, s: *game.Session, screen: *u8) {
+    if (f.finalestage == 1) {
+        video.draw_page(s.d, screen, "HELP2");
+        ret;
+    }
+    # F_TextWrite: erase the entire screen to a tiled background, then type
+    # the text out a character every few tics
+    video.tile_flat(s.d, screen, "FLOOR4_8");
+    var count: i32 = (f.finalecount - 10) / TEXTSPEED;
+    if (count < 0) { count = 0; }
+    video.write_text(s.d, screen, 10, 10, E1TEXT, count);
+}
+
+# ------------------------------------------------------------------- ticks
+
+# one tic of whatever is on screen
+# ---
+# f:     the front end
+# s:     the game
+# bar:   the status bar
+# input: what the player is holding down
+pub fun ticker(f: *Front, s: *game.Session, bar: *st.State, input: *game.Input) {
+    # the menu's skull blinks
+    f.skulltics = f.skulltics - 1;
+    if (f.skulltics <= 0) {
+        f.whichskull = f.whichskull ^ 1;
+        f.skulltics  = 8;
+    }
+
+    if (f.mode == MODE_PAGE) {
+        f.pagetic = f.pagetic - 1;
+        if (f.pagetic < 0) { advance_demo(f, s); }
+    }
+    or (f.mode == MODE_DEMO) {
+        var none: game.Input;
+        game.ticker(s, ?none);
+        st.ticker(?s.g, bar);
+        if (s.demodone || s.broken) { advance_demo(f, s); }
+    }
+    or (f.mode == MODE_LEVEL) {
+        # a menu pauses a game played alone
+        if (f.menuactive && !s.g.netgame) { ret; }
+        game.ticker(s, input);
+        st.ticker(?s.g, bar);
+        if (s.broken) { start_title(f); }
+        if (s.completed) {
+            if (s.wi.finale) {
+                start_finale(f);
+            }
+            or {
+                start_wi(f, s);
+            }
+        }
+    }
+    or (f.mode == MODE_WI) {
+        wi_ticker(f, s, input);
+    }
+    or (f.mode == MODE_FINALE) {
+        finale_ticker(f);
+    }
+
+    if (!f.showmessages) { bar.msgtics = 0; }
+}
+
+# start a co-op game that every machine starts the same way
+pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i32, map: i32) bool {
+    f.menuactive = 0;
+    if (!game.coop_game(s, players, me, skill, map)) { ret 0; }
+    f.mode = MODE_LEVEL;
+    level_song(f, s);
+    ret 1;
+}
+
+# one tic of a network game: the same on every machine, because it depends
+# only on the commands every machine holds. the intermission moves on when
+# any player presses fire or use, as each machine sees in the commands.
+# ---
+# f:    the front end
+# s:    the game
+# bar:  the status bar
+# cmds: four ticcmds, one per player
+pub fun net_ticker(f: *Front, s: *game.Session, bar: *st.State, cmds: *defs.Ticcmd) {
+    f.skulltics = f.skulltics - 1;
+    if (f.skulltics <= 0) {
+        f.whichskull = f.whichskull ^ 1;
+        f.skulltics  = 8;
+    }
+
+    if (f.mode == MODE_LEVEL) {
+        game.ticker_cmds(s, cmds);
+        st.ticker(?s.g, bar);
+        if (s.completed) {
+            if (s.wi.finale) {
+                start_finale(f);
+            }
+            or {
+                start_wi(f, s);
+            }
+        }
+    }
+    or (f.mode == MODE_WI) {
+        var input: game.Input;
+        var p:     i32 = 0;
+        for (p < defs.MAXPLAYERS) {
+            if (s.g.playeringame[p]) {
+                if ((cmds[p].buttons::i32 & defs.BT_ATTACK) != 0) { input.fire = 1; }
+                if ((cmds[p].buttons::i32 & defs.BT_USE) != 0)    { input.activate = 1; }
+            }
+            p = p + 1;
+        }
+        wi_ticker(f, s, ?input);
+    }
+    or (f.mode == MODE_FINALE) {
+        finale_ticker(f);
+    }
+
+    if (!f.showmessages) { bar.msgtics = 0; }
+}
+
+# show a message, such as the network's state, until replaced or cleared
+pub fun notice(f: *Front, text: str) {
+    f.message   = text;
+    f.messageyn = 0;
+    f.ask       = ASK_NONE;
+}
+
+# draw whatever is on screen into the renderer's screen
+pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
+    val screen: *u8 = ?r.screen[0];
+
+    if (f.mode == MODE_DEMO || f.mode == MODE_LEVEL) {
+        val player: *defs.Player = ?s.g.players[s.g.consoleplayer];
+        if (player.mo != nil) {
+            r.lv = s.g.lv;
+            render.render_player_view(r, ?s.g, player);
+            st.draw(?s.g, bar, screen);
+        }
+    }
+    or (f.mode == MODE_PAGE) {
+        video.draw_page(s.d, screen, f.pagename);
+    }
+    or (f.mode == MODE_WI) {
+        wi_draw(f, s, screen);
+    }
+    or (f.mode == MODE_FINALE) {
+        finale_draw(f, s, screen);
+    }
+
+    # a message replaces the menu while it is up, as in the original
+    if (f.message != nil) {
+        video.write_centred(s.d, screen, f.message);
+    }
+    or (f.menuactive) {
+        draw_menu(f, s, screen);
+    }
+}
+
+# which of the 14 palettes the screen should be shown through
+pub fun palette(f: *Front, bar: *st.State) i32 {
+    if (f.mode == MODE_DEMO || f.mode == MODE_LEVEL) { ret bar.palette; }
+    ret 0;
+}

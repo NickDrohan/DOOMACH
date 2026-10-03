@@ -1,0 +1,214 @@
+# drawing pictures and text onto the 320 by 200 screen
+#
+# V_DrawPatch from v_video.c and the small-font text of m_menu.c and
+# hu_stuff.c. Everything the game draws that is not the 3D view goes through
+# here: the status bar, the menus, the intermission and the finale.
+
+use std.types.option.opt;
+use std.types.string.str;
+
+use doom.rdata;
+use doom.wad;
+
+pub val SCREENWIDTH:  i32 = 320;
+pub val SCREENHEIGHT: i32 = 200;
+
+# the first and last characters the small font has pictures of
+val FONTSTART: i32 = 33;
+val FONTEND:   i32 = 95;
+
+fun le16(p: *u8, at: i32) i32 {
+    ret ((p[at]::u16 | (p[at + 1]::u16 << 8)):~i16)::i32;
+}
+
+fun le32(p: *u8, at: i32) i32 {
+    ret (p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24)):~i32;
+}
+
+# a patch lump by name, or nil when the WAD has none
+pub fun patch(d: *rdata.Data, name: str) *u8 {
+    val found: opt[u32] = wad.find(d.w, name);
+    if (sel found.none)                     { ret nil; }
+    if (wad.lump(d.w, found.some).size < 8) { ret nil; }
+    ret wad.bytes(d.w, found.some);
+}
+
+# a raw lump by name, or nil
+pub fun lump(d: *rdata.Data, name: str) *u8 {
+    val found: opt[u32] = wad.find(d.w, name);
+    if (sel found.none) { ret nil; }
+    ret wad.bytes(d.w, found.some);
+}
+
+pub fun width(p: *u8) i32 {
+    if (p == nil) { ret 0; }
+    ret le16(p, 0);
+}
+
+pub fun height(p: *u8) i32 {
+    if (p == nil) { ret 0; }
+    ret le16(p, 2);
+}
+
+# V_DrawPatch: masks a column based masked pic to the screen
+# ---
+# screen: 320 by 200 palette indices
+# x_in:   where the patch's origin goes
+# y_in:   where the patch's origin goes
+# p:      the patch, or nil to draw nothing
+pub fun draw_patch(screen: *u8, x_in: i32, y_in: i32, p: *u8) {
+    if (p == nil) { ret; }
+    val w: i32 = le16(p, 0);
+    val x: i32 = x_in - le16(p, 4);
+    val y: i32 = y_in - le16(p, 6);
+
+    var col: i32 = 0;
+    for (col < w) {
+        val sx: i32 = x + col;
+        if (sx >= 0 && sx < SCREENWIDTH) {
+            # step through the posts in a column
+            var at: i32 = le32(p, 8 + col * 4);
+            for (p[at] != 0xff) {
+                val top:    i32 = y + p[at]::i32;
+                val length: i32 = p[at + 1]::i32;
+                var k:      i32 = 0;
+                for (k < length) {
+                    val sy: i32 = top + k;
+                    if (sy >= 0 && sy < SCREENHEIGHT) { screen[sy * SCREENWIDTH + sx] = p[at + 3 + k]; }
+                    k = k + 1;
+                }
+                at = at + length + 4;
+            }
+        }
+        col = col + 1;
+    }
+}
+
+# draw a full-screen picture by name, such as TITLEPIC
+pub fun draw_page(d: *rdata.Data, screen: *u8, name: str) {
+    draw_patch(screen, 0, 0, patch(d, name));
+}
+
+# fill the screen with a flat repeated, as the finale's background
+pub fun tile_flat(d: *rdata.Data, screen: *u8, name: str) {
+    val src: *u8 = lump(d, name);
+    if (src == nil) { ret; }
+    var y: i32 = 0;
+    for (y < SCREENHEIGHT) {
+        var x: i32 = 0;
+        for (x < SCREENWIDTH) {
+            screen[y * SCREENWIDTH + x] = src[((y & 63) << 6) + (x & 63)];
+            x                           = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# a lump name made of a prefix and a decimal number of so many digits
+pub fun numbered(d: *rdata.Data, prefix: str, n: i32, digits: i32) *u8 {
+    var name: [9]u8;
+    var k:    i32 = 0;
+    for (prefix[k] != 0 && k < 8) {
+        name[k] = prefix[k];
+        k       = k + 1;
+    }
+    var i:    i32 = digits - 1;
+    var rest: i32 = n;
+    for (i >= 0) {
+        if (k + i < 8) { name[k + i] = ('0' + rest % 10)::u8; }
+        rest = rest / 10;
+        i    = i - 1;
+    }
+    k = k + digits;
+    if (k > 8) { k = 8; }
+    name[k] = 0;
+    ret patch(d, ?name[0]);
+}
+
+# the small font's picture of a character, or nil for a space or a
+# character it has none of
+fun glyph(d: *rdata.Data, c_in: i32) *u8 {
+    var c: i32 = c_in;
+    if (c >= 'a' && c <= 'z')         { c = c - 32; }
+    if (c < FONTSTART || c > FONTEND) { ret nil; }
+    ret numbered(d, "STCFN", c, 3);
+}
+
+# the height of one line of the small font
+pub fun line_height(d: *rdata.Data) i32 {
+    ret height(glyph(d, 'A')) + 1;
+}
+
+# M_StringWidth: the width of a line of text, up to its end or a newline
+pub fun text_width(d: *rdata.Data, s: str) i32 {
+    var w: i32 = 0;
+    var i: i32 = 0;
+    for (s[i] != 0 && s[i] != '\n') {
+        val g: *u8 = glyph(d, s[i]::i32);
+        if (g == nil) {
+            w = w + 4;
+        }
+        or {
+            w = w + width(g);
+        }
+        i = i + 1;
+    }
+    ret w;
+}
+
+# M_WriteText: write a string in the small font; newlines start a new line
+# back at x
+# ---
+# count: how many characters to write, or -1 for all of them
+pub fun write_text(d: *rdata.Data, screen: *u8, x: i32, y: i32, s: str, count: i32) {
+    var cx: i32 = x;
+    var cy: i32 = y;
+    var i:  i32 = 0;
+    for (s[i] != 0 && (count < 0 || i < count)) {
+        val c: i32 = s[i]::i32;
+        i = i + 1;
+        if (c == '\n') {
+            cx = x;
+            cy = cy + 11;
+            cnt;
+        }
+        val g: *u8 = glyph(d, c);
+        if (g == nil) {
+            cx = cx + 4;
+            cnt;
+        }
+        if (cx + width(g) > SCREENWIDTH) { brk; }
+        draw_patch(screen, cx, cy, g);
+        cx = cx + width(g);
+    }
+}
+
+# the menus' messages: each line centred, the block centred on the screen
+pub fun write_centred(d: *rdata.Data, screen: *u8, s: str) {
+    val lh:    i32 = line_height(d);
+    var lines: i32 = 1;
+    var i:     i32 = 0;
+    for (s[i] != 0) {
+        if (s[i] == '\n') { lines = lines + 1; }
+        i = i + 1;
+    }
+
+    var y:     i32 = 100 - lines * lh / 2;
+    var start: i32 = 0;
+    for {
+        val w: i32 = text_width(d, ?s[start]);
+        write_line(d, screen, 160 - w / 2, y, ?s[start]);
+        y = y + lh;
+        var k: i32 = start;
+        for (s[k] != 0 && s[k] != '\n') { k = k + 1; }
+        if (s[k] == 0) { brk; }
+        start = k + 1;
+    }
+}
+
+# one line of text, stopping at a newline
+fun write_line(d: *rdata.Data, screen: *u8, x: i32, y: i32, s: str) {
+    var n: i32 = 0;
+    for (s[n] != 0 && s[n] != '\n') { n = n + 1; }
+    write_text(d, screen, x, y, s, n);
+}

@@ -13,10 +13,13 @@ $out map products/doom/data/DOOM1.WAD E1M1   # dump a loaded map, one record per
 $out frame products/doom/data/DOOM1.WAD E1M1 frame.ppm              # draw from the player start
 $out frame products/doom/data/DOOM1.WAD E1M1 frame.ppm 1900 -3200 135   # or from x, y, degrees
 python products/doom/harness/topng.py frame.ppm frame.png 3         # PPM to PNG, enlarged 3x
-$out play products/doom/data/DOOM1.WAD        # play the first episode in a window
-$out play products/doom/data/DOOM1.WAD 5 4    # ... from E1M5 on "Ultra-Violence"
+$out play products/doom/data/DOOM1.WAD        # title screen, menus, the whole episode
+$out play products/doom/data/DOOM1.WAD 5 4    # ... or straight into E1M5 on "Ultra-Violence"
 $out demo products/doom/data/DOOM1.WAD DEMO1  # run a built-in demo headless
 $out wav products/doom/data/DOOM1.WAD DEMO1 demo1.wav   # ... and write what it sounds like
+$out mus products/doom/data/DOOM1.WAD D_E1M1  # a song's MIDI messages, one per line
+$out host products/doom/data/DOOM1.WAD 2      # co-op: host a game for two players...
+$out join products/doom/data/DOOM1.WAD 192.168.1.20   # ...and join it from another machine
 bash products/doom/check.sh             # acceptance gates
 ```
 
@@ -61,7 +64,10 @@ a SPIR-V 1.6 module for `vulkan1.3` in both profiles. That module has not been v
 
 ## Playing it
 
-`doom play <wad> [map 1-9] [skill 1-5]` opens a 960 by 720 window on the first episode.
+`doom play <wad>` opens a 960 by 720 window on the title screen, with the three demos playing
+behind it as the original does. Any key brings up the menu: New Game, Options (messages on or
+off, sound and music volume), Read This!, Quit. `doom play <wad> <map 1-9> [skill 1-5]` skips
+straight into a level.
 
 | key | does |
 | --- | --- |
@@ -72,27 +78,39 @@ a SPIR-V 1.6 module for `vulkan1.3` in both profiles. That module has not been v
 | Ctrl or F | fire |
 | Space or E | open doors, press switches; restart the level when dead |
 | 1 to 7 | change weapon |
-| Esc | quit |
+| Esc | the menu; arrows, Enter and Backspace move through it |
 
 It is the game: monsters, weapons, doors, lifts, switches, keys, secrets, damaging floors,
-teleporters, pickups, the status bar, the red and gold screen flashes, and sound effects placed
-in stereo by where they come from. Finishing a level goes straight to the next.
+teleporters, pickups, the status bar, the red and gold screen flashes, sound effects placed in
+stereo by where they come from, and each level's music. Finishing a level brings up the
+intermission (kills, items, secrets and time counting up, then the map with where you are going),
+and finishing E1M8 the episode's closing text.
 
-What is missing, all of it around the game rather than in it: music, the menus,
-the intermission and ending screens, the automap, saved games. The marine's face on the status
+What is missing: the automap, saved games (the menu says so), the screen melt between screens,
+and the screen-size, detail and mouse options. The marine's face on the status
 bar shows how hurt he is and nothing else. Nightmare skill does not speed the demons up as it
 should, because the state table is a constant here and the original edits it in place.
 
 The window procedure Windows calls is a plain Mach function, the frame goes to the screen as an
 8-bit image through `StretchDIBits`, sound goes out through `waveOut` in four short blocks that
-the play loop refills as the device finishes them, and nothing links but user32, gdi32, winmm and
-kernel32. Up to eight effects mix at once, at the 11,025 Hz the WAD stores them at.
+the play loop refills as the device finishes them, and music goes to Windows' own General MIDI
+synthesizer through `midiOut`, translated from id's MUS format 140 ticks a second. Nothing links
+but user32, gdi32, winmm and kernel32. Up to eight effects mix at once, at the 11,025 Hz the WAD
+stores them at.
 
 How far it has been checked: the simulation by the demos below; the renderer and status bar by
 looking at frames captured from the running window; the mapping from held keys to commands by a
-unit test; the mixer by writing a demo's sound to a file and finding the WAD's own samples in it.
-Whether sound actually reaches the speakers has not been checked by anything: the device opens
-and the game runs, and the rest takes ears. The path from the real keyboard to those held keys has been read, not exercised.
+unit test; the mixer by writing a demo's sound to a file and finding the WAD's own samples in it;
+the music by comparing every song's MIDI messages with an independent reader; the menus,
+intermission and finale by a script of keys that photographs each screen. Whether sound and music
+actually reach the speakers has not been checked by anything: the devices open and the game
+runs, and the rest takes ears. The path from the real keyboard to those held keys has been read, not exercised.
+
+## Co-op
+
+Two to four players on the first episode, over a LAN or the internet, in lockstep: every machine
+runs the same simulation and only the players' commands cross the network. Details, the packet
+format and what is and is not done are in [MULTIPLAYER.md](MULTIPLAYER.md).
 
 ## How it is laid out
 
@@ -103,9 +121,11 @@ any animation frame can run code from anywhere. So the port has a real layering,
 | module | from | what |
 | --- | --- | --- |
 | `root` | `d_main.c`, `i_*.c` | commands, the play loop |
-| `win`, `st` | `i_video.c`, `st_stuff.c` | the window and sound device; the status bar |
-| `sound`, `sfx` | `s_sound.c`, `i_sound.c`, `sounds.c` | channels, distance and stereo, the mixer |
-| `game` | `g_game.c`, `p_setup.c` | sessions, levels, demos, keys to commands |
+| `front` | `d_main.c`, `m_menu.c`, `wi_stuff.c`, `f_finale.c` | title and demos, menus, intermission, finale |
+| `win`, `st`, `video` | `i_video.c`, `st_stuff.c`, `v_video.c` | the window and sound devices; the status bar; pictures and text |
+| `sound`, `sfx`, `music` | `s_sound.c`, `i_sound.c`, `sounds.c`, `mus2mid` | effects: channels, distance and stereo, the mixer; MUS to MIDI |
+| `net` | `d_net.c`, `i_net.c` | lockstep co-op over UDP |
+| `game` | `g_game.c`, `p_setup.c` | sessions, levels, demos, co-op, keys to commands |
 | `tick` | `p_tick.c`, `p_user.c` | one tic; the player; thinker dispatch |
 | `enemy`, `pspr` | `p_enemy.c`, `p_pspr.c` | what monsters and weapons do |
 | `spec` | `p_spec.c`, `p_switch.c`, `p_telept.c` | what lines and sectors trigger |
@@ -150,6 +170,16 @@ lift. The three C files that are circular among themselves and cannot be pulled 
 - four views from inside those demos, with monsters, items and the weapon in hand, matching
   `fixtures/shots.sha256` in both profiles;
 - a demo the WAD does not hold rejected with exit 3;
+- each of the WAD's thirteen songs giving, message for message and tick for tick, what
+  `harness/musdump.py` reads from the MUS data independently;
+- a scripted walk through the front end (title, main menu, options, the sound sliders, an
+  intermission counting up and moving on, the E1M8 ending text, the order screen, the quit
+  prompt), eleven screens pinned by hash in `fixtures/front.sha256`, in both profiles;
+- co-op: two games in one process fed the same bots' commands, two players on E1M1 for 3,500
+  tics and four on E1M3 for 7,000, each with a forced death and respawn, ending where
+  `fixtures/coop*.expected` pins them in both profiles;
+- the network: a host and a joiner as two processes over loopback ending exactly where the
+  one-process run ends, and a joiner that secretly draws one random number more caught by both;
 - the first demo's sound, 143 seconds of it: the demo ending exactly where it does with sound
   off, debug and release mixing identical files, the file matching `fixtures/sound.sha256`, and
   the pistol's lump found in it sample for sample by `harness/wavcheck.py`.
@@ -167,7 +197,10 @@ would settle it.
 Perturbed four ways: drawing a pair of random numbers in the other order, strengthening friction
 by one part in 59,392, and letting monsters reach one unit further each sent all three demos
 somewhere else. Restoring the 32 units of explosion reach that the original loses to an overflow
-changed nothing: no explosion in the three demos has anything standing in that gap.
+changed nothing: no explosion in the three demos has anything standing in that gap. The music
+gate caught a channel mapped to the wrong MIDI channel (three songs changed) and pitch bends
+scaled one part in 64 wrong (six songs); it cannot see a volume byte's top bit kept, because no
+song has one set.
 
 **The frame gates are weaker than the rest, and say so.** Everything above them is checked
 against an independent implementation. The frames are not: there is no reference engine on this
@@ -242,7 +275,7 @@ applies to this directory only; the other products in the portfolio are unaffect
 
 Low-detail mode and view sizes other than the standard one with the status bar.
 
-Networking and multiplayer. Music (sound effects only). Doom II, Heretic, Hexen, or any source
+Deathmatch, and networking beyond lockstep co-op. Music (sound effects only). Doom II, Heretic, Hexen, or any source
 port extension — the target is the shareware episode behaving as the original did. Targets other
 than windows-x86_64: the simulation is integer-only and ought to reproduce elsewhere, but nothing
 here tests that.

@@ -1008,6 +1008,25 @@ pub fun give_ammo(g: *Game, player: *Player, ammo: i32, num_in: i32) bool {
 
 # P_GiveWeapon: the weapon name may have a MF_DROPPED flag ored in
 fun give_weapon(g: *Game, player: *Player, weapon: i32, dropped: bool) bool {
+    if (g.netgame && g.deathmatch != 2 && !dropped) {
+        # leave placed weapons forever on net games
+        if (player.weaponowned[weapon]) { ret 0; }
+
+        player.bonuscount          = player.bonuscount + BONUSADD;
+        player.weaponowned[weapon] = 1;
+
+        if (g.deathmatch != 0) {
+            give_ammo(g, player, weaponinfo(weapon, WI_AMMO), 5);
+        }
+        or {
+            give_ammo(g, player, weaponinfo(weapon, WI_AMMO), 2);
+        }
+        player.pendingweapon = weapon;
+
+        if (player == ?g.players[g.consoleplayer]) { defs.sound(g, nil, info.SFX_WPNUP); }
+        ret 0;
+    }
+
     var gaveammo: bool = 0;
     if (weaponinfo(weapon, WI_AMMO) != defs.AM_NOAMMO) {
         # give one clip with a dropped weapon, two clips with a found weapon
@@ -1149,21 +1168,33 @@ fun touch_special_thing(g: *Game, special: *Mobj, toucher: *Mobj) {
     or (sprite == info.SPR_BKEY) {
         # cards; leave cards for everyone
         give_card(player, defs.IT_BLUECARD, "Picked up a blue keycard.");
+        # leave cards for everyone
+        if (g.netgame) { ret; }
     }
     or (sprite == info.SPR_YKEY) {
         give_card(player, defs.IT_YELLOWCARD, "Picked up a yellow keycard.");
+        # leave cards for everyone
+        if (g.netgame) { ret; }
     }
     or (sprite == info.SPR_RKEY) {
         give_card(player, defs.IT_REDCARD, "Picked up a red keycard.");
+        # leave cards for everyone
+        if (g.netgame) { ret; }
     }
     or (sprite == info.SPR_BSKU) {
         give_card(player, defs.IT_BLUESKULL, "Picked up a blue skull key.");
+        # leave cards for everyone
+        if (g.netgame) { ret; }
     }
     or (sprite == info.SPR_YSKU) {
         give_card(player, defs.IT_YELLOWSKULL, "Picked up a yellow skull key.");
+        # leave cards for everyone
+        if (g.netgame) { ret; }
     }
     or (sprite == info.SPR_RSKU) {
         give_card(player, defs.IT_REDSKULL, "Picked up a red skull key.");
+        # leave cards for everyone
+        if (g.netgame) { ret; }
     }
     or (sprite == info.SPR_STIM) {
         # medikits, heals
