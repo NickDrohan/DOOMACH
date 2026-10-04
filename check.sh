@@ -7,6 +7,12 @@ source "$here/scripts/gates.sh"
 echo "doom"
 build_gates "$here"
 
+# The relay is not the default artifact, so it is built here by name, before
+# any gate that starts one: a gate must never run against a relay left over
+# from an older source, nor find none at all in a fresh checkout.
+gate "the relay builds (release, Windows)" 0 "$mach" build "$here" --artifact relay --profile release --quiet
+gate "the relay builds (release, Linux, as Fly runs it)" 0 "$mach" build "$here" --artifact relay --target linux-x86_64 --profile release --quiet
+
 debug="$here/out/windows-x86_64/debug/bin/doom.exe"
 release="$here/out/windows-x86_64/release/bin/doom.exe"
 wad="$here/data/DOOM1.WAD"
@@ -362,10 +368,6 @@ gate "the desync leaves doom-desync.txt saying where" 0 report_says
 # hosts a room, joins every other seat by the code the host prints, and
 # leaves each player's last line in $work/<tag>.<seat>.
 relay_exe="$here/out/windows-x86_64/release/bin/relay.exe"
-# the relay is not the default artifact, so it is built here by name: a gate
-# must never run against a relay left over from an older source
-gate "the relay builds (release, Windows)" 0 "$mach" build "$here" --artifact relay --profile release --quiet
-gate "the relay builds (release, Linux, as Fly runs it)" 0 "$mach" build "$here" --artifact relay --target linux-x86_64 --profile release --quiet
 room() {
     local tag="$1" rport="$2" players="$3" map="$4" tics="$5" extra="${6:-}"
     # shellcheck disable=SC2086
