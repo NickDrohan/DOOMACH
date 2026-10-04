@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run the pinned compiler: scripts/mach build . --profile release
+# The version is the one toolchain.env names; bootstrap.sh fetches it.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$root/toolchain.env"
+exec "$root/tools/mach-$MACH_VERSION/mach.exe" "$@"

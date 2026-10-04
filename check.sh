@@ -2,7 +2,7 @@
 # Acceptance gates for doom. Every gate is a claim that can fail.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-source "$here/../../scripts/gates.sh"
+source "$here/scripts/gates.sh"
 
 echo "doom"
 build_gates "$here"

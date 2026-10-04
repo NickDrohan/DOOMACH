@@ -5,7 +5,7 @@ quarter-wave log-sine table and an exponent table, both 256 entries, turn a
 phase and an attenuation into an amplitude with adds and shifts only. These
 are the published shapes of the chip's ROMs. The rest are the chip's own
 constants, a frequency table for notes in 1/32 semitone steps, and a volume
-curve. Run from products/doom.
+curve. Run from the repository root.
 """
 import io
 import math

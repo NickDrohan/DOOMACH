@@ -1,7 +1,7 @@
 """Generate src/tables.mach from the reference tables.c.
 
 The three trigonometry tables are data, not code, so they are carried over
-mechanically rather than retyped. Run from products/doom.
+mechanically rather than retyped. Run from the repository root.
 """
 import io
 import re

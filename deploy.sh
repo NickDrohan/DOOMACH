@@ -2,14 +2,14 @@
 # Build everything the Fly machine runs and deploy it: the relay, hedge serving
 # the download page, and the download itself.
 #
-#   bash products/doom/deploy.sh            stage and deploy
-#   bash products/doom/deploy.sh --stage    stage only, into out/deploy
+#   bash deploy.sh            stage and deploy
+#   bash deploy.sh --stage    stage only, into out/deploy
 #
 # hedge is built from its v0.17.0 release with Mach 6.5.0, the compiler its CI
 # qualifies it on; newer compilers refuse one of its dependencies.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
+root="$here"
 
 hedge_tag="v0.17.0"
 hedge_mach="6.5.0"

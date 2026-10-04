@@ -1,7 +1,7 @@
 """Generate src/sfx.mach from the reference sounds.c.
 
 The sound effect table is data: a lump name and a priority for each of the
-effects that info.mach numbers. Run from products/doom.
+effects that info.mach numbers. Run from the repository root.
 """
 import io
 import re

@@ -1,4 +1,4 @@
-# doom
+# DOOMACH
 
 A port of id Software's Doom engine to Mach, built so that the port asks hard questions of the
 language rather than just transliterating C.
@@ -7,30 +7,30 @@ language rather than just transliterating C.
 `doom.exe`. Co-op and deathmatch with friends or bots are on the main menu under "Play online".
 
 ```bash
-scripts/bootstrap.sh                    # compiler 6.9.0, std, shareware WAD, id's source
-scripts/mach build products/doom --profile release
-out=products/doom/out/windows-x86_64/release/bin/doom.exe
+./bootstrap.sh                         # compiler 6.9.0, std, shareware WAD, id's source
+scripts/mach build . --profile release
+out=out/windows-x86_64/release/bin/doom.exe
 
-$out wad products/doom/data/DOOM1.WAD        # list the archive's directory
-$out map products/doom/data/DOOM1.WAD E1M1   # dump a loaded map, one record per line
-$out frame products/doom/data/DOOM1.WAD E1M1 frame.ppm              # draw from the player start
-$out frame products/doom/data/DOOM1.WAD E1M1 frame.ppm 1900 -3200 135   # or from x, y, degrees
-python products/doom/harness/topng.py frame.ppm frame.png 3         # PPM to PNG, enlarged 3x
-$out play products/doom/data/DOOM1.WAD        # title screen, menus, the whole episode
-$out play products/doom/data/DOOM1.WAD 5 4    # ... or straight into E1M5 on "Ultra-Violence"
-$out demo products/doom/data/DOOM1.WAD DEMO1  # run a built-in demo headless
-$out wav products/doom/data/DOOM1.WAD DEMO1 demo1.wav   # ... and write what it sounds like
-$out mus products/doom/data/DOOM1.WAD D_E1M1  # a song's MIDI messages, one per line
-$out muswav products/doom/data/DOOM1.WAD D_E1M1 e1m1.wav 30   # ... and 30 s of it, synthesized
-$out host products/doom/data/DOOM1.WAD 2      # co-op: host a game for two players...
-$out join products/doom/data/DOOM1.WAD 192.168.1.20   # ...and join it from another machine
-$out host products/doom/data/DOOM1.WAD 2 --relay mach-doom-relay.fly.dev   # across the internet: shows a room code
-$out join products/doom/data/DOOM1.WAD KQ7M2T --relay mach-doom-relay.fly.dev  # ...which the friend joins with
-$out botmatch products/doom/data/DOOM1.WAD 1 2100   # four bots' deathmatch on E1M1, a minute of it
-$out navdump products/doom/data/DOOM1.WAD 5 nav.ppm # the bots' walk grid of a map, as a picture
-bash products/doom/check.sh             # acceptance gates
-bash products/doom/package.sh           # the download: out/package/doom-in-mach.zip
-bash products/doom/deploy.sh            # the relay, the page and the download, to Fly.io
+$out wad data/DOOM1.WAD        # list the archive's directory
+$out map data/DOOM1.WAD E1M1   # dump a loaded map, one record per line
+$out frame data/DOOM1.WAD E1M1 frame.ppm              # draw from the player start
+$out frame data/DOOM1.WAD E1M1 frame.ppm 1900 -3200 135   # or from x, y, degrees
+python harness/topng.py frame.ppm frame.png 3         # PPM to PNG, enlarged 3x
+$out play data/DOOM1.WAD        # title screen, menus, the whole episode
+$out play data/DOOM1.WAD 5 4    # ... or straight into E1M5 on "Ultra-Violence"
+$out demo data/DOOM1.WAD DEMO1  # run a built-in demo headless
+$out wav data/DOOM1.WAD DEMO1 demo1.wav   # ... and write what it sounds like
+$out mus data/DOOM1.WAD D_E1M1  # a song's MIDI messages, one per line
+$out muswav data/DOOM1.WAD D_E1M1 e1m1.wav 30   # ... and 30 s of it, synthesized
+$out host data/DOOM1.WAD 2      # co-op: host a game for two players...
+$out join data/DOOM1.WAD 192.168.1.20   # ...and join it from another machine
+$out host data/DOOM1.WAD 2 --relay mach-doom-relay.fly.dev   # across the internet: shows a room code
+$out join data/DOOM1.WAD KQ7M2T --relay mach-doom-relay.fly.dev  # ...which the friend joins with
+$out botmatch data/DOOM1.WAD 1 2100   # four bots' deathmatch on E1M1, a minute of it
+$out navdump data/DOOM1.WAD 5 nav.ppm # the bots' walk grid of a map, as a picture
+bash check.sh             # acceptance gates
+bash package.sh           # the download: out/package/doom-in-mach.zip
+bash deploy.sh            # the relay, the page and the download, to Fly.io
 ```
 
 `doom.exe` with no arguments, started by a double click, plays with the `DOOM1.WAD` beside it and
@@ -180,7 +180,7 @@ lift. The three C files that are circular among themselves and cannot be pulled 
 
 ## Acceptance gates
 
-`bash products/doom/check.sh` asserts, and fails loudly on:
+`bash check.sh` asserts, and fails loudly on:
 
 - the standard library checkout matching its pinned tag;
 - the unit tests, and that both profiles build;
@@ -296,9 +296,10 @@ cannot see that bug, so a unit test now pins the behaviour instead.
 
 ## Toolchain
 
-`toolchain.env` in this directory pins **Mach 6.9.0**, overriding the portfolio's 5.11.0 for this
-product only — the SPIR-V backend and 256-bit vectors arrived after 5.11. `scripts/mach` picks the
-override up from the product path. The standard library is `tag/v9.4.1`.
+`toolchain.env` pins **Mach 6.9.0**: the SPIR-V backend and 256-bit vectors arrived after 5.11.
+`bootstrap.sh` fetches that compiler into `tools/`, checked against the hash its release
+publishes, and `scripts/mach` runs it. The standard library is `tag/v9.4.1`, pinned in
+`mach.toml`.
 
 ## Data and reference source
 
@@ -312,8 +313,9 @@ Neither is committed; `bootstrap.sh` fetches both into ignored directories.
 
 ## Licence
 
-GPL-2.0-or-later, in [LICENSE](LICENSE): this is a derivative of id Software's GPL release. That
-applies to this directory only; the other products in the portfolio are unaffected.
+GPL-2.0-or-later, in [LICENSE](LICENSE): this is a derivative of id Software's GPL release.
+`DOOM1.WAD` is not part of this repository and is not covered by it. Doom is a trademark of id
+Software; this is a fan project, not made or endorsed by id Software.
 
 ## Deliberately not built
 

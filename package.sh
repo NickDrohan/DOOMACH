@@ -2,10 +2,10 @@
 # Build the download: one zip with the game, the shareware WAD, a page on how
 # to play, the licence, and the complete source the GPL asks to go with it.
 #
-#   bash products/doom/package.sh          writes out/package/doom-in-mach.zip
+#   bash package.sh          writes out/package/doom-in-mach.zip
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
+root="$here"
 
 (cd "$here" && sha256sum -c --status fixtures/DOOM1.WAD.sha256) || {
     echo "package: data/DOOM1.WAD is missing or not shareware 1.9; run bootstrap.sh" >&2
@@ -29,9 +29,9 @@ import os, sys, zipfile
 root, here, target = sys.argv[1:4]
 top = "doom-in-mach/"
 
-# the source: this product as it stands, and the portfolio scripts that build
-# it, laid out as in the repository; never the WAD, id's code, or build output
-skip = {"data", "ref", "out", "dep"}
+# the source: the repository as it stands; never the WAD, id's code, the
+# compiler, fetched dependencies, git's own files, or build output
+skip = {"data", "ref", "out", "dep", "tools", ".git"}
 source = os.path.join(os.path.dirname(target), "source.zip")
 with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     for base, dirs, files in os.walk(here):
@@ -39,9 +39,7 @@ with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         dirs[:] = sorted(d for d in dirs if not (rel == "." and d in skip))
         for name in sorted(files):
             path = os.path.join(base, name)
-            z.write(path, os.path.join("products/doom", os.path.relpath(path, here)).replace(os.sep, "/"))
-    for name in ("mach", "gates.sh", "bootstrap.sh"):
-        z.write(os.path.join(root, "scripts", name), "scripts/" + name)
+            z.write(path, os.path.join("DOOMACH", os.path.relpath(path, here)).replace(os.sep, "/"))
 
 with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     z.write(os.path.join(here, "out/windows-x86_64/release/bin/doom.exe"), top + "doom.exe")

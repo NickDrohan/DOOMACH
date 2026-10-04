@@ -1,2 +1,9 @@
-data/
-ref/
+# fetched by bootstrap.sh (dep/std is a submodule, pinned and committed)
+/tools/
+/data/
+/ref/
+# built
+out/
+__pycache__/
+# written beside a development build when games go out of step
+doom-desync.txt

@@ -80,7 +80,7 @@ LICENCE AND SOURCE
 
 The program is free software under the GNU General Public License, version 2
 or later (COPYING.txt). Its complete source is in source.zip next to this
-file.
+file, and at https://github.com/NickDrohan/DOOMACH
 
 DOOM1.WAD is id Software's shareware Doom 1.9 data file, which id allows to be
 given away unchanged and free of charge. It is not covered by the GPL.

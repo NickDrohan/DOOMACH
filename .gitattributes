@@ -1,0 +1,7 @@
+# LF everywhere: the gates compare files byte for byte and check hashes
+# line by line, and a CRLF checkout would make those miss.
+* text=auto eol=lf
+
+# a bot's net is weights, and a picture is a picture: never text
+*.net binary
+*.png binary

@@ -2,7 +2,7 @@
 
 The state table, the object-type table and their enumerations are data: 967
 states and 137 object types, each row a handful of numbers. They are carried
-over mechanically rather than retyped. Run from products/doom.
+over mechanically rather than retyped. Run from the repository root.
 """
 import io
 import re
