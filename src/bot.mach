@@ -1,0 +1,897 @@
+# bot: players the simulation plays itself
+#
+# A bot is a player whose commands are computed from the world rather than
+# read from a keyboard. It is part of the simulation, as a monster is: in a
+# network game every machine computes the same bot's same command from the
+# same world, so nothing about a bot crosses the network. That holds only
+# because everything here is integer arithmetic over the shared game state
+# and the bot's own seeded sequence; nothing local to one machine may be
+# read.
+#
+# Every fourth tic a bot senses: how far it can go along eight rays, the
+# nearest enemy it can see, the way through the map's sectors toward the
+# nearest opponent, its own state, the nearest pickup. From those 32
+# numbers it decides: forward, sideways, turn, fire, use, change weapon. Two
+# things can decide. The script is a hand-written fighter, a function of the
+# senses alone. The net is a small integer network, 32 inputs to 24 hidden
+# units to 6 outputs, in eight-bit weights: 942 bytes, which is what makes a
+# bot something to send to another machine, to mutate, and to keep a
+# hundred of. A net that imitates the script is where every bot begins.
+
+use std.types.bool.bool;
+use std.types.size.usize;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.defs.Mobj;
+use doom.defs.Player;
+use doom.defs.Ticcmd;
+use doom.fixed;
+use doom.fixed.Fixed;
+use doom.info;
+use doom.level;
+use doom.maputl;
+use t: doom.tables;
+use doom.world;
+
+pub val INPUTS:  i32 = 32;
+pub val HIDDEN:  i32 = 24;
+pub val OUTPUTS: i32 = 6;
+# input weights, hidden biases, output weights, output biases
+pub val NETSIZE: i32 = 32 * 24 + 24 + 24 * 6 + 6;
+
+pub val KIND_SCRIPT: i32 = 1;
+pub val KIND_NET:    i32 = 2;
+
+# the senses, by index
+pub val F_RAYS:      i32 = 0;
+pub val F_SEEN:      i32 = 8;
+pub val F_BEARING:   i32 = 9;
+pub val F_CLOSE:     i32 = 10;
+pub val F_FACED:     i32 = 11;
+pub val F_SINCE:     i32 = 12;
+pub val F_LASTBEAR:  i32 = 13;
+pub val F_HEALTH:    i32 = 14;
+pub val F_PATH:      i32 = 15;
+pub val F_AMMO:      i32 = 16;
+pub val F_WEAPON:    i32 = 17;
+pub val F_HURT:      i32 = 22;
+pub val F_HURTBEAR:  i32 = 23;
+pub val F_ITEM:      i32 = 24;
+pub val F_ITEMBEAR:  i32 = 25;
+pub val F_ITEMCLOSE: i32 = 26;
+pub val F_STUCK:     i32 = 27;
+pub val F_PHASE:     i32 = 28;
+pub val F_NOISE:     i32 = 29;
+pub val F_WAY:       i32 = 30;
+pub val F_BETTER:    i32 = 31;
+
+# the decisions, by index
+pub val O_FORWARD: i32 = 0;
+pub val O_SIDE:    i32 = 1;
+pub val O_TURN:    i32 = 2;
+pub val O_FIRE:    i32 = 3;
+pub val O_USE:     i32 = 4;
+pub val O_SWITCH:  i32 = 5;
+
+val RAYS:     i32   = 8;
+val RAYRANGE: i32   = 1024;
+val STEP:     Fixed = 24 * 65536;
+val TALL:     Fixed = 56 * 65536;
+
+# the rays' directions from straight ahead, in 256ths of a turn: ahead, 30
+# and 60 degrees to each side, both sides, and behind
+val RAYTURN: [8]i32 = [8]i32{0, 21, -21, 43, -43, 64, -64, 128};
+
+pub rec Bot {
+    active: bool;
+    kind:   i32;
+    net:    [942]i8;
+    seed:   u32;
+
+    # what it last sensed and decided
+    feat: [32]i32;
+    out:  [6]i32;
+
+    # what the senses remember between looks: tics since an enemy was seen
+    # and where; where it stood a second ago, and for how long it has not
+    # moved from there
+    since:    i32;
+    lastbear: i32;
+    wasx:     Fixed;
+    wasy:     Fixed;
+    stuck:    i32;
+    # the place it is making for on the way to an opponent, if it has one
+    haveway:  bool;
+    wayx:     Fixed;
+    wayy:     Fixed;
+
+    # what it has done, for whoever scores it
+    shots:  i32;
+    turned: i32;
+    uses:   i32;
+}
+
+fun clamp(v: i32, lo: i32, hi: i32) i32 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+fun next_random(b: *Bot) i32 {
+    b.seed = b.seed * 1103515245 + 12345;
+    ret ((b.seed >> 16) & 0xff)::i32;
+}
+
+# a direction relative to where a thing faces, in 256ths of a turn, -128 to
+# 127; positive is to its left
+fun bearing(from: *Mobj, x: Fixed, y: Fixed) i32 {
+    val rel: u32 = world.point_to_angle2(from.x, from.y, x, y) - from.angle;
+    ret (((rel >> 24)::i32) ^ 0x80) - 0x80;
+}
+
+fun distance(a: *Mobj, x: Fixed, y: Fixed) i32 {
+    ret maputl.aprox_distance(x - a.x, y - a.y) >> 16;
+}
+
+# ------------------------------------------------------------------ the rays
+
+# how far along the ray the first thing a player could not pass is, as the
+# traverser leaves it; and the floor the ray started from
+var rayfrac:  Fixed;
+var rayfloor: Fixed;
+
+fun ray_stops(g: *Game, in: *defs.Intercept) bool {
+    if (!in.isaline) { ret 1; }
+    val line: *level.Line = ?g.lv.lines[in.line];
+    var blocked: bool = (line.flags::i32 & defs.ML_TWOSIDED) == 0 || (line.flags::i32 & defs.ML_BLOCKING) != 0;
+    if (!blocked) {
+        # a gap too low to walk through, or a step too high to climb
+        maputl.line_opening(g, in.line);
+        blocked = g.openrange < TALL || g.openbottom - rayfloor > STEP;
+    }
+    if (blocked) {
+        rayfrac = in.frac;
+        ret 0;
+    }
+    ret 1;
+}
+
+# how far a player could walk from a thing in a direction, up to RAYRANGE
+fun ray(g: *Game, mo: *Mobj, turn: i32) i32 {
+    val an: u32   = (mo.angle + (turn:~u32 << 24)) >> t.ANGLETOFINESHIFT;
+    val x2: Fixed = mo.x + RAYRANGE * t.FINESINE[an + 2048];
+    val y2: Fixed = mo.y + RAYRANGE * t.FINESINE[an];
+    rayfrac  = 65536;
+    rayfloor = mo.floorz;
+    maputl.path_traverse(g, mo.x, mo.y, x2, y2, defs.PT_ADDLINES, ray_stops);
+    ret fixed.mul(rayfrac, RAYRANGE << 16) >> 16;
+}
+
+# ---------------------------------------------------------------- the senses
+
+# the nearest living thing a bot should fight that it can see: the other
+# players in a deathmatch, the monsters otherwise
+fun find_enemy(g: *Game, me: *Mobj) *Mobj {
+    var best:     *Mobj = nil;
+    var bestdist: i32   = 0x7fffffff;
+
+    if (g.deathmatch != 0) {
+        var i: i32 = 0;
+        for (i < defs.MAXPLAYERS) {
+            val o: *Mobj = g.players[i].mo;
+            if (g.playeringame[i] && o != nil && o != me && o.health > 0) {
+                val d: i32 = distance(me, o.x, o.y);
+                if (d < bestdist && maputl.check_sight(g, me, o)) {
+                    best     = o;
+                    bestdist = d;
+                }
+            }
+            i = i + 1;
+        }
+        ret best;
+    }
+
+    # monsters: the four nearest within reach, then the nearest of those in
+    # sight, so that sight is tested four times at most
+    var near:  [4]*Mobj;
+    var dists: [4]i32 = [4]i32{0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            val mo: *Mobj = th:~*Mobj;
+            if ((mo.flags & defs.MF_COUNTKILL) != 0 && mo.health > 0) {
+                var d: i32   = distance(me, mo.x, mo.y);
+                var m: *Mobj = mo;
+                if (d < 1536) {
+                    # insert into the four, nearest first
+                    var k: i32 = 0;
+                    for (k < 4) {
+                        if (d < dists[k]) {
+                            val td: i32   = dists[k];
+                            val tm: *Mobj = near[k];
+                            dists[k] = d;
+                            near[k]  = m;
+                            d        = td;
+                            m        = tm;
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+        th = th.next;
+    }
+    var k: i32 = 0;
+    for (k < 4) {
+        if (near[k] != nil && dists[k] != 0x7fffffff && maputl.check_sight(g, me, near[k])) { ret near[k]; }
+        k = k + 1;
+    }
+    ret nil;
+}
+
+# the nearest thing to pick up within reach that it can see
+fun find_item(g: *Game, me: *Mobj) *Mobj {
+    var best:     *Mobj = nil;
+    var bestdist: i32   = 768;
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            val mo: *Mobj = th:~*Mobj;
+            if ((mo.flags & defs.MF_SPECIAL) != 0) {
+                val d: i32 = distance(me, mo.x, mo.y);
+                if (d < bestdist) {
+                    best     = mo;
+                    bestdist = d;
+                }
+            }
+        }
+        th = th.next;
+    }
+    if (best != nil && !maputl.check_sight(g, me, best)) { ret nil; }
+    ret best;
+}
+
+# -------------------------------------------------------------- the walk grid
+
+# The map as cells 32 units square, built once a level. A cell's byte says
+# which of its four neighbours a player could walk to from its middle: no
+# wall or blocking line between, room to stand, no step up of more than a
+# stride. A line that does something (a door, a lift) is taken to open.
+val CELL:  i32 = 32;
+val EAST:  i32 = 1;
+val NORTH: i32 = 2;
+val WEST:  i32 = 4;
+val SOUTH: i32 = 8;
+val MAXCELLS: i32 = 65536;
+
+# where the walk being tested ends, for telling which side of a line is the
+# far one
+var walkx: Fixed;
+var walky: Fixed;
+
+fun walk_stops(g: *Game, in: *defs.Intercept) bool {
+    if (!in.isaline) { ret 1; }
+    val line: *level.Line = ?g.lv.lines[in.line];
+    if (line.sidenum[1] == level.NONE || (line.flags::i32 & defs.ML_BLOCKING) != 0) { ret 0; }
+    if (line.special != 0) { ret 1; }
+    # a sector that a switch or trigger moves (a lift, a far door, a rising
+    # floor) is taken to be where it needs to be when the time comes
+    if (g.navmoves[line.frontsector] != 0 || g.navmoves[line.backsector] != 0) { ret 1; }
+    maputl.line_opening(g, in.line);
+    if (g.openrange < TALL) { ret 0; }
+    # the floor on the far side against the floor on the near one
+    var far:  i32 = line.frontsector;
+    var near: i32 = line.backsector;
+    if (maputl.point_on_line_side(g, walkx, walky, in.line) != 0) {
+        far  = line.backsector;
+        near = line.frontsector;
+    }
+    ret g.lv.sectors[far].floorheight - g.lv.sectors[near].floorheight <= STEP;
+}
+
+fun can_walk(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed) bool {
+    walkx = x2;
+    walky = y2;
+    ret maputl.path_traverse(g, x1, y1, x2, y2, defs.PT_ADDLINES, walk_stops);
+}
+
+fun cell_x(g: *Game, cx: i32) Fixed {
+    ret g.lv.bmaporgx + ((cx * CELL + CELL / 2) << 16);
+}
+
+fun cell_y(g: *Game, cy: i32) Fixed {
+    ret g.lv.bmaporgy + ((cy * CELL + CELL / 2) << 16);
+}
+
+fun build_grid(g: *Game) {
+    g.navserial = g.levelserial;
+    g.navw      = g.lv.bmapwidth * (128 / CELL);
+    g.navh      = g.lv.bmapheight * (128 / CELL);
+    g.navgrid   = nil;
+    if (g.navw * g.navh > MAXCELLS) { ret; }
+    g.navgrid  = defs.alloc(g, (g.navw * g.navh)::usize):~*u8;
+    g.navmoves = defs.alloc(g, (g.lv.numsectors + 1)::usize):~*u8;
+    if (g.navgrid == nil || g.navmoves == nil) {
+        g.navgrid = nil;
+        ret;
+    }
+    # the sectors some line's special is aimed at, by tag
+    var l: i32 = 0;
+    for (l < g.lv.numlines) {
+        val line: *level.Line = ?g.lv.lines[l];
+        if (line.special != 0 && line.tagnum != 0) {
+            var sc: i32 = 0;
+            for (sc < g.lv.numsectors) {
+                if (g.lv.sectors[sc].tagnum == line.tagnum) { g.navmoves[sc] = 1; }
+                sc = sc + 1;
+            }
+        }
+        l = l + 1;
+    }
+
+    var cy: i32 = 0;
+    for (cy < g.navh) {
+        var cx: i32 = 0;
+        for (cx < g.navw) {
+            val at: i32   = cy * g.navw + cx;
+            val x:  Fixed = cell_x(g, cx);
+            val y:  Fixed = cell_y(g, cy);
+            if (cx + 1 < g.navw) {
+                val ex: Fixed = cell_x(g, cx + 1);
+                if (can_walk(g, x, y, ex, y)) { g.navgrid[at] = g.navgrid[at] | EAST::u8; }
+                if (can_walk(g, ex, y, x, y)) { g.navgrid[at + 1] = g.navgrid[at + 1] | WEST::u8; }
+            }
+            if (cy + 1 < g.navh) {
+                val ny: Fixed = cell_y(g, cy + 1);
+                if (can_walk(g, x, y, x, ny)) { g.navgrid[at] = g.navgrid[at] | NORTH::u8; }
+                if (can_walk(g, x, ny, x, y)) { g.navgrid[at + g.navw] = g.navgrid[at + g.navw] | SOUTH::u8; }
+            }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+}
+
+# for looking at the grid: mark every cell that can be walked to from a
+# place (1), leaving the rest 0; ret how many
+pub fun grid_flood(g: *Game, x: Fixed, y: Fixed, marks: *u8, back: bool) i32 {
+    if (g.navserial != g.levelserial) { build_grid(g); }
+    if (g.navgrid == nil) { ret 0; }
+    val cells: i32 = g.navw * g.navh;
+    var queue: [65536]u16;
+    var tail:  i32 = 0;
+    var dy:    i32 = -1;
+    for (dy <= 1) {
+        var dx: i32 = -1;
+        for (dx <= 1) {
+            val by: i32 = cell_of(g, x + ((dx * CELL) << 16), y + ((dy * CELL) << 16));
+            if (by >= 0 && marks[by] == 0 && can_walk(g, x, y, cell_x(g, by % g.navw), cell_y(g, by / g.navw))) {
+                marks[by]   = 1;
+                queue[tail] = by::u16;
+                tail        = tail + 1;
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    var head: i32 = 0;
+    for (head < tail) {
+        val at: i32 = queue[head]::i32;
+        head = head + 1;
+        val e:  i32 = g.navgrid[at]::i32;
+        val ax: i32 = at % g.navw;
+        var k:  i32 = 0;
+        for (k < 4) {
+            var next: i32 = -1;
+            if (!back) {
+                if (k == 0 && (e & EAST) != 0)  { next = at + 1; }
+                if (k == 1 && (e & WEST) != 0)  { next = at - 1; }
+                if (k == 2 && (e & NORTH) != 0) { next = at + g.navw; }
+                if (k == 3 && (e & SOUTH) != 0) { next = at - g.navw; }
+            }
+            or {
+                # backwards: the neighbours that can walk into this cell
+                if (k == 0 && ax > 0 && (g.navgrid[at - 1]::i32 & EAST) != 0)                         { next = at - 1; }
+                if (k == 1 && ax + 1 < g.navw && (g.navgrid[at + 1]::i32 & WEST) != 0)                { next = at + 1; }
+                if (k == 2 && at >= g.navw && (g.navgrid[at - g.navw]::i32 & NORTH) != 0)             { next = at - g.navw; }
+                if (k == 3 && at + g.navw < cells && (g.navgrid[at + g.navw]::i32 & SOUTH) != 0)      { next = at + g.navw; }
+            }
+            k = k + 1;
+            if (next < 0 || next >= cells || marks[next] != 0) { cnt; }
+            marks[next] = 1;
+            queue[tail] = next::u16;
+            tail        = tail + 1;
+        }
+    }
+    ret tail;
+}
+
+# the cell a place is in, or -1 off the grid
+fun cell_of(g: *Game, x: Fixed, y: Fixed) i32 {
+    val cx: i32 = ((x - g.lv.bmaporgx) >> 16) / CELL;
+    val cy: i32 = ((y - g.lv.bmaporgy) >> 16) / CELL;
+    if (x < g.lv.bmaporgx || y < g.lv.bmaporgy || cx >= g.navw || cy >= g.navh) { ret -1; }
+    ret cy * g.navw + cx;
+}
+
+# the way to the nearest living opponent: the bearing of a place a few cells
+# along the shortest walk to it, searched across the grid from the opponent
+# back to the bot. Looked for afresh every sixteenth tic; the place is kept
+# in between. 0 if there is no opponent or no way.
+fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
+    val me: *Mobj = g.players[playernum].mo;
+    if (((g.leveltime + playernum) & 15) != 0 && b.haveway) { ret clamp(bearing(me, b.wayx, b.wayy), -127, 127); }
+    b.haveway = 0;
+
+    # whom to make for: in a deathmatch the nearest opponent; in co-op the
+    # nearest person, to follow, or failing a person the nearest bot
+    var target:   *Mobj = nil;
+    var bestdist: i32   = 0x7fffffff;
+    var person:   bool  = 0;
+    var i:        i32   = 0;
+    for (i < defs.MAXPLAYERS) {
+        val o: *Mobj = g.players[i].mo;
+        if (i != playernum && g.playeringame[i] && o != nil && o.health > 0) {
+            val dist:   i32  = distance(me, o.x, o.y);
+            val better: bool = g.deathmatch == 0 && !g.isbot[i] && !person;
+            if (better || (dist < bestdist && (g.deathmatch != 0 || person == !g.isbot[i]))) {
+                target   = o;
+                bestdist = dist;
+                person   = g.deathmatch == 0 && !g.isbot[i];
+            }
+        }
+        i = i + 1;
+    }
+    if (target == nil) { ret 0; }
+    # in co-op, near enough: stay about rather than stand on their toes
+    if (g.deathmatch == 0 && bestdist < 128) { ret 0; }
+
+    if (g.navserial != g.levelserial) { build_grid(g); }
+    if (g.navgrid == nil) { ret 0; }
+    val mine: i32 = cell_of(g, me.x, me.y);
+    val goal: i32 = cell_of(g, target.x, target.y);
+    if (mine < 0 || goal < 0) { ret 0; }
+
+    # A thing is rarely at the middle of its cell, and the middle may be in
+    # a wall. So the search starts from every cell around the opponent whose
+    # middle can walk to it, and ends at the first cell around the bot that
+    # the bot can walk to the middle of.
+    var step:  [65536]u8;
+    var queue: [65536]u16;
+    val cells: i32 = g.navw * g.navh;
+    i = 0;
+    for (i < cells) {
+        step[i] = 0;
+        i       = i + 1;
+    }
+    var ends:  [9]i32;
+    var nends: i32 = 0;
+    var tail:  i32 = 0;
+    var dy:    i32 = -1;
+    for (dy <= 1) {
+        var dx: i32 = -1;
+        for (dx <= 1) {
+            val near: i32 = cell_of(g, target.x + ((dx * CELL) << 16), target.y + ((dy * CELL) << 16));
+            if (near >= 0 && step[near] == 0 && can_walk(g, cell_x(g, near % g.navw), cell_y(g, near / g.navw), target.x, target.y)) {
+                step[near]  = 16;
+                queue[tail] = near::u16;
+                tail        = tail + 1;
+            }
+            val by: i32 = cell_of(g, me.x + ((dx * CELL) << 16), me.y + ((dy * CELL) << 16));
+            if (by >= 0 && can_walk(g, me.x, me.y, cell_x(g, by % g.navw), cell_y(g, by / g.navw))) {
+                ends[nends] = by;
+                nends       = nends + 1;
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+
+    # breadth first from the opponent's cells. step[c] is the way to go from
+    # c, as its direction's bit, 16 at an end of the walk, 0 if not reached.
+    var from: i32 = -1;
+    i = 0;
+    for (i < nends && from < 0) {
+        if (step[ends[i]] != 0) { from = ends[i]; }
+        i = i + 1;
+    }
+    var head: i32 = 0;
+    for (head < tail && from < 0) {
+        val to: i32 = queue[head]::i32;
+        head = head + 1;
+        val tx: i32 = to % g.navw;
+        # each neighbour that can walk into this cell
+        var k: i32 = 0;
+        for (k < 4) {
+            var next: i32 = -1;
+            var way:  i32 = 0;
+            if (k == 0 && tx > 0)               { next = to - 1;      way = EAST; }
+            if (k == 1 && tx + 1 < g.navw)      { next = to + 1;      way = WEST; }
+            if (k == 2 && to >= g.navw)         { next = to - g.navw; way = NORTH; }
+            if (k == 3 && to + g.navw < cells)  { next = to + g.navw; way = SOUTH; }
+            k = k + 1;
+            if (next < 0 || step[next] != 0 || (g.navgrid[next]::i32 & way) == 0) { cnt; }
+            step[next]  = way::u8;
+            queue[tail] = next::u16;
+            tail        = tail + 1;
+            i = 0;
+            for (i < nends) {
+                if (ends[i] == next) { from = next; }
+                i = i + 1;
+            }
+        }
+    }
+    if (from < 0) { ret 0; }
+
+    # along the way: the farthest of the next six cells the bot can walk
+    # straight to, so that it cuts corners no more than the walls allow
+    b.wayx    = cell_x(g, from % g.navw);
+    b.wayy    = cell_y(g, from / g.navw);
+    b.haveway = 1;
+    var at:   i32 = from;
+    var hops: i32 = 0;
+    for (hops < 6 && step[at] != 16) {
+        val way: i32 = step[at]::i32;
+        if (way == EAST)  { at = at + 1; }
+        or (way == WEST)  { at = at - 1; }
+        or (way == NORTH) { at = at + g.navw; }
+        or                { at = at - g.navw; }
+        hops = hops + 1;
+        val x: Fixed = cell_x(g, at % g.navw);
+        val y: Fixed = cell_y(g, at / g.navw);
+        if (!can_walk(g, me.x, me.y, x, y)) { brk; }
+        b.wayx = x;
+        b.wayy = y;
+    }
+    # at the end of the walk, the opponent itself
+    if (step[at] == 16 && can_walk(g, me.x, me.y, target.x, target.y)) {
+        b.wayx = target.x;
+        b.wayy = target.y;
+    }
+    ret clamp(bearing(me, b.wayx, b.wayy), -127, 127);
+}
+
+# which ammunition a weapon uses, or -1
+fun ammo_of(weapon: i32) i32 {
+    if (weapon == defs.WP_PISTOL || weapon == defs.WP_CHAINGUN) { ret defs.AM_CLIP; }
+    if (weapon == defs.WP_SHOTGUN)                              { ret defs.AM_SHELL; }
+    if (weapon == defs.WP_MISSILE)                              { ret defs.AM_MISL; }
+    ret -1;
+}
+
+# the best weapon a player owns and has ammunition for: chaingun, shotgun,
+# pistol, then fists. Rockets are left out: a bot would only kill itself.
+fun best_weapon(p: *Player) i32 {
+    if (p.weaponowned[defs.WP_CHAINGUN] && p.ammo[defs.AM_CLIP] > 0) { ret defs.WP_CHAINGUN; }
+    if (p.weaponowned[defs.WP_SHOTGUN] && p.ammo[defs.AM_SHELL] > 0) { ret defs.WP_SHOTGUN; }
+    if (p.weaponowned[defs.WP_PISTOL] && p.ammo[defs.AM_CLIP] > 0)   { ret defs.WP_PISTOL; }
+    ret defs.WP_FIST;
+}
+
+# look at the world: fill the bot's 32 senses, each within -127 to 127
+fun sense(g: *Game, playernum: i32, b: *Bot) {
+    val p:  *Player = ?g.players[playernum];
+    val me: *Mobj   = p.mo;
+    var f:  *i32    = ?b.feat[0];
+
+    var i: i32 = 0;
+    for (i < RAYS) {
+        # near is high: 127 at the wall, 0 at the ray's end
+        f[F_RAYS + i] = 127 - ray(g, me, RAYTURN[i]) / 8;
+        if (f[F_RAYS + i] < 0) { f[F_RAYS + i] = 0; }
+        i = i + 1;
+    }
+
+    val enemy: *Mobj = find_enemy(g, me);
+    f[F_SEEN]    = 0;
+    f[F_BEARING] = 0;
+    f[F_CLOSE]   = 0;
+    f[F_FACED]   = 0;
+    if (enemy != nil) {
+        f[F_SEEN]    = 127;
+        f[F_BEARING] = clamp(bearing(me, enemy.x, enemy.y), -127, 127);
+        f[F_CLOSE]   = clamp(127 - distance(me, enemy.x, enemy.y) / 16, 0, 127);
+        val back: i32 = bearing(enemy, me.x, me.y);
+        if (back > -16 && back < 16) { f[F_FACED] = 127; }
+        b.since    = 0;
+        b.lastbear = f[F_BEARING];
+    }
+    or {
+        b.since = b.since + 4;
+        if (b.since > 127) { b.since = 127; }
+    }
+    f[F_SINCE]    = b.since;
+    f[F_LASTBEAR] = b.lastbear;
+
+    f[F_HEALTH] = clamp(p.health, 0, 127);
+    f[F_PATH]   = path_bearing(g, playernum, b);
+    val ammo: i32 = ammo_of(p.readyweapon);
+    f[F_AMMO] = 127;
+    if (ammo >= 0) { f[F_AMMO] = clamp(p.ammo[ammo], 0, 127); }
+    i = 0;
+    for (i < 5) {
+        f[F_WEAPON + i] = 0;
+        i               = i + 1;
+    }
+    if (p.readyweapon >= 0 && p.readyweapon < 5) { f[F_WEAPON + p.readyweapon] = 127; }
+
+    f[F_HURT]     = clamp(p.damagecount, 0, 127);
+    f[F_HURTBEAR] = 0;
+    if (p.damagecount > 0 && p.attacker != nil && p.attacker != me) {
+        f[F_HURTBEAR] = clamp(bearing(me, p.attacker.x, p.attacker.y), -127, 127);
+    }
+
+    val item: *Mobj = find_item(g, me);
+    f[F_ITEM]      = 0;
+    f[F_ITEMBEAR]  = 0;
+    f[F_ITEMCLOSE] = 0;
+    if (item != nil) {
+        f[F_ITEM]      = 127;
+        f[F_ITEMBEAR]  = clamp(bearing(me, item.x, item.y), -127, 127);
+        f[F_ITEMCLOSE] = clamp(127 - distance(me, item.x, item.y) / 8, 0, 127);
+    }
+
+    # stuck: how long since it was last a stride from where it stood
+    if (distance(me, b.wasx, b.wasy) > 48) {
+        b.wasx  = me.x;
+        b.wasy  = me.y;
+        b.stuck = 0;
+    }
+    or {
+        b.stuck = b.stuck + 4;
+        if (b.stuck > 127) { b.stuck = 127; }
+    }
+    f[F_STUCK] = b.stuck;
+
+    # a slow square wave, out of step between players, for anything done by
+    # turns; and noise
+    f[F_PHASE] = -127;
+    if (((g.leveltime + playernum * 23) & 64) != 0) { f[F_PHASE] = 127; }
+    f[F_NOISE] = next_random(b) - 128;
+    if (f[F_NOISE] < -127) { f[F_NOISE] = -127; }
+    f[F_WAY] = 0;
+    if (b.haveway) { f[F_WAY] = 127; }
+    f[F_BETTER] = 0;
+    if (best_weapon(p) != p.readyweapon) { f[F_BETTER] = 127; }
+}
+
+# ---------------------------------------------------------------- the script
+
+# the hand-written fighter: a decision from the senses alone, so that a net
+# given the same senses can learn to make the same one
+pub fun script(f: *i32, out: *i32) {
+    var forward: i32 = 0;
+    var side:    i32 = 0;
+    var turn:    i32 = 0;
+    var fire:    i32 = -64;
+    var use:     i32 = -64;
+
+    val ahead: i32 = f[F_RAYS];
+    val left:  i32 = f[F_RAYS + 1] + f[F_RAYS + 3] + f[F_RAYS + 5];
+    val right: i32 = f[F_RAYS + 2] + f[F_RAYS + 4] + f[F_RAYS + 6];
+
+    if (f[F_SEEN] > 0) {
+        # fight: face it, fire when it is in the sights, keep a middling
+        # distance (or close in, with fists), and sidestep by turns
+        turn = f[F_BEARING] * 6;
+        if (f[F_BEARING] > -4 && f[F_BEARING] < 4) { fire = 64; }
+        if (f[F_CLOSE] < 100 || f[F_WEAPON] > 0) {
+            forward = 100;
+        }
+        or (f[F_CLOSE] > 118) {
+            forward = -100;
+        }
+        side = f[F_PHASE] * 100 / 127;
+    }
+    or (f[F_HURT] > 0 && f[F_HURTBEAR] != 0) {
+        # shot from somewhere: turn to it
+        turn    = f[F_HURTBEAR] * 6;
+        forward = 40;
+    }
+    or (f[F_SINCE] < 24) {
+        # it was just there: go where it was last seen
+        turn    = f[F_LASTBEAR] * 3;
+        forward = 100;
+    }
+    or (f[F_ITEM] > 0 && f[F_ITEMCLOSE] > 64 && f[F_STUCK] < 60) {
+        # something to pick up, close by
+        turn    = f[F_ITEMBEAR] * 6;
+        forward = 100;
+    }
+    or (f[F_WAY] > 0) {
+        # hunt: along the way to an opponent, slowing to turn a corner; a
+        # wall in the way straight ahead is likely a door
+        forward = 100;
+        turn    = f[F_PATH] * 6;
+        if (f[F_PATH] > 32 || f[F_PATH] < -32) { forward = 30; }
+        if (ahead > 112 && f[F_PATH] > -12 && f[F_PATH] < 12) { use = 64; }
+    }
+    or {
+        # no way known: roam forward, steering off the nearer wall, and hard
+        # away from a wall ahead; the phase picks a side when both are alike
+        forward = 100;
+        turn    = (right - left) / 6;
+        if (ahead > 96) {
+            turn = 100;
+            if (right < left || (right == left && f[F_PHASE] < 0)) { turn = -100; }
+            if (ahead > 115) {
+                forward = 0;
+                # a wall this near may be a door
+                use = 64;
+            }
+        }
+    }
+
+    # stuck a while: back off turning, the way the phase says, and try the wall
+    if (f[F_STUCK] > 60 && f[F_SEEN] == 0) {
+        forward = -60;
+        turn    = f[F_PHASE] * 100 / 127;
+        use     = 64;
+    }
+
+    out[O_FORWARD] = clamp(forward, -127, 127);
+    out[O_SIDE]    = clamp(side, -127, 127);
+    out[O_TURN]    = clamp(turn, -127, 127);
+    out[O_FIRE]    = fire;
+    out[O_USE]     = use;
+    out[O_SWITCH]  = -64;
+    if (f[F_BETTER] > 0) { out[O_SWITCH] = 64; }
+}
+
+# ------------------------------------------------------------------- the net
+
+# the network: inputs to hidden units, clipped at 0 and 127, to outputs.
+# Weights are in 64ths; a bias counts as a weight on an input of 64.
+pub fun forward(net: *i8, f: *i32, out: *i32) {
+    var hidden: [24]i32;
+    var j:      i32 = 0;
+    for (j < HIDDEN) {
+        var sum: i32 = net[INPUTS * HIDDEN + j]::i32 * 64;
+        var i:   i32 = 0;
+        for (i < INPUTS) {
+            sum = sum + net[j * INPUTS + i]::i32 * f[i];
+            i   = i + 1;
+        }
+        hidden[j] = clamp(sum >> 6, 0, 127);
+        j         = j + 1;
+    }
+    val base: i32 = INPUTS * HIDDEN + HIDDEN;
+    var k:    i32 = 0;
+    for (k < OUTPUTS) {
+        var sum: i32 = net[base + HIDDEN * OUTPUTS + k]::i32 * 64;
+        j = 0;
+        for (j < HIDDEN) {
+            sum = sum + net[base + k * HIDDEN + j]::i32 * hidden[j];
+            j   = j + 1;
+        }
+        out[k] = clamp(sum >> 6, -127, 127);
+        k      = k + 1;
+    }
+}
+
+# ------------------------------------------------------------------ thinking
+
+# one tic of a bot: its command
+# ---
+# g:         the game
+# playernum: which player it is
+# b:         the bot
+# cmd:       the command to fill
+pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
+    var blank: Ticcmd;
+    @cmd = blank;
+    val p: *Player = ?g.players[playernum];
+    if (p.mo == nil) { ret; }
+
+    # dead: press use, off and on, to come back
+    if (p.playerstate == defs.PST_DEAD) {
+        if (((g.leveltime + playernum) & 7) == 0) { cmd.buttons = defs.BT_USE::u8; }
+        ret;
+    }
+
+    # look and decide every fourth tic, each player on its own tic
+    val looking: bool = ((g.leveltime + playernum) & 3) == 0;
+    if (looking) {
+        sense(g, playernum, b);
+        if (b.kind == KIND_NET) {
+            forward(?b.net[0], ?b.feat[0], ?b.out[0]);
+        }
+        or {
+            script(?b.feat[0], ?b.out[0]);
+        }
+    }
+
+    # the decision, held until the next: full speed is 50 forward and 40
+    # sideways; a turn of 127 is 2540 a tic, a fast spin
+    cmd.forwardmove = (b.out[O_FORWARD] * 50 / 127)::i8;
+    cmd.sidemove    = (b.out[O_SIDE] * 40 / 127)::i8;
+    cmd.angleturn   = (b.out[O_TURN] * 20)::i16;
+    b.turned = b.turned + b.out[O_TURN];
+    if (b.out[O_TURN] < 0) { b.turned = b.turned - 2 * b.out[O_TURN]; }
+
+    var buttons: i32 = 0;
+    if (b.out[O_FIRE] > 0) {
+        buttons  = buttons | defs.BT_ATTACK;
+        b.shots  = b.shots + 1;
+    }
+    # use works on the press, so it is pressed on the tic of the decision only
+    if (b.out[O_USE] > 0 && looking) {
+        buttons = buttons | defs.BT_USE;
+        b.uses  = b.uses + 1;
+    }
+    if (b.out[O_SWITCH] > 0 && looking) {
+        val want: i32 = best_weapon(p);
+        if (want != p.readyweapon) { buttons = buttons | defs.BT_CHANGE | (want << defs.BT_WEAPONSHIFT); }
+    }
+    cmd.buttons = buttons::u8;
+}
+
+# make a player a bot
+# ---
+# b:    the bot
+# kind: KIND_SCRIPT or KIND_NET
+# net:  for a net, its 942 weights; nil otherwise
+# seed: for its own noise
+pub fun start(b: *Bot, kind: i32, net: *i8, seed: u32) {
+    var blank: Bot;
+    @b       = blank;
+    b.active = 1;
+    b.kind   = kind;
+    b.seed   = seed;
+    b.since  = 127;
+    if (net != nil) {
+        var i: i32 = 0;
+        for (i < NETSIZE) {
+            b.net[i] = net[i];
+            i        = i + 1;
+        }
+    }
+}
+
+# ------------------------------------------------------------------- tests
+
+test script__faces_and_fires {
+    var f:   [32]i32;
+    var out: [6]i32;
+    # an enemy to the left, far: turn left, come on, hold fire
+    f[F_SEEN]    = 127;
+    f[F_BEARING] = 30;
+    f[F_CLOSE]   = 40;
+    script(?f[0], ?out[0]);
+    if (out[O_TURN] <= 0 || out[O_FORWARD] <= 0 || out[O_FIRE] > 0) { ret 1; }
+
+    # dead ahead: fire
+    f[F_BEARING] = 0;
+    script(?f[0], ?out[0]);
+    if (out[O_FIRE] <= 0) { ret 2; }
+
+    # nothing seen and a wall ahead, open to the right: turn right
+    f[F_SEEN]     = 0;
+    f[F_SINCE]    = 127;
+    f[F_RAYS]     = 110;
+    f[F_RAYS + 1] = 120;
+    script(?f[0], ?out[0]);
+    if (out[O_TURN] >= 0) { ret 3; }
+    ret 0;
+}
+
+test forward__zero_net_gives_zero {
+    var net: [942]i8;
+    var f:   [32]i32;
+    var out: [6]i32;
+    f[0] = 100;
+    forward(?net[0], ?f[0], ?out[0]);
+    var k: i32 = 0;
+    for (k < OUTPUTS) {
+        if (out[k] != 0) { ret 1; }
+        k = k + 1;
+    }
+    # one input, through one hidden unit, to one output: 100 * 64/64 = 100,
+    # then 100 * 32/64 = 50
+    net[0]                              = 64;
+    net[INPUTS * HIDDEN + HIDDEN]       = 32;
+    forward(?net[0], ?f[0], ?out[0]);
+    if (out[0] != 50) { ret 2; }
+    ret 0;
+}

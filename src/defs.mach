@@ -334,6 +334,9 @@ pub rec Player {
     killcount:   i32;
     itemcount:   i32;
     secretcount: i32;
+    # in a deathmatch, how many times this player has killed each player;
+    # its own entry counts the times it killed itself
+    frags:       [4]i32;
 
     message: str;
 
@@ -421,6 +424,15 @@ pub rec Game {
     # counts the levels loaded; whatever held a pointer into the last one
     # must let go when this changes
     levelserial: i32;
+
+    # the bots' walk grid for this level (bot.mach): a byte a cell, and which
+    # level it was built for
+    navgrid:   *u8;
+    # a byte a sector: whether some line's switch or trigger moves it
+    navmoves:  *u8;
+    navw:      i32;
+    navh:      i32;
+    navserial: i32;
     # the WAD holds only the first episode
     shareware: bool;
     # the flat that means "sky"
@@ -430,6 +442,11 @@ pub rec Game {
     playeringame:  [4]bool;
     consoleplayer: i32;
     playerstarts:  [4]level.Thing;
+    # which players the simulation plays itself (bot.mach)
+    isbot:         [4]bool;
+    # where deathmatch players come in, and how many such places the map has
+    deathmatchstarts: [10]level.Thing;
+    numdmstarts:      i32;
 
     totalkills:  i32;
     totalitems:  i32;

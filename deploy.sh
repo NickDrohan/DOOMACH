@@ -18,6 +18,7 @@ hedge_mach_sha256="b0bab055a4aa245bdb2767ec37d2c042a0187f39963403c402872ccc5cedd
 # the game and the zip, then the relay as the Linux machine runs it
 bash "$here/package.sh"
 "$root/scripts/mach" build "$here" --artifact relay --target linux-x86_64 --profile release --quiet
+"$root/scripts/mach" build "$here" --artifact arena --target linux-x86_64 --profile release --quiet
 
 # hedge
 compiler="$root/tools/mach-$hedge_mach/mach.exe"
@@ -40,8 +41,12 @@ rm -rf "$stage"
 mkdir -p "$stage/usr/local/bin" "$stage/srv/site"
 cp "$here/out/linux-x86_64/release/bin/relay" "$stage/usr/local/bin/relay"
 cp "$hedge/out/linux-x86_64/release/bin/hedge" "$stage/usr/local/bin/hedge"
+cp "$here/out/linux-x86_64/release/bin/arena" "$stage/usr/local/bin/arena"
 cp "$here/site/start.sh" "$stage/usr/local/bin/start"
+# what the arena plays with: the game data, and the net every bot began as
+cp "$here/data/DOOM1.WAD" "$here/fixtures/bot0.net" "$stage/srv/"
 cp "$here/site/hedge.toml" "$stage/srv/hedge.toml"
+cp "$here/site/league.html" "$stage/srv/site/"
 cp "$here/site/shot.png" "$here/out/package/doom-in-mach.zip" "$here/out/package/source.zip" "$stage/srv/site/"
 
 zip="$here/out/package/doom-in-mach.zip"

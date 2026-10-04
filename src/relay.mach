@@ -10,6 +10,14 @@
 #   RELAY_BIND_HOST   address or host name to listen on (default 0.0.0.0)
 #   RELAY_UDP_PORT    port (default 5029)
 #   RELAY_MAX_ROOMS   rooms open at once (default 32, at most 256)
+#   RELAY_LEAGUE_FILE the bot league, as the arena keeps it; read every
+#                     minute, and its bots seated in games that start with
+#                     seats empty (default none: the hand-written bot)
+#   RELAY_FILL_SECONDS how long a public room waits before bots take its
+#                     empty seats (default 120; 0 for never)
+#   RELAY_WATCH_FILE  the bot league's match to watch, as the arena leaves
+#                     it; read every five seconds and handed to games that
+#                     ask (default none)
 #
 # --impair makes it a bad network on purpose, for tests: it drops,
 # duplicates and reorders the datagrams it sends, from a seeded sequence.
@@ -28,13 +36,17 @@ use std.types.string.str;
 use std.types.string.str_equals;
 
 
+use fs: std.filesystem;
 use io_error: std.io.error;
 use std.chrono.time;
 use std.crypto.rand;
 use std.net.dns;
 use dnstypes: std.net.resolve.types;
 use std.net.ip;
+use std.allocator;
+use std.allocator.page;
 use std.net.udp;
+use std.types.error.err;
 use std.process.env;
 use std.text.parse;
 
@@ -202,6 +214,39 @@ fun tell(r: *core.Relay) {
     r.nevents = 0;
 }
 
+# read the league, if there is one, for the core to seat its bots
+fun read_league(bots: *core.Bots, path: str) {
+    val opened: res[fs.File, io_error.Error] = fs.open(path);
+    if (sel opened.err) { ret; }
+    var file: fs.File = opened.ok;
+    var have: i32 = 0;
+    for (have < 200000) {
+        val got: res[usize, io_error.Error] = fs.read(file, ?bots.league[have], (200000 - have)::usize);
+        if (sel got.err) { brk; }
+        if (got.ok == 0) { brk; }
+        have = have + got.ok::i32;
+    }
+    fs.close(?file);
+    bots.leaguelen = have;
+}
+
+# read the arena's match file, if there is one, for the core to hand out
+fun read_watch(r: *core.Relay, path: str) {
+    val opened: res[fs.File, io_error.Error] = fs.open(path);
+    if (sel opened.err) { ret; }
+    var file: fs.File = opened.ok;
+    var data: [4096]u8;
+    var have: i32 = 0;
+    for (have < 4096) {
+        val got: res[usize, io_error.Error] = fs.read(file, ?data[have], (4096 - have)::usize);
+        if (sel got.err) { brk; }
+        if (got.ok == 0) { brk; }
+        have = have + got.ok::i32;
+    }
+    fs.close(?file);
+    core.set_watch(r, ?data[0], have);
+}
+
 fun report(r: *core.Relay) {
     print.printlnf("relay: rooms {} created {} started {} closed {} forwarded {} refused {} dropped {}",
         core.open_rooms(r), r.created, r.started, r.closed, r.forwarded, r.refused, r.dropped);
@@ -222,6 +267,15 @@ fun main(argc: i64, argv: **u8) i64 {
     if (roomenv != nil) { maxrooms = number(roomenv, 32); }
     if (maxrooms < 1) { maxrooms = 1; }
     if (maxrooms > core.MAXROOMS::i64) { maxrooms = core.MAXROOMS::i64; }
+
+    var leaguebuf:  [512]u8;
+    val leaguefile: str = setting("RELAY_LEAGUE_FILE", ?leaguebuf[0], 512);
+    var fillbuf:    [32]u8;
+    var fillwait:   i64 = 120;
+    val fillenv:    str = setting("RELAY_FILL_SECONDS", ?fillbuf[0], 32);
+    if (fillenv != nil) { fillwait = number(fillenv, 120); }
+    var watchbuf:  [512]u8;
+    val watchfile: str = setting("RELAY_WATCH_FILE", ?watchbuf[0], 512);
 
     var m: Impair;
     var i: i64 = 1;
@@ -278,6 +332,15 @@ fun main(argc: i64, argv: **u8) i64 {
     var r: core.Relay;
     r.maxrooms = maxrooms::i32;
     r.random   = random;
+    r.fillwait = fillwait * 1000;
+
+    # the bots' room: too big for the stack
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.ok) {
+        val room: res[*core.Bots, allocator.Error] = allocator.zallocate[core.Bots](?a, 1);
+        if (sel room.ok) { r.bots = room.ok; }
+    }
 
     print.printlnf("relay: listening on {}:{}, at most {} rooms", bindhost, port, maxrooms);
     if (m.on) { print.printlnf("relay: impaired: drop {}% duplicate {}% reorder {}%", m.drop, m.dup, m.reorder); }
@@ -286,6 +349,8 @@ fun main(argc: i64, argv: **u8) i64 {
     var buf:      [1500]u8;
     var lasttick: i64 = millis();
     var lastlog:  i64 = lasttick;
+    var lastread: i64 = 0;
+    var lastleague: i64 = -60000;
     var lastrooms: i32 = 0;
     for {
         var from: ip.Endpoint;
@@ -309,6 +374,14 @@ fun main(argc: i64, argv: **u8) i64 {
             lasttick = now;
         }
 
+        if (leaguefile != nil && r.bots != nil && now - lastleague >= 60000) {
+            read_league(r.bots, leaguefile);
+            lastleague = now;
+        }
+        if (watchfile != nil && now - lastread >= 5000) {
+            read_watch(?r, watchfile);
+            lastread = now;
+        }
         release(?sock, ?m, now);
         tell(?r);
 

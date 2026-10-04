@@ -13,6 +13,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
+use doom.bot;
 use doom.defs;
 use doom.defs.Game;
 use doom.defs.Player;
@@ -78,6 +79,9 @@ pub rec Session {
     # moves on. what the intermission shows is kept here.
     completed: bool;
     wi:        Finished;
+
+    # the players the simulation plays itself; set after a game starts
+    bots: [4]bot.Bot;
 }
 
 # what a finished level reports to the intermission (wbstartstruct_t)
@@ -166,6 +170,16 @@ fun load_level(s: *Session) bool {
         i                        = i + 1;
     }
 
+    # a deathmatch starts every level level: nobody has fragged anybody
+    if (g.deathmatch != 0) {
+        i = 0;
+        for (i < defs.MAXPLAYERS) {
+            var none: [4]i32;
+            g.players[i].frags = none;
+            i                  = i + 1;
+        }
+    }
+
     g.totalkills  = 0;
     g.totalitems  = 0;
     g.totalsecret = 0;
@@ -205,7 +219,20 @@ fun load_level(s: *Session) bool {
     g.blocklinks = defs.alloc(g, (cells * 8)::usize):~**defs.Mobj;
 
     g.bodyqueslot = 0;
+    g.numdmstarts = 0;
     load_things(g);
+
+    # if deathmatch, randomly spawn the active players
+    if (g.deathmatch != 0) {
+        i = 0;
+        for (i < defs.MAXPLAYERS) {
+            if (g.playeringame[i]) {
+                g.players[i].mo = nil;
+                deathmatch_spawn_player(g, i);
+            }
+            i = i + 1;
+        }
+    }
 
     # clear special respawning que
     g.iquehead = 0;
@@ -214,6 +241,26 @@ fun load_level(s: *Session) bool {
     # set up world state
     spec.spawn_specials(g);
     ret 1;
+}
+
+# make a player of the game in progress a bot, from now on
+# ---
+# player: which player, who must be in the game
+# kind:   bot.KIND_SCRIPT or bot.KIND_NET
+# net:    a net's weights, or nil
+# seed:   for the bot's own noise
+pub fun set_bot(s: *Session, player: i32, kind: i32, net: *i8, seed: u32) {
+    bot.start(?s.bots[player], kind, net, seed);
+    s.g.isbot[player] = 1;
+}
+
+fun clear_bots(s: *Session) {
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        s.bots[i].active = 0;
+        s.g.isbot[i]     = 0;
+        i                = i + 1;
+    }
 }
 
 # G_InitNew: can be called by the startup code or the menu task
@@ -269,6 +316,7 @@ pub fun init_new(s: *Session, skill_in: i32, episode_in: i32, map_in: i32) bool 
 # ret:     whether the level loaded
 pub fun new_game(s: *Session, skill: i32, episode: i32, map: i32) bool {
     val g: *Game = ?s.g;
+    clear_bots(s);
     g.deathmatch    = 0;
     g.respawnparm   = 0;
     g.fastparm      = 0;
@@ -294,6 +342,7 @@ pub fun new_game(s: *Session, skill: i32, episode: i32, map: i32) bool {
 # ret:     whether the level loaded
 pub fun coop_game(s: *Session, players: i32, me: i32, skill: i32, map: i32) bool {
     val g: *Game = ?s.g;
+    clear_bots(s);
     g.deathmatch    = 0;
     g.respawnparm   = 0;
     g.fastparm      = 0;
@@ -304,6 +353,38 @@ pub fun coop_game(s: *Session, players: i32, me: i32, skill: i32, map: i32) bool
     for (i < defs.MAXPLAYERS) {
         g.playeringame[i] = i < players;
         i                 = i + 1;
+    }
+    ret init_new(s, skill, 1, map);
+}
+
+# start a deathmatch: every machine in the game calls this with the same
+# numbers
+# ---
+# s:          the session
+# players:    how many, 2 to 4
+# me:         which of them this machine is
+# skill:      SK_BABY to SK_NIGHTMARE
+# map:        1 to 9
+# altdeath:   items come back thirty seconds after they are taken, and
+#             weapons are taken rather than left
+# nomonsters: only the players
+# ret:        whether the level loaded
+pub fun deathmatch_game(s: *Session, players: i32, me: i32, skill: i32, map: i32, altdeath: bool, nomonsters: bool) bool {
+    val g: *Game = ?s.g;
+    clear_bots(s);
+    g.deathmatch = 1;
+    if (altdeath) { g.deathmatch = 2; }
+    g.respawnparm   = 0;
+    g.fastparm      = 0;
+    g.nomonsters    = nomonsters;
+    g.netgame       = 1;
+    g.consoleplayer = me;
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        g.playeringame[i] = i < players;
+        var none: [4]i32;
+        g.players[i].frags = none;
+        i                  = i + 1;
     }
     ret init_new(s, skill, 1, map);
 }
@@ -550,14 +631,80 @@ fun check_spot(g: *Game, playernum: i32, mthing: *level.Thing) bool {
     ret 1;
 }
 
+# G_DeathMatchSpawnPlayer: spawns a player at one of the random death match
+# spots; called at level load and each death
+fun deathmatch_spawn_player(g: *Game, playernum: i32) {
+    val selections: i32 = g.numdmstarts;
+    # the original stops with an error on a map with fewer than four; here
+    # such a map falls back to the player's own start
+    if (selections >= 4) {
+        var j: i32 = 0;
+        for (j < 20) {
+            val i: i32 = defs.p_random(g) % selections;
+            if (check_spot(g, playernum, ?g.deathmatchstarts[i])) {
+                g.deathmatchstarts[i].kind = (playernum + 1)::i16;
+                world.spawn_player(g, ?g.deathmatchstarts[i]);
+                ret;
+            }
+            j = j + 1;
+        }
+    }
+
+    # no good spot, so the player will probably get stuck
+    world.spawn_player(g, ?g.playerstarts[playernum]);
+}
+
+# P_RespawnSpecials: in the second kind of deathmatch, an item picked up
+# comes back where it was thirty seconds later
+fun respawn_specials(g: *Game) {
+    # only respawn items in deathmatch
+    if (g.deathmatch != 2) { ret; }
+
+    # nothing left to respawn?
+    if (g.iquehead == g.iquetail) { ret; }
+
+    # wait at least 30 seconds
+    if (g.leveltime - g.itemrespawntime[g.iquetail] < 30 * 35) { ret; }
+
+    val mthing: *level.Thing = ?g.itemrespawnque[g.iquetail];
+    val x:      Fixed        = mthing.x::i32 << 16;
+    val y:      Fixed        = mthing.y::i32 << 16;
+
+    # spawn a teleport fog at the new spot
+    val ss:  i32        = render.point_in_subsector(g.lv, x, y);
+    val fog: *defs.Mobj = world.spawn_mobj(g, x, y, g.lv.sectors[g.lv.subsectors[ss].sector].floorheight, info.MT_IFOG);
+    defs.sound(g, fog, info.SFX_ITMBK);
+
+    # find which type to spawn
+    var i: i32 = 0;
+    for (i < info.NUMMOBJTYPES) {
+        if (mthing.kind::i32 == info.mi(i, info.MI_DOOMEDNUM)) { brk; }
+        i = i + 1;
+    }
+    if (i < info.NUMMOBJTYPES) {
+        # spawn it
+        var z: Fixed = defs.ONFLOORZ;
+        if ((info.mi(i, info.MI_FLAGS) & defs.MF_SPAWNCEILING) != 0) { z = defs.ONCEILINGZ; }
+        val mo: *defs.Mobj = world.spawn_mobj(g, x, y, z, i);
+        mo.spawnpoint = @mthing;
+        mo.angle      = t.ANG45 * (mthing.angle::i32 / 45):~u32;
+    }
+
+    # pull it from the que
+    g.iquetail = (g.iquetail + 1) & (defs.ITEMQUESIZE - 1);
+}
+
 # G_DoReborn in a network game: the dead player comes back at a start, and
 # the level carries on for everyone else
 fun reborn_in_netgame(g: *Game, playernum: i32) {
     # dissasociate the corpse
     g.players[playernum].mo.player = nil;
 
-    # spawn at random spot if in death match; the deathmatch starts are not
-    # kept, so a deathmatch player comes back at their own start
+    # spawn at random spot if in death match
+    if (g.deathmatch != 0) {
+        deathmatch_spawn_player(g, playernum);
+        ret;
+    }
 
     if (check_spot(g, playernum, ?g.playerstarts[playernum])) {
         world.spawn_player(g, ?g.playerstarts[playernum]);
@@ -639,6 +786,9 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
                 read_demo_ticcmd(s, cmd);
                 if (s.demodone) { ret; }
             }
+            or (s.bots[i].active) {
+                bot.think(g, i, ?s.bots[i], cmd);
+            }
             or {
                 @cmd = cmds[i];
             }
@@ -647,6 +797,7 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
     }
 
     tick.ticker(g);
+    respawn_specials(g);
     g.gametic = g.gametic + 1;
 }
 

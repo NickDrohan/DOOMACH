@@ -34,6 +34,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 
+use doom.bot;
 use doom.defs;
 use doom.front;
 use doom.game;
@@ -386,8 +387,17 @@ fun start_menu_net(argc: i64, argv: **u8, n: *net.Net, request: i32, f: *front.F
     if (!net.open(n, 0, 0)) { ret "the network could not be opened.\n\n(press a key)"; }
     n.wadhash = wadhash;
     if (request == front.NET_HOST) {
-        net.host(n, f.netplayers, f.netskill, 1);
+        # a deathmatch is on one of the maps the bots know, picked by the
+        # clock; co-op starts the episode. The list's standing deathmatch is
+        # public and quick whatever the menu says.
+        val dm: bool = f.netdm || f.netquick;
+        var map: i32 = 1;
+        if (dm) { map = BOTMAPS[(win.micros_now() % 7)::i32]; }
+        net.host(n, f.netplayers, f.netskill, map);
         net.use_relay(n, ?relay);
+        n.public     = f.netpublic || f.netquick;
+        n.deathmatch = dm;
+        n.quick      = f.netquick;
     }
     or {
         net.use_relay(n, ?relay);
@@ -479,6 +489,12 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     var netstarted: bool = 0;
     var stalled:    bool = 0;
     var reported:   bool = 0;
+    var lobby:      net.Lobby;
+    # watching the bot league: a match being fetched, or one being played
+    # again, and how long it runs
+    var fetch:     *net.Watch = nil;
+    var fetching:  bool       = 0;
+    var watchtics: i32        = 0;
     var progress:   i64  = 0;
     val tic:        i64  = 1000000 / 35;
     var next:       i64  = win.micros(?window);
@@ -487,15 +503,30 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
         # keys that act once when pressed: the menus, and the weapon keys
         val key:     i32  = win.take_key();
         val stopped: bool = n != nil && (!netstarted || stalled || n.desync || n.quit);
-        if (key != 0 && !stopped) {
+        if (fetching && key == front.KEY_ESCAPE) {
+            # give up on the league
+            net.watch_close(fetch);
+            fetching = 0;
+            front.to_title(?f);
+            f.message = nil;
+            cnt;
+        }
+        if (key != 0 && !stopped && !fetching) {
             val playing: bool = f.mode == front.MODE_LEVEL && !f.menuactive && f.message == nil;
-            if (playing && key >= '1' && key <= '7') {
+            if (playing && f.watching && key >= '1' && key <= '4') {
+                # whose eyes to watch through
+                s.g.consoleplayer = key - '1';
+            }
+            or (playing && key >= '1' && key <= '7') {
                 weapon = key - '0';
             }
             or {
                 front.responder(?f, s, key);
             }
         }
+
+        # a host waiting may start at once, with bots in the empty seats
+        if (n != nil && !netstarted && key == front.KEY_ENTER) { net.ask_fill(n); }
 
         # a network game is left with Esc while waiting or once it has
         # stopped, or with the menu's End Game
@@ -510,6 +541,97 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
             front.to_title(?f);
             f.message = nil;
             cnt;
+        }
+
+        # the bot league, watched: fetch its last match from the relay, play
+        # it again here at the speed of a game, and when it ends fetch the
+        # next
+        if (f.netrequest == front.NET_WATCH || (f.watching && f.mode != front.MODE_PAGE && !fetching && (s.g.leveltime >= watchtics || s.completed))) {
+            f.netrequest = 0;
+            if (fetch == nil) {
+                val wg: res[*net.Watch, allocator.Error] = allocator.zallocate[net.Watch](?a, 1);
+                if (sel wg.ok) { fetch = wg.ok; }
+            }
+            var where: net.Peer;
+            f.mode        = front.MODE_FINALE;
+            f.finalestage = 1;
+            f.menuactive  = 0;
+            if (n == nil && fetch != nil && menu_relay(argc, argv, ?where) && net.watch_open(fetch, ?where)) {
+                fetching = 1;
+                front.notice(?f, "fetching a match from the bot league...\n\n(esc to give up)");
+            }
+            or {
+                front.to_title(?f);
+                front.notice(?f, "the relay could not be reached.\n\n(press a key)");
+            }
+        }
+        if (fetching) {
+            net.watch_poll(fetch, win.micros_now());
+            if (fetch.done) {
+                net.watch_close(fetch);
+                fetching  = 0;
+                watchtics = watch_setup(s, ?fetch.data[0], 0);
+                if (watchtics > 0) {
+                    var names: [96]u8;
+                    var q:     i32 = 0;
+                    for (q < 96) {
+                        names[q] = fetch.data[16 + (q / 24) * 986 + 20 + q % 24];
+                        q        = q + 1;
+                    }
+                    front.start_watching(?f, s, ?names[0]);
+                }
+                or {
+                    front.to_title(?f);
+                    front.notice(?f, "that match is from another version\nof the game. download it again.\n\n(press a key)");
+                }
+            }
+            or (fetch.asks >= 4) {
+                net.watch_close(fetch);
+                fetching = 0;
+                front.to_title(?f);
+                if (fetch.none) {
+                    front.notice(?f, "the bot league has no match\nto watch just now.\n\n(press a key)");
+                }
+                or {
+                    front.notice(?f, "the relay did not answer.\n\n(press a key)");
+                }
+            }
+        }
+
+        # the list of open games, while it is on screen: ask the relay, and
+        # hand the menu what it says
+        if (front.listing(?f) && n == nil) {
+            if (!lobby.opened) {
+                var where: net.Peer;
+                f.liststate = front.LIST_NOREACH;
+                if (menu_relay(argc, argv, ?where) && net.lobby_open(?lobby, ?where, wadhash)) { f.liststate = front.LIST_ASKING; }
+            }
+            net.lobby_poll(?lobby, win.micros_now());
+            if (lobby.answered) {
+                f.liststate = front.LIST_KNOWN;
+                f.nrooms    = lobby.count;
+                var g: i32 = 0;
+                for (g < lobby.count) {
+                    var c: i32 = 0;
+                    for (c < 7) {
+                        f.rooms[g].code[c] = lobby.rooms[g].code[c];
+                        c                  = c + 1;
+                    }
+                    f.rooms[g].players = lobby.rooms[g].players;
+                    f.rooms[g].joined  = lobby.rooms[g].joined;
+                    f.rooms[g].skill   = lobby.rooms[g].skill;
+                    f.rooms[g].map     = lobby.rooms[g].map;
+                    f.rooms[g].deathmatch = lobby.rooms[g].deathmatch;
+                    g                  = g + 1;
+                }
+            }
+            # six seconds without a word is a relay that cannot be reached
+            or (lobby.opened && lobby.asks >= 3) {
+                f.liststate = front.LIST_NOREACH;
+            }
+        }
+        or (lobby.opened) {
+            net.lobby_close(?lobby);
         }
 
         # the menu asked for a co-op game: reach the relay and wait there
@@ -566,7 +688,10 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                     if (net.gather(n)) {
                         netstarted = 1;
                         progress   = now;
-                        if (!front.start_coop(?f, s, n.players, n.me, n.skill, n.map)) { f.quit = 1; }
+                        var names: [96]u8;
+                        net_names(n, ?names[0]);
+                        if (!front.start_coop(?f, s, n.players, n.me, n.skill, n.map, n.deathmatch, ?names[0])) { f.quit = 1; }
+                        seat_bots(s, n);
                         f.message = nil;
                     }
                     or {
@@ -656,6 +781,8 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
         }
     }
     if (n != nil && given == nil) { net.close(n); }
+    net.lobby_close(?lobby);
+    if (fetch != nil) { net.watch_close(fetch); }
     music.stop(?song, opl.midi);
     win.fine_timer(0);
     win.audio_close(?audio);
@@ -969,6 +1096,57 @@ fun desync_report(n: *net.Net, s: *game.Session, mode: i32, gametic: i32) {
     fs.write_bytes(?path[0], ?text[0], at::usize, 0o644);
 }
 
+# every player's name for the deathmatch's score: the bots' own, "you", and
+# "player n" for the other people; 24 bytes each
+fun net_names(n: *net.Net, out: *u8) {
+    var i: i32 = 0;
+    for (i < 96) {
+        out[i] = 0;
+        i      = i + 1;
+    }
+    i = 0;
+    for (i < n.players && i < 4) {
+        if ((n.botmask & (1 << i)) != 0) {
+            append(?out[i * 24], 0, ?n.bots[i].name[0]);
+        }
+        or (i == n.me) {
+            append(?out[i * 24], 0, "you");
+        }
+        or {
+            val at: i32 = append(?out[i * 24], 0, "player ");
+            append_number(?out[i * 24], at, (i + 1)::i64);
+        }
+        i = i + 1;
+    }
+}
+
+# the bots the relay seated in a network game, made players of the session;
+# every machine in the game does the same with the same bots
+fun seat_bots(s: *game.Session, n: *net.Net) {
+    var at: i32 = 0;
+    var i:  i32 = 0;
+    for (i < n.players) {
+        if ((n.botmask & (1 << i)) != 0) {
+            var kind: i32 = bot.KIND_NET;
+            if (n.bots[i].kind == 1) { kind = bot.KIND_SCRIPT; }
+            game.set_bot(s, i, kind, ?n.bots[i].net[0], n.bots[i].seed);
+            # and say who they are, on this player's message line
+            if (at == 0) {
+                at = append(?botline[0], 0, "with you: ");
+            }
+            or {
+                at = append(?botline[0], at, ", ");
+            }
+            at = append(?botline[0], at, ?n.bots[i].name[0]);
+        }
+        i = i + 1;
+    }
+    if (at > 0) { s.g.players[n.me].message = ?botline[0]; }
+}
+
+# the line naming the bots in a game, which a player's message points at
+var botline: [256]u8;
+
 # the sound effects and the music, into one stretch of the output
 fun mix_all(out: *i16, frames: i32) {
     sound.mix(out, frames);
@@ -1246,6 +1424,16 @@ fun waiting_text(n: *net.Net, buf: *u8) {
         count[8]  = ('0' + n.joined)::u8;
         count[10] = ('0' + n.players)::u8;
         at = append(buf, at, ?count[0]);
+        if (n.startseen) {
+            at = append(buf, at, "\n\nthe bots are coming...");
+            ret;
+        }
+        if (n.fillin != 255 && n.fillin != 0) {
+            at = append(buf, at, "\n\nbots take the empty seats in ");
+            at = append_number(buf, at, n.fillin::i64);
+            at = append(buf, at, " s");
+        }
+        if (n.host) { at = append(buf, at, "\n\nenter: start now, with bots"); }
         at = append(buf, at, "\n\n(esc to give up)");
         ret;
     }
@@ -1343,6 +1531,340 @@ fun coop_session(a: *allocator.Allocator, w: *wad.Wad, d: *rdata.Data, players: 
     game.init(s, a, w, d);
     if (!game.coop_game(s, players, me, defs.SK_MEDIUM, map)) { ret nil; }
     ret s;
+}
+
+# one headless deathmatch for four bots; nil if the map does not load
+fun bot_session(a: *allocator.Allocator, w: *wad.Wad, d: *rdata.Data, map: i32) *game.Session {
+    val got: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](a, 1);
+    if (sel got.err) { ret nil; }
+    val s: *game.Session = got.ok;
+    game.init(s, a, w, d);
+    if (!game.deathmatch_game(s, 4, 0, defs.SK_MEDIUM, map, 1, 1)) { ret nil; }
+    ret s;
+}
+
+# the maps the bots can find each other on
+val BOTMAPS: [7]i32 = [7]i32{1, 2, 3, 4, 7, 8, 9};
+
+# write what the hand-written bot sensed and decided, for a net to learn
+# from: matches of four of them across the maps, each decision as 38 bytes
+# (32 senses, 6 decisions, each a signed byte)
+#
+#   doom botdata <file> <matches> <out.bin>
+fun botdata(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+
+    val matches: i32 = number(argv[3], 7)::i32;
+    val tics:    i32 = 4200;
+    # a decision every fourth tic from each of four bots
+    val room: i32 = matches * tics * 38;
+    val buffer: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, room::usize);
+    if (sel buffer.err) { ret EXIT_WRITE; }
+    val out: *u8 = buffer.ok;
+    var at:  i32 = 0;
+
+    val s: *game.Session = bot_session(?a, ?w, ?d, 1);
+    if (s == nil) { ret EXIT_MAP; }
+    var m: i32 = 0;
+    for (m < matches) {
+        if (!game.deathmatch_game(s, 4, 0, defs.SK_MEDIUM, BOTMAPS[m % 7], 1, 1)) { ret EXIT_MAP; }
+        var i: i32 = 0;
+        for (i < 4) {
+            game.set_bot(s, i, bot.KIND_SCRIPT, nil, (m * 7919 + i * 104729 + 17)::u32);
+            i = i + 1;
+        }
+        var cmds: [4]defs.Ticcmd;
+        var tic:  i32 = 0;
+        for (tic < tics && !s.completed) {
+            val time: i32 = s.g.leveltime;
+            game.ticker_cmds(s, ?cmds[0]);
+            i = 0;
+            for (i < 4) {
+                # the bots that looked this tic, and were alive to
+                if (((time + i) & 3) == 0 && s.g.players[i].playerstate == defs.PST_LIVE && s.g.players[i].mo != nil && at + 38 <= room) {
+                    var k: i32 = 0;
+                    for (k < 32) {
+                        out[at + k] = s.bots[i].feat[k]:~u32::u8;
+                        k           = k + 1;
+                    }
+                    k = 0;
+                    for (k < 6) {
+                        out[at + 32 + k] = s.bots[i].out[k]:~u32::u8;
+                        k                = k + 1;
+                    }
+                    at = at + 38;
+                }
+                i = i + 1;
+            }
+            tic = tic + 1;
+        }
+        m = m + 1;
+    }
+    val wrote: err[fs.FsError] = fs.write_bytes(argv[4], out, at::usize, 0o644);
+    if (sel wrote.err) { ret EXIT_WRITE; }
+    print.printlnf("{} decisions from {} matches", at / 38, matches);
+    ret EXIT_OK;
+}
+
+# a deathmatch with nets in it: players 1 and 2 play by the net in a file,
+# 3 and 4 by the script. Prints each one's frags and deaths.
+#
+#   doom netmatch <file> <map 1-9> <tics> <net file>
+fun netmatch(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+
+    val weights: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, argv[5]);
+    if (sel weights.err) {
+        print.eprintln("doom: the net could not be read");
+        ret EXIT_DATA;
+    }
+    if (weights.ok.len != bot.NETSIZE::usize) {
+        print.eprintln("doom: that is not a net: it should be 942 bytes");
+        ret EXIT_DATA;
+    }
+
+    val s: *game.Session = bot_session(?a, ?w, ?d, number(argv[3], 1)::i32);
+    if (s == nil) { ret EXIT_MAP; }
+    game.set_bot(s, 0, bot.KIND_NET, weights.ok.data:~*i8, 17);
+    game.set_bot(s, 1, bot.KIND_NET, weights.ok.data:~*i8, 7936);
+    game.set_bot(s, 2, bot.KIND_SCRIPT, nil, 15855);
+    game.set_bot(s, 3, bot.KIND_SCRIPT, nil, 23774);
+
+    val tics: i32 = number(argv[4], 2100)::i32;
+    var cmds: [4]defs.Ticcmd;
+    var tic:  i32 = 0;
+    for (tic < tics && !s.completed) {
+        game.ticker_cmds(s, ?cmds[0]);
+        tic = tic + 1;
+    }
+    var i: i32 = 0;
+    for (i < 4) {
+        val p: *defs.Player = ?s.g.players[i];
+        var frags:  i32 = 0;
+        var deaths: i32 = p.frags[i];
+        var k:      i32 = 0;
+        for (k < 4) {
+            if (k != i) {
+                frags  = frags + p.frags[k];
+                deaths = deaths + s.g.players[k].frags[i];
+            }
+            k = k + 1;
+        }
+        if (i < 2) {
+            print.printlnf("net {} frags {} deaths {} shots {}", i + 1, frags, deaths, s.bots[i].shots);
+        }
+        or {
+            print.printlnf("script {} frags {} deaths {} shots {}", i + 1, frags, deaths, s.bots[i].shots);
+        }
+        i = i + 1;
+    }
+    print.printlnf("end tic {} sum {} map E1M{}", tic, game.checksum(s), s.g.gamemap);
+    ret EXIT_OK;
+}
+
+# draw a map's walk grid as the bots have it, as a PPM: grey where a player
+# can walk somewhere, green where it can walk to from the first deathmatch
+# start, red at each deathmatch start, black elsewhere
+#
+#   doom navdump <file> <map 1-9> <out.ppm>
+fun navdump(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+    val got: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+    if (sel got.err) { ret EXIT_DATA; }
+    val s: *game.Session = got.ok;
+    game.init(s, ?a, ?w, ?d);
+    if (!game.deathmatch_game(s, 4, 0, defs.SK_MEDIUM, number(argv[3], 1)::i32, 1, 1)) { ret EXIT_MAP; }
+
+    val g: *defs.Game = ?s.g;
+    val marks: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, 65536);
+    if (sel marks.err) { ret EXIT_DATA; }
+    val reached: i32 = bot.grid_flood(g, g.deathmatchstarts[0].x::i32 << 16, g.deathmatchstarts[0].y::i32 << 16, marks.ok, 0);
+    val backs: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, 65536);
+    if (sel backs.err) { ret EXIT_DATA; }
+    val returned: i32 = bot.grid_flood(g, g.deathmatchstarts[0].x::i32 << 16, g.deathmatchstarts[0].y::i32 << 16, backs.ok, 1);
+    print.printlnf("{} cells can walk back to it", returned);
+    val gw: i32 = g.navw;
+    val gh: i32 = g.navh;
+    print.printlnf("grid {} by {}, {} cells walked to from the first start, {} deathmatch starts", gw, gh, reached, g.numdmstarts);
+
+    val bytes: i32 = 32 + gw * gh * 3;
+    val image: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, bytes::usize);
+    if (sel image.err) { ret EXIT_WRITE; }
+    val out: *u8 = image.ok;
+    var at:  i32 = append(out, 0, "P6\n");
+    at = append_number(out, at, gw::i64);
+    at = append(out, at, " ");
+    at = append_number(out, at, gh::i64);
+    at = append(out, at, "\n255\n");
+    var y: i32 = gh - 1;
+    for (y >= 0) {
+        var x: i32 = 0;
+        for (x < gw) {
+            val c: i32 = y * gw + x;
+            var r: u8  = 0;
+            var gr: u8 = 0;
+            var bl: u8 = 0;
+            if (g.navgrid[c] != 0) {
+                r  = 90;
+                gr = 90;
+                bl = 90;
+            }
+            if (marks.ok[c] != 0) {
+                r  = 40;
+                gr = 200;
+                bl = 60;
+                # walked into, but with no way back: yellow
+                if (backs.ok[c] == 0) {
+                    r  = 240;
+                    gr = 220;
+                    bl = 40;
+                }
+            }
+            var k: i32 = 0;
+            for (k < g.numdmstarts) {
+                val sx: i32 = ((g.deathmatchstarts[k].x::i32 << 16) - g.lv.bmaporgx) >> 21;
+                val sy: i32 = ((g.deathmatchstarts[k].y::i32 << 16) - g.lv.bmaporgy) >> 21;
+                if (x >= sx - 1 && x <= sx + 1 && y >= sy - 1 && y <= sy + 1) {
+                    r  = 255;
+                    gr = 30;
+                    bl = 30;
+                }
+                k = k + 1;
+            }
+            out[at]     = r;
+            out[at + 1] = gr;
+            out[at + 2] = bl;
+            at          = at + 3;
+            x           = x + 1;
+        }
+        y = y - 1;
+    }
+    val wrote: err[fs.FsError] = fs.write_bytes(argv[4], out, at::usize, 0o644);
+    if (sel wrote.err) { ret EXIT_WRITE; }
+    ret EXIT_OK;
+}
+
+# a deathmatch between four bots with no window: two machines' worth of
+# game in one process, compared every tic, since a bot is part of the
+# simulation and must decide the same on every machine. Prints each bot's
+# frags and deaths.
+#
+#   doom botmatch <file> <map 1-9> <tics> [<out.ppm> [trace]]
+#
+# With a last word, each bot's place and what it senses and decides is
+# printed every ten seconds, for finding out why bots do what they do.
+fun botmatch(argc: i64, argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    var b:     allocator.Allocator;
+    val made2: err[allocator.Error] = page.make(?b);
+    if (sel made2.err) { ret EXIT_WAD; }
+
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+
+    val map:  i32 = number(argv[3], 1)::i32;
+    val tics: i32 = number(argv[4], 2100)::i32;
+
+    val got1: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+    val got2: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?b, 1);
+    if (sel got1.err) { ret EXIT_DATA; }
+    if (sel got2.err) { ret EXIT_DATA; }
+    val one: *game.Session = got1.ok;
+    val two: *game.Session = got2.ok;
+    game.init(one, ?a, ?w, ?d);
+    game.init(two, ?b, ?w, ?d);
+    if (!game.deathmatch_game(one, 4, 0, defs.SK_MEDIUM, map, 1, 1) || !game.deathmatch_game(two, 4, 1, defs.SK_MEDIUM, map, 1, 1)) {
+        print.eprintln("doom: the map could not be loaded");
+        ret EXIT_MAP;
+    }
+    var i: i32 = 0;
+    for (i < 4) {
+        game.set_bot(one, i, bot.KIND_SCRIPT, nil, (i * 7919 + 17)::u32);
+        game.set_bot(two, i, bot.KIND_SCRIPT, nil, (i * 7919 + 17)::u32);
+        i = i + 1;
+    }
+
+    val began: i64 = win.micros_now();
+    var cmds:  [4]defs.Ticcmd;
+    var tic:   i32 = 0;
+    for (tic < tics && !one.completed) {
+        game.ticker_cmds(one, ?cmds[0]);
+        game.ticker_cmds(two, ?cmds[0]);
+        if (game.checksum(one) != game.checksum(two)) {
+            print.printlnf("diverged at tic {}", tic);
+            ret EXIT_MAP;
+        }
+        if (argc == 7 && tic % 350 == 0) {
+            var q: i32 = 0;
+            for (q < 4) {
+                val mo: *defs.Mobj = one.g.players[q].mo;
+                val bb: *bot.Bot   = ?one.bots[q];
+                print.eprintlnf("t{} b{} at {},{} way {} path {} stuck {} ahead {} seen {} fwd {} turn {} use {} hp {}", tic, q + 1, mo.x >> 16, mo.y >> 16, bb.haveway, bb.feat[bot.F_PATH], bb.feat[bot.F_STUCK], bb.feat[0], bb.feat[bot.F_SEEN], bb.out[0], bb.out[2], bb.out[4], one.g.players[q].health);
+                q = q + 1;
+            }
+        }
+        tic = tic + 1;
+    }
+    val took: i64 = win.micros_now() - began;
+
+    if (argc >= 6) {
+        val ready: res[*render.Renderer, render.RenderError] = render.make(?a, ?d, one.g.lv);
+        if (sel ready.ok) {
+            val r: *render.Renderer = ready.ok;
+            render.render_player_view(r, ?one.g, ?one.g.players[0]);
+            write_ppm(?a, ?d, r, argv[5]);
+        }
+    }
+
+    i = 0;
+    for (i < 4) {
+        val p: *defs.Player = ?one.g.players[i];
+        var frags:  i32 = 0;
+        var deaths: i32 = p.frags[i];
+        var k:      i32 = 0;
+        for (k < 4) {
+            if (k != i) {
+                frags  = frags + p.frags[k];
+                deaths = deaths + one.g.players[k].frags[i];
+            }
+            k = k + 1;
+        }
+        print.printlnf("bot {} frags {} deaths {} suicides {} shots {} health {}", i + 1, frags, deaths, p.frags[i], one.bots[i].shots, p.health);
+        i = i + 1;
+    }
+    print.eprintlnf("{} tics of two games in {} ms", tic, took / 1000);
+    print.printlnf("end tic {} sum {} map E1M{}", tic, game.checksum(one), one.g.gamemap);
+    ret EXIT_OK;
 }
 
 # co-op without a network: two machines' worth of game in one process, each
@@ -1486,11 +2008,20 @@ fun netplay(argc: i64, argv: **u8) i64 {
     # machine alone press Space on the intermission, as a player would
     var levels: bool = 0;
     var press:  bool = 0;
+    # "public" puts a hosted room on the relay's list
+    var listed: bool = 0;
+    # "fill" starts a hosted room as soon as it can, bots in the empty seats
+    var fillnow: bool = 0;
+    # "dm" hosts a deathmatch rather than co-op
+    var deathmatch: bool = 0;
     var word:   i64  = 4;
     for (word < argc) {
         if (str_equals(argv[word], "paced"))  { paced = 1; }
         if (str_equals(argv[word], "levels")) { levels = 1; }
         if (str_equals(argv[word], "press"))  { press = 1; }
+        if (str_equals(argv[word], "public")) { listed = 1; }
+        if (str_equals(argv[word], "fill"))   { fillnow = 1; }
+        if (str_equals(argv[word], "dm"))     { deathmatch = 1; }
         word = word + 1;
     }
     var tics:    i32  = 0;
@@ -1536,6 +2067,8 @@ fun netplay(argc: i64, argv: **u8) i64 {
         if (players > 4) { players = 4; }
         net.host(n, players, defs.SK_MEDIUM, number(argv[5], 1)::i32);
         if (viarelay) { net.use_relay(n, ?relay); }
+        n.public     = listed;
+        n.deathmatch = deathmatch;
     }
     or (viarelay) {
         net.use_relay(n, ?relay);
@@ -1565,6 +2098,8 @@ fun netplay(argc: i64, argv: **u8) i64 {
             print.printlnf("room {}", ?n.code[0]);
             said = 1;
         }
+        # for the test: once one other player is in, start with bots
+        if (fillnow && n.host && n.joined >= 2) { net.ask_fill(n); }
         win.nap(5);
         if (win.micros_now() - began > 20000000) {
             print.eprintln("doom: nobody came");
@@ -1573,11 +2108,23 @@ fun netplay(argc: i64, argv: **u8) i64 {
         }
     }
 
-    val s: *game.Session = coop_session(?a, ?w, ?d, n.players, n.me, n.map);
+    var s: *game.Session = nil;
+    if (n.deathmatch) {
+        val got2: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+        if (sel got2.ok) {
+            s = got2.ok;
+            game.init(s, ?a, ?w, ?d);
+            if (!game.deathmatch_game(s, n.players, n.me, defs.SK_MEDIUM, n.map, 1, 1)) { s = nil; }
+        }
+    }
+    or {
+        s = coop_session(?a, ?w, ?d, n.players, n.me, n.map);
+    }
     if (s == nil) {
         net.close(n);
         ret EXIT_MAP;
     }
+    seat_bots(s, n);
 
     var bot: Bot;
     bot.seed = (n.me * 7919 + 17)::u32;
@@ -1702,6 +2249,169 @@ fun netplay(argc: i64, argv: **u8) i64 {
     ret EXIT_OK;
 }
 
+fun get32(p: *u8, at: i32) u32 {
+    ret p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24);
+}
+
+# set a session up to play a league match again, as the arena left it in
+# its watch file (arena.mach): the map, and each bot's kind, seed and net
+# ---
+# view: whose eyes, 0 to 3
+# ret:  the match's length in tics, or 0 if the file is not one or its map
+#       does not load
+fun watch_setup(s: *game.Session, data: *u8, view: i32) i32 {
+    if (data[0] != 'M' || data[1] != 'D' || data[2] != 'W' || data[3] != '1' || data[4] != 1) { ret 0; }
+    val map:  i32 = data[5]::i32;
+    val tics: i32 = get32(data, 8):~i32;
+    if (map < 1 || map > 9 || tics < 1 || tics > 35 * 600) { ret 0; }
+    if (!game.deathmatch_game(s, 4, view, defs.SK_MEDIUM, map, 1, 1)) { ret 0; }
+    var i: i32 = 0;
+    for (i < 4) {
+        val at: i32 = 16 + i * 986;
+        var kind: i32 = bot.KIND_NET;
+        if (get32(data, at) == bot.KIND_SCRIPT::u32) { kind = bot.KIND_SCRIPT; }
+        game.set_bot(s, i, kind, (?data[at + 44]):~*i8, get32(data, at + 4));
+        i = i + 1;
+    }
+    ret tics;
+}
+
+# fetch the bot league's last match from a relay and play it again with no
+# window, as fast as it goes; say whether it came out as the league
+# recorded it, which it must if this program and the arena, on whatever
+# machines, compute the same game
+#
+#   doom watch <wad> <relay address>
+fun watch(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+
+    var relay: net.Peer;
+    if (!net.parse_address(argv[3], ?relay)) {
+        print.eprintln("doom: that relay is not an address");
+        ret EXIT_USAGE;
+    }
+    val wg: res[*net.Watch, allocator.Error] = allocator.zallocate[net.Watch](?a, 1);
+    if (sel wg.err) { ret EXIT_DATA; }
+    val fetch: *net.Watch = wg.ok;
+    if (!net.watch_open(fetch, ?relay)) {
+        print.eprintln("doom: the network could not be opened");
+        ret EXIT_WINDOW;
+    }
+    val began: i64 = win.micros_now();
+    for (!fetch.done && win.micros_now() - began < 10000000) {
+        net.watch_poll(fetch, win.micros_now());
+        win.nap(5);
+    }
+    net.watch_close(fetch);
+    if (!fetch.done) {
+        if (fetch.none) {
+            print.eprintln("doom: the relay has no league match to watch");
+        }
+        or {
+            print.eprintln("doom: the relay did not answer");
+        }
+        ret EXIT_MAP;
+    }
+
+    val got: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+    if (sel got.err) { ret EXIT_DATA; }
+    val s: *game.Session = got.ok;
+    game.init(s, ?a, ?w, ?d);
+    val tics: i32 = watch_setup(s, ?fetch.data[0], 0);
+    if (tics == 0) {
+        print.eprintln("doom: that is not a match this program can play");
+        ret EXIT_DATA;
+    }
+    var cmds: [4]defs.Ticcmd;
+    var tic:  i32 = 0;
+    for (tic < tics && !s.completed && !s.broken) {
+        game.ticker_cmds(s, ?cmds[0]);
+        tic = tic + 1;
+    }
+
+    var same: bool = 1;
+    var i:    i32  = 0;
+    for (i < 4) {
+        val at: i32 = 16 + i * 986;
+        val p:  *defs.Player = ?s.g.players[i];
+        var frags:  i32 = 0;
+        var deaths: i32 = p.frags[i];
+        var k:      i32 = 0;
+        for (k < 4) {
+            if (k != i) {
+                frags  = frags + p.frags[k];
+                deaths = deaths + s.g.players[k].frags[i];
+            }
+            k = k + 1;
+        }
+        val wasfrags:  i32 = get32(?fetch.data[0], at + 8):~i32;
+        val wasdeaths: i32 = get32(?fetch.data[0], at + 12):~i32;
+        if (frags != wasfrags || deaths != wasdeaths) { same = 0; }
+        print.printlnf("{}: frags {} deaths {} (the league had {} and {})", ?fetch.data[at + 20], frags, deaths, wasfrags, wasdeaths);
+        i = i + 1;
+    }
+    if (!same) {
+        print.println("the replay differs from the league's match");
+        ret EXIT_MAP;
+    }
+    print.printlnf("match {} on E1M{}: the replay is the league's match", get32(?fetch.data[0], 12), s.g.gamemap);
+    ret EXIT_OK;
+}
+
+# print a relay's open games that this program and WAD could join, one a
+# line: code, players joined of how many, skill, map
+#
+#   doom rooms <wad> <relay address>
+fun rooms(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+
+    var relay: net.Peer;
+    if (!net.parse_address(argv[3], ?relay)) {
+        print.eprintln("doom: that relay is not an address");
+        ret EXIT_USAGE;
+    }
+    var lobby: net.Lobby;
+    if (!net.lobby_open(?lobby, ?relay, game_hash(?a, ?w))) {
+        print.eprintln("doom: the network could not be opened");
+        ret EXIT_WINDOW;
+    }
+    val began: i64 = win.micros_now();
+    for (!lobby.answered && win.micros_now() - began < 5000000) {
+        net.lobby_poll(?lobby, win.micros_now());
+        win.nap(5);
+    }
+    net.lobby_close(?lobby);
+    if (!lobby.answered) {
+        print.eprintln("doom: the relay did not answer");
+        ret EXIT_MAP;
+    }
+    var i: i32 = 0;
+    for (i < lobby.count) {
+        val g: *net.Listing = ?lobby.rooms[i];
+        if (g.deathmatch) {
+            print.printlnf("{} {}/{} deathmatch map E1M{}", ?g.code[0], g.joined, g.players, g.map);
+        }
+        or {
+            print.printlnf("{} {}/{} skill {} map E1M{}", ?g.code[0], g.joined, g.players, g.skill + 1, g.map);
+        }
+        i = i + 1;
+    }
+    ret EXIT_OK;
+}
+
 # started by a double click: play with the DOOM1.WAD in the same folder,
 # and say in a box what is wrong if it cannot
 fun clicked() i64 {
@@ -1736,8 +2446,14 @@ fun main(argc: i64, argv: **u8) i64 {
     if ((argc == 5 || argc == 8) && str_equals(argv[1], "frame"))             { ret frame(argc, argv); }
     if (argc >= 6 && str_equals(argv[1], "netplay"))                          { ret netplay(argc, argv); }
     if (argc >= 6 && str_equals(argv[1], "coop"))                             { ret coop(argc, argv); }
+    if (argc == 5 && str_equals(argv[1], "navdump"))                          { ret navdump(argv); }
+    if (argc == 5 && str_equals(argv[1], "botdata"))                          { ret botdata(argv); }
+    if (argc == 6 && str_equals(argv[1], "netmatch"))                         { ret netmatch(argv); }
+    if (argc >= 5 && argc <= 7 && str_equals(argv[1], "botmatch"))          { ret botmatch(argc, argv); }
     if (argc >= 4 && str_equals(argv[1], "script"))                           { ret script(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "mus"))                              { ret mus(argv); }
+    if (argc == 4 && str_equals(argv[1], "rooms"))                            { ret rooms(argv); }
+    if (argc == 4 && str_equals(argv[1], "watch"))                            { ret watch(argv); }
     if (argc == 6 && str_equals(argv[1], "muswav"))                           { ret muswav(argv); }
     if (argc == 5 && str_equals(argv[1], "wav"))                              { ret wav(argv); }
     if (argc >= 3 && argc <= 9 && str_equals(argv[1], "host"))                { ret play_net(argc, argv, 1); }

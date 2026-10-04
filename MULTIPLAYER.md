@@ -6,8 +6,10 @@ is a reason for one. **Built 2026-10-02**; what is and is not done is under "Whe
 
 ## Playing it
 
-Each machine needs the same `DOOM1.WAD`. The easy way is the menu: Esc, "Co-op online", then
-"Host a game for 2" (3, 4) and a skill, or "Join with a room code". The host's screen shows a
+Each machine needs the same `DOOM1.WAD`. The easy way is the menu: Esc, "Play online", then
+"Host a game for 2" (3, 4) and a skill, or "Join with a room code". With "Listed publicly" set
+to yes the hosted game also shows under "Find an open game" on every other copy of the same
+build, to be joined with Enter; `doom rooms <wad> <relay address>` prints that list. The host's screen shows a
 six-character code to send the others. It goes through the relay at `mach-doom-relay.fly.dev`
 (see [RELAY.md](RELAY.md)), or the one `--relay` or `DOOM_RELAY` names; Options, End Game leaves,
 and the others are told. From the command line, the same through the relay:

@@ -20,6 +20,7 @@
 
 use std.types.bool.bool;
 
+use lf: doom.leaguefile;
 use p: doom.relayproto;
 
 pub val MAXROOMS:   i32 = 256;
@@ -31,6 +32,8 @@ val RATESLOTS:      i32 = 64;
 # a lobby player silent this long is dropped; a playing one, this long
 pub val LOBBY_TIMEOUT: i64 = 15000;
 pub val PLAY_TIMEOUT:  i64 = 10000;
+# a room that asks to be quick waits this long for people before its bots
+pub val QUICK_WAIT: i64 = 15000;
 # a room that never filled is closed after this long
 pub val ROOM_LIFETIME: i64 = 30 * 60 * 1000;
 # at most this many creates and joins from one address in each window
@@ -61,8 +64,34 @@ pub rec Room {
     skill:    i32;
     map:      i32;
     wadhash:  u64;
+    public:   bool;
+    deathmatch: bool;
+    # how long it waits, if public, before bots take its empty seats, in
+    # milliseconds; 0 for never
+    wait:     i64;
     created:  i64;
     slots:    [4]Slot;
+    # once started: which seats bots took, a bit a seat
+    botmask:  i32;
+}
+
+# a bot in a seat
+pub rec Seated {
+    kind: i32;
+    seed: u32;
+    name: [24]u8;
+    net:  [942]i8;
+}
+
+# what the relay needs to seat the league's bots: the league as the arena
+# last wrote it, and, for each room, the bots seated in it, copied when the
+# game starts so that every player is told the same nets however the league
+# moves on. Too big for a stack: the process allocates it. Without it, or
+# without a league, the bots seated are the hand-written one.
+pub rec Bots {
+    league:    [200000]u8;
+    leaguelen: i32;
+    seated:    [1024]Seated;
 }
 
 # a datagram to send
@@ -108,6 +137,18 @@ pub rec Relay {
     out:      [64]Out;
     nout:     i32;
     rates:    [64]Rate;
+
+    # the league's bots, if the process has them; and how long a public room
+    # waits before bots take its empty seats, in milliseconds, 0 for never
+    bots:     *Bots;
+    fillwait: i64;
+
+    # the league match the arena last left to be watched, if any
+    watch:    [4096]u8;
+    watchlen: i32;
+
+    # the time of the datagram or tick being handled
+    now: i64;
 
     # what has happened to rooms since the process last took the list
     events:  [32]Event;
@@ -201,7 +242,10 @@ fun send_start(r: *Relay, room: *Room, slot: i32) {
     o.data[at]     = room.players::u8;
     o.data[at + 1] = room.skill::u8;
     o.data[at + 2] = room.map::u8;
-    o.len          = at + 3;
+    o.data[at + 3] = room.botmask::u8;
+    o.data[at + 4] = 0;
+    if (room.deathmatch) { o.data[at + 4] = p.FLAG_DEATHMATCH; }
+    o.len          = at + 5;
 }
 
 fun send_lobby(r: *Relay, room: *Room, slot: i32) {
@@ -211,7 +255,15 @@ fun send_lobby(r: *Relay, room: *Room, slot: i32) {
     val at: i32 = p.header(?o.data[0], p.LOBBY, slot, 0, s.token);
     o.data[at]     = room.players::u8;
     o.data[at + 1] = joined(room)::u8;
-    o.len          = at + 2;
+    # seconds until bots take the empty seats, 255 for never
+    o.data[at + 2] = 255;
+    if (room.public && room.wait > 0) {
+        var left: i64 = (room.created + room.wait - r.now) / 1000;
+        if (left < 0)   { left = 0; }
+        if (left > 254) { left = 254; }
+        o.data[at + 2] = left::u8;
+    }
+    o.len = at + 3;
 }
 
 # tell everyone left in a room that a player has gone
@@ -265,6 +317,120 @@ fun try_start(r: *Relay, room: *Room, now: i64) {
     for (i < room.players) {
         send_start(r, room, i);
         i = i + 1;
+    }
+}
+
+fun room_index(r: *Relay, room: *Room) i32 {
+    var i: i32 = 0;
+    for (i < MAXROOMS) {
+        if (room == ?r.rooms[i]) { ret i; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# start a room that is not full: bots take the empty seats. Every player
+# there must have shown it can be reached. The bots are drawn from the
+# league if the process has one, each a different member, and copied for the
+# room; otherwise they are the hand-written bot.
+fun fill(r: *Relay, room: *Room, now: i64) {
+    if (room.started || joined(room) == 0) { ret; }
+    var mask: i32 = 0;
+    var i:    i32 = 0;
+    for (i < room.players) {
+        if (room.slots[i].used) {
+            if (!room.slots[i].validated) { ret; }
+        }
+        or {
+            mask = mask | (1 << i);
+        }
+        i = i + 1;
+    }
+    if (mask == 0) {
+        try_start(r, room, now);
+        ret;
+    }
+
+    val index: i32 = room_index(r, room);
+    var drawn: [4]i32 = [4]i32{-1, -1, -1, -1};
+    i = 0;
+    for (i < room.players) {
+        if ((mask & (1 << i)) != 0 && r.bots != nil) {
+            val b: *Seated = ?r.bots.seated[index * MAXPLAYERS + i];
+            var blank: Seated;
+            @b     = blank;
+            b.seed = r.random()::u32;
+            b.kind = lf.KIND_SCRIPT;
+            var k: i32 = 0;
+            if (lf.valid(?r.bots.league[0], r.bots.leaguelen)) {
+                # a member not already drawn for this room
+                var who: i32 = 0;
+                for {
+                    who = (r.random() % lf.MEMBERS::u64)::i32;
+                    if (who != drawn[0] && who != drawn[1] && who != drawn[2] && who != drawn[3]) { brk; }
+                }
+                drawn[i] = who;
+                val at: i32 = lf.HEAD + who * lf.MEMBER_BYTES;
+                if (p.get32(?r.bots.league[0], at + lf.AT_KIND) != lf.KIND_SCRIPT::u32) { b.kind = lf.KIND_LEARNS; }
+                for (k < lf.NET) {
+                    b.net[k] = r.bots.league[at + lf.AT_NET + k]:~i8;
+                    k        = k + 1;
+                }
+                lf.name_of(who, ?b.name[0]);
+            }
+            or {
+                lf.name_of(0, ?b.name[0]);
+            }
+        }
+        i = i + 1;
+    }
+
+    room.botmask = mask;
+    room.started = 1;
+    room.began   = now;
+    r.started    = r.started + 1;
+    event(r, EV_STARTED, room, 0);
+    i = 0;
+    for (i < room.players) {
+        if (room.slots[i].used) { send_start(r, room, i); }
+        i = i + 1;
+    }
+}
+
+# tell a player about the bot in a seat of its room
+fun bot_is(r: *Relay, room: *Room, slot: i32, seat: i32) {
+    if (seat < 0 || seat >= room.players || (room.botmask & (1 << seat)) == 0) { ret; }
+    val s: *Slot = ?room.slots[slot];
+    val o: *Out  = queue(r, ?s.addr);
+    if (o == nil) { ret; }
+    val at: i32 = p.header(?o.data[0], p.BOTIS, slot, 0, s.token);
+    var k:  i32 = 0;
+    for (k < p.BOTBODY) {
+        o.data[at + k] = 0;
+        k              = k + 1;
+    }
+    o.data[at] = seat::u8;
+    o.len      = at + p.BOTBODY;
+    if (r.bots == nil) {
+        # no league: the hand-written bot, its seed from the room and seat
+        p.put32(?o.data[0], at + 4, lf.KIND_SCRIPT::u32);
+        p.put32(?o.data[0], at + 8, (room.code[0]::u32 << 16) | (room.code[1]::u32 << 8) | seat::u32);
+        lf.name_of(0, ?o.data[at + 12]);
+        ret;
+    }
+    val index: i32     = room_index(r, room);
+    val b:     *Seated = ?r.bots.seated[index * MAXPLAYERS + seat];
+    p.put32(?o.data[0], at + 4, b.kind::u32);
+    p.put32(?o.data[0], at + 8, b.seed);
+    k = 0;
+    for (k < 24) {
+        o.data[at + 12 + k] = b.name[k];
+        k                   = k + 1;
+    }
+    k = 0;
+    for (k < lf.NET) {
+        o.data[at + 36 + k] = b.net[k]:~u8;
+        k                   = k + 1;
     }
 }
 
@@ -376,6 +542,13 @@ fun create(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     room.skill   = d[p.HEADER + 1]::i32;
     room.map     = d[p.HEADER + 2]::i32;
     room.wadhash = p.get64(d, p.HEADER + 4);
+    # an older game's create has no flags, and its room is private
+    var flags: u8 = 0;
+    if (len >= p.HEADER + 17) { flags = d[p.HEADER + 16]; }
+    room.public     = (flags & p.FLAG_PUBLIC) != 0;
+    room.deathmatch = (flags & p.FLAG_DEATHMATCH) != 0;
+    room.wait       = r.fillwait;
+    if ((flags & p.FLAG_QUICK) != 0) { room.wait = QUICK_WAIT; }
     room.created = now;
 
     val s: *Slot = ?room.slots[0];
@@ -453,6 +626,93 @@ fun join(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     welcome(r, room, i);
 }
 
+# the public list: the rooms this game could join now. Answered only to a
+# request as long as the answer could be, within the rate limit.
+fun list(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
+    if (len < p.LISTSIZE || d[p.HEADER] != p.VERSION) {
+        r.dropped = r.dropped + 1;
+        ret;
+    }
+    if (!rate_ok(r, from.ip, now)) { ret; }
+    val wad: u64  = p.get64(d, p.HEADER + 1);
+    val o:   *Out = queue(r, from);
+    if (o == nil) { ret; }
+    var at:    i32 = p.header(?o.data[0], p.ROOMS, 0, 0, 0) + 1;
+    var count: i32 = 0;
+    var i:     i32 = 0;
+    for (i < r.maxrooms && count < p.LISTMAX) {
+        val room: *Room = ?r.rooms[i];
+        i = i + 1;
+        if (!room.used || !room.public || room.started || room.wadhash != wad) { cnt; }
+        val here: i32 = joined(room);
+        if (here >= room.players) { cnt; }
+        var k: i32 = 0;
+        for (k < p.CODELEN) {
+            o.data[at + k] = room.code[k];
+            k              = k + 1;
+        }
+        o.data[at + 6] = room.players::u8;
+        o.data[at + 7] = here::u8;
+        o.data[at + 8]  = room.skill::u8;
+        o.data[at + 9]  = room.map::u8;
+        o.data[at + 10] = 0;
+        if (room.deathmatch) { o.data[at + 10] = 1; }
+        at    = at + p.LISTENTRY;
+        count = count + 1;
+    }
+    o.data[p.HEADER] = count::u8;
+    o.len            = at;
+}
+
+# the process read the arena's match file: keep it to hand out
+pub fun set_watch(r: *Relay, data: *u8, len: i32) {
+    if (len != p.WATCHFILE) {
+        r.watchlen = 0;
+        ret;
+    }
+    var k: i32 = 0;
+    for (k < len) {
+        r.watch[k] = data[k];
+        k          = k + 1;
+    }
+    r.watchlen = len;
+}
+
+# one piece of the match to watch, to a request as long as the answer
+fun watch(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
+    if (len < p.WATCHSIZE || d[p.HEADER] != p.VERSION) {
+        r.dropped = r.dropped + 1;
+        ret;
+    }
+    if (!rate_ok(r, from.ip, now)) { ret; }
+    val piece: i32 = d[p.HEADER + 1]::i32;
+    val start: i32 = piece * p.WATCHPIECE;
+    val o: *Out = queue(r, from);
+    if (o == nil) { ret; }
+    val at: i32 = p.header(?o.data[0], p.MATCH, 0, 0, 0);
+    p.put16(?o.data[0], at, r.watchlen::u32);
+    o.data[at + 2] = piece::u8;
+    o.data[at + 3] = 0;
+    # the match's number, by which a game tells pieces of one match from
+    # pieces of the next
+    var k: i32 = 0;
+    for (k < 4) {
+        o.data[at + 4 + k] = r.watch[12 + k];
+        k                  = k + 1;
+    }
+    var count: i32 = 0;
+    if (start < r.watchlen) {
+        count = r.watchlen - start;
+        if (count > p.WATCHPIECE) { count = p.WATCHPIECE; }
+    }
+    k = 0;
+    for (k < count) {
+        o.data[at + 8 + k] = r.watch[start + k];
+        k                  = k + 1;
+    }
+    o.len = at + 8 + count;
+}
+
 # the room and seat a token belongs to, or nil
 fun find_token(r: *Relay, slot: i32, token: u64) *Room {
     if (slot < 0 || slot >= MAXPLAYERS || token == 0) { ret nil; }
@@ -486,6 +746,14 @@ pub fun handle(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
         join(r, d, len, from, now);
         ret;
     }
+    if (kind == p.LIST) {
+        list(r, d, len, from, now);
+        ret;
+    }
+    if (kind == p.WATCH) {
+        watch(r, d, len, from, now);
+        ret;
+    }
 
     # everything else must carry a seat's token
     val slot: i32   = d[5]::i32;
@@ -495,6 +763,7 @@ pub fun handle(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
         ret;
     }
     val s: *Slot = ?room.slots[slot];
+    r.now = now;
 
     # a token from a new address is the same player after its router
     # changed its mapping; the token is the proof it can be reached there
@@ -537,10 +806,18 @@ pub fun handle(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     or (kind == p.LEAVE) {
         remove_slot(r, room, slot, EV_LEFT, now);
     }
+    or (kind == p.FILL) {
+        # the host would rather start now, with bots in the empty seats
+        if (slot == 0) { fill(r, room, now); }
+    }
+    or (kind == p.BOTASK) {
+        if (room.started && len >= p.BOTSIZE) { bot_is(r, room, slot, d[p.HEADER]::i32); }
+    }
 }
 
 # the timers: drop silent players, close rooms nobody filled
 pub fun tick(r: *Relay, now: i64) {
+    r.now = now;
     var i: i32 = 0;
     for (i < r.maxrooms) {
         val room: *Room = ?r.rooms[i];
@@ -554,6 +831,8 @@ pub fun tick(r: *Relay, now: i64) {
             if (room.slots[k].used && now - room.slots[k].lastseen > limit) { remove_slot(r, room, k, EV_TIMEDOUT, now); }
             k = k + 1;
         }
+        # a public room that has waited long enough starts with bots
+        if (room.used && !room.started && room.public && room.wait > 0 && now - room.created >= room.wait) { fill(r, room, now); }
         if (room.used && !room.started && now - room.created > ROOM_LIFETIME) { close_room(r, room, now); }
     }
 }
@@ -714,6 +993,139 @@ test relay__events_tell_the_story {
     }
     if (r.events[1].slot != p.WAD_MISMATCH::i32 || r.events[2].slot != 1 || r.events[4].slot != 1) { ret 10; }
     if (r.events[6].played != 7 || r.events[6].code[0] != code[0]) { ret 11; }
+    ret 0;
+}
+
+fun list_req(buf: *u8, wad: u64, len: i32) i32 {
+    var k: i32 = 0;
+    for (k < p.LISTSIZE) {
+        buf[k] = 0;
+        k      = k + 1;
+    }
+    val at: i32 = request(buf, p.LIST, 0, 0, 0);
+    buf[at] = p.VERSION;
+    p.put64(buf, at + 1, wad);
+    ret len;
+}
+
+test relay__list_shows_only_what_can_be_joined {
+    var r: Relay;
+    fresh(?r);
+    var buf: [128]u8;
+    var a:   Addr = Addr{ip: 1, port: 1};
+    var b:   Addr = Addr{ip: 2, port: 2};
+    var c:   Addr = Addr{ip: 3, port: 3};
+    var ask: Addr = Addr{ip: 9, port: 9};
+
+    # a public room, a private one, and a public one with another WAD
+    var len: i32 = create_req(?buf[0], 2, 5, 1);
+    buf[len] = p.FLAG_PUBLIC;
+    handle(?r, ?buf[0], len + 1, ?a, 0);
+    var code: [6]u8;
+    var k:    i32 = 0;
+    for (k < 6) {
+        code[k] = r.out[0].data[16 + k];
+        k       = k + 1;
+    }
+    handle(?r, ?buf[0], create_req(?buf[0], 2, 5, 2), ?b, 0);
+    len = create_req(?buf[0], 2, 6, 3);
+    buf[len] = p.FLAG_PUBLIC;
+    handle(?r, ?buf[0], len + 1, ?c, 0);
+    if (open_rooms(?r) != 3) { ret 1; }
+    r.nout = 0;
+
+    # a short request gets nothing: the answer could be longer than it
+    handle(?r, ?buf[0], list_req(?buf[0], 5, 30), ?ask, 10);
+    if (r.nout != 0) { ret 2; }
+
+    # a full-length one gets the one room it could join
+    handle(?r, ?buf[0], list_req(?buf[0], 5, p.LISTSIZE), ?ask, 20);
+    if (r.nout != 1 || r.out[0].data[4] != p.ROOMS || r.out[0].data[16] != 1) { ret 3; }
+    if (r.out[0].len > p.LISTSIZE) { ret 4; }
+    k = 0;
+    for (k < 6) {
+        if (r.out[0].data[17 + k] != code[k]) { ret 5; }
+        k = k + 1;
+    }
+    if (r.out[0].data[23] != 2 || r.out[0].data[24] != 1) { ret 6; }
+    r.nout = 0;
+
+    # once it fills it is off the list
+    handle(?r, ?buf[0], join_req(?buf[0], ?code[0], 5, 7), ?b, 30);
+    r.nout = 0;
+    handle(?r, ?buf[0], list_req(?buf[0], 5, p.LISTSIZE), ?ask, 40);
+    if (r.nout != 1 || r.out[0].data[16] != 0) { ret 7; }
+    ret 0;
+}
+
+test relay__bots_take_the_empty_seats {
+    var r: Relay;
+    fresh(?r);
+    r.fillwait = 60000;
+    var buf:  [1100]u8;
+    var host: Addr = Addr{ip: 1, port: 1};
+
+    # a public room for three, with only its host
+    var len: i32 = create_req(?buf[0], 3, 5, 1);
+    buf[len] = p.FLAG_PUBLIC;
+    handle(?r, ?buf[0], len + 1, ?host, 0);
+    val token: u64 = p.get64(?r.out[0].data[0], 8);
+    r.nout = 0;
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 0, 0, token), ?host, 1000);
+    # the lobby says how long until the bots come: 59 seconds
+    if (r.out[0].data[4] != p.LOBBY || r.out[0].data[18] != 59) { ret 1; }
+    r.nout = 0;
+
+    # the host keeps reporting in; not yet
+    var t: i64 = 10000;
+    for (t < 59000) {
+        handle(?r, ?buf[0], request(?buf[0], p.STATUS, 0, 0, token), ?host, t);
+        t = t + 10000;
+    }
+    tick(?r, 59000);
+    if (r.rooms[0].started) { ret 2; }
+    # at a minute, the room starts with bots in seats 1 and 2
+    r.nout = 0;
+    tick(?r, 60000);
+    if (!r.rooms[0].started || r.rooms[0].botmask != 6) { ret 3; }
+    if (r.nout != 1 || r.out[0].data[4] != p.START || r.out[0].data[19] != 6) { ret 4; }
+    r.nout = 0;
+
+    # asked who is in seat 2: the hand-written bot, here, with no league
+    var k: i32 = 0;
+    for (k < p.BOTSIZE) {
+        buf[k] = 0;
+        k      = k + 1;
+    }
+    val at: i32 = request(?buf[0], p.BOTASK, 0, 0, token);
+    buf[at] = 2;
+    handle(?r, ?buf[0], p.BOTSIZE, ?host, 60100);
+    if (r.nout != 1 || r.out[0].data[4] != p.BOTIS || r.out[0].data[16] != 2) { ret 5; }
+    if (p.get32(?r.out[0].data[0], 20) != lf.KIND_SCRIPT::u32 || r.out[0].data[28] != 'T') { ret 6; }
+    r.nout = 0;
+    # and a seat a person holds is not a bot's
+    buf[at] = 0;
+    handle(?r, ?buf[0], p.BOTSIZE, ?host, 60200);
+    if (r.nout != 0) { ret 7; }
+    ret 0;
+}
+
+test relay__a_host_can_start_at_once_with_bots {
+    var r: Relay;
+    fresh(?r);
+    var buf:  [64]u8;
+    var host: Addr = Addr{ip: 1, port: 1};
+    # a private room: bots never come by themselves
+    r.fillwait = 1000;
+    handle(?r, ?buf[0], create_req(?buf[0], 4, 5, 1), ?host, 0);
+    val token: u64 = p.get64(?r.out[0].data[0], 8);
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 0, 0, token), ?host, 100);
+    tick(?r, 5000);
+    if (r.rooms[0].started) { ret 1; }
+    # until the host asks
+    r.nout = 0;
+    handle(?r, ?buf[0], request(?buf[0], p.FILL, 0, 0, token), ?host, 5100);
+    if (!r.rooms[0].started || r.rooms[0].botmask != 14) { ret 2; }
     ret 0;
 }
 

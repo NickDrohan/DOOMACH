@@ -1,0 +1,767 @@
+# arena: a league of a hundred bots, playing deathmatches around the clock
+#
+#   arena <wad> <first net> <directory> [<matches>]
+#
+# A hundred bots, each a 942-byte net that began as the same imitation of
+# the hand-written bot. Four at a time are drawn to a two-minute deathmatch
+# on one of the episode's maps, with no window, as fast as the processor
+# allows within a share of it (ARENA_DUTY, a percentage, 5 unless set).
+#
+# Every bot is rated the same way, by who outscored whom (Elo). But each
+# learns by its own lights: it has a style, a reward of its own, and
+# alternates six games as it is with six as a mutated copy of itself,
+# keeping the copy if the copy earned more of that reward. Most styles want
+# frags, in different ways; some want to spin, to open doors, never to fire,
+# or to die, and get comically bad at winning while getting good at what
+# they want. Two never learn: the hand-written bot itself, and a net of
+# noise.
+#
+# The directory holds league.bin, the whole league, rewritten every minute
+# and read back at the start, so the league outlives the process;
+# board.json, the standings, for the page that shows them; and watch.bin,
+# the match just played, for a game to play again at the speed a person can
+# watch: the map, and each bot's net, seed and name, which is all a match
+# is, with its result to check the replay against.
+
+use std.allocator;
+use std.allocator.page;
+use std.chrono.time;
+use std.collections.vector.Vector;
+use std.crypto.rand;
+use fs: std.filesystem;
+use io_error: std.io.error;
+use std.print;
+use std.runtime;
+use std.process.env;
+use std.system.os;
+use std.text.parse;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use doom.bot;
+use doom.defs;
+use doom.game;
+use lf: doom.leaguefile;
+use doom.rdata;
+use doom.wad;
+
+val MEMBERS: i32 = 100;
+val NET:     i32 = 942;
+# games in a block: so many as it is, then so many as its mutant
+val BLOCK: i32 = 6;
+# tics in a match: two minutes
+val MATCH: i32 = 4200;
+# the maps the bots can find each other on
+val MAPS: [7]i32 = [7]i32{1, 2, 3, 4, 7, 8, 9};
+
+val STYLES: i32 = 10;
+val STYLE_NAMES: [10]str = [10]str{
+    "Fragger", "Survivor", "Berserker", "Sniper", "Tourist", "Camper", "Dervish", "Pacifist", "Doorman", "Lemming"
+};
+# which style each bot in twenty has: eight fraggers, two each of the next
+# three, one each of the rest
+val STYLE_OF: [20]i32 = [20]i32{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9};
+
+# the chance of the higher rated by rating gap, in thousandths, every 25
+# points from 0 to 800
+val EXPECT: [33]i32 = [33]i32{
+    500, 536, 571, 606, 640, 673, 703, 732, 760, 785, 808, 830, 849, 867, 882, 896, 909,
+    920, 930, 939, 947, 954, 960, 965, 969, 973, 977, 980, 983, 985, 987, 989, 990
+};
+
+val KIND_LEARNS: i32 = 0;
+val KIND_SCRIPT: i32 = 1;
+val KIND_STATIC: i32 = 2;
+
+rec Member {
+    kind:  i32;
+    style: i32;
+    # how hard it mutates: the size of a change and the share of weights
+    # changed, in hundredths
+    sigma: i32;
+    share: i32;
+
+    # in hundredths of a point
+    rating: i32;
+    games:  i32;
+    frags:  i32;
+    deaths: i32;
+    # mutants kept
+    generation: i32;
+
+    # the block being played: 0 as it is, 1 as its mutant; what it has
+    # earned in it; and what it earned in the last block as it is
+    phase:    i32;
+    played:   i32;
+    earned:   i32;
+    baseline: i32;
+
+    net:   [942]i8;
+    trial: [942]i8;
+}
+
+rec League {
+    matches: i64;
+    members: [100]Member;
+}
+
+# what a bot did in a match
+rec Tally {
+    frags:    i32;
+    deaths:   i32;
+    suicides: i32;
+    shots:    i32;
+    turned:   i32;
+    uses:     i32;
+    distance: i32;
+}
+
+var seed: u64;
+
+fun random() u32 {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ (seed >> 7);
+    seed = seed ^ (seed << 17);
+    ret (seed >> 16)::u32;
+}
+
+fun below(n: i32) i32 {
+    ret (random() % n::u32)::i32;
+}
+
+fun number(s: str, fallback: i64) i64 {
+    val r: res[i64, parse.ParseError] = parse.parse_i64(s, 10);
+    if (sel r.ok) { ret r.ok; }
+    ret fallback;
+}
+
+fun millis() i64 {
+    val now: time.InstantClock = time.instant();
+    if (sel now.err) { ret 0; }
+    ret now.ok.sec * 1000 + now.ok.nsec / 1000000;
+}
+
+# ---------------------------------------------------------------- the league
+
+fun fresh(l: *League, first: *i8) {
+    l.matches = 0;
+    var i: i32 = 0;
+    for (i < MEMBERS) {
+        val m: *Member = ?l.members[i];
+        var blank: Member;
+        @m       = blank;
+        m.kind   = KIND_LEARNS;
+        m.style  = STYLE_OF[i % 20];
+        m.sigma  = 2 + ((i * 7) % 5) * 3;
+        m.share  = 4 + ((i * 3) % 4) * 3;
+        m.rating = 100000;
+        var k: i32 = 0;
+        for (k < NET) {
+            m.net[k] = first[k];
+            k        = k + 1;
+        }
+        i = i + 1;
+    }
+    # the two that never learn: the teacher, and noise
+    l.members[0].kind  = KIND_SCRIPT;
+    l.members[99].kind = KIND_STATIC;
+    var k: i32 = 0;
+    for (k < NET) {
+        l.members[99].net[k] = (below(256) - 128)::i8;
+        k                    = k + 1;
+    }
+}
+
+fun mutate(m: *Member) {
+    var k: i32 = 0;
+    for (k < NET) {
+        var w: i32 = m.net[k]::i32;
+        if (below(100) < m.share) {
+            # two throws, for small changes more often than large
+            w = w + (below(2 * m.sigma + 1) + below(2 * m.sigma + 1)) / 2 - m.sigma;
+            if (w > 127)  { w = 127; }
+            if (w < -128) { w = -128; }
+        }
+        m.trial[k] = w::i8;
+        k          = k + 1;
+    }
+}
+
+# what a match was worth to a bot of a style
+fun reward(style: i32, t: *Tally) i32 {
+    if (style == 0) { ret 10 * t.frags - 3 * t.deaths - 5 * t.suicides; }
+    if (style == 1) { ret 60 - 15 * t.deaths + 2 * t.frags; }
+    if (style == 2) { ret 8 * t.frags + t.shots / 40; }
+    if (style == 3) { ret 12 * t.frags - t.shots / 30; }
+    if (style == 4) { ret t.distance / 2000 - 2 * t.deaths; }
+    if (style == 5) { ret 10 * t.frags - t.distance / 1500; }
+    if (style == 6) { ret t.turned / 3000; }
+    if (style == 7) { ret 50 - t.shots / 5 - 5 * t.deaths; }
+    if (style == 8) { ret t.uses; }
+    ret 10 * t.suicides + 4 * t.deaths;
+}
+
+# the chance, in thousandths, that a bot outscores one rated `gap`
+# hundredths of a point above it (negative: below it)
+fun expected(gap: i32) i32 {
+    var d: i32 = gap / 100;
+    var up: bool = 1;
+    if (d < 0) {
+        d  = -d;
+        up = 0;
+    }
+    var at: i32 = d / 25;
+    if (at > 32) { at = 32; }
+    if (up) { ret 1000 - EXPECT[at]; }
+    ret EXPECT[at];
+}
+
+# a match is over: rate the four against each other, and let each learn
+fun settle(l: *League, picks: *i32, tally: *Tally) {
+    # ratings: every pair, by frags less suicides
+    var change: [4]i32;
+    var i:      i32 = 0;
+    for (i < 4) {
+        var j: i32 = 0;
+        for (j < 4) {
+            if (i != j) {
+                val mine:   i32 = tally[i].frags - tally[i].suicides;
+                val theirs: i32 = tally[j].frags - tally[j].suicides;
+                var result: i32 = 500;
+                if (mine > theirs) { result = 1000; }
+                if (mine < theirs) { result = 0; }
+                val e: i32 = expected(l.members[picks[j]].rating - l.members[picks[i]].rating);
+                # eight points a pair at stake, in hundredths
+                change[i] = change[i] + (result - e) * 8 / 10;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < 4) {
+        val m: *Member = ?l.members[picks[i]];
+        m.rating = m.rating + change[i];
+        m.games  = m.games + 1;
+        m.frags  = m.frags + tally[i].frags;
+        m.deaths = m.deaths + tally[i].deaths;
+
+        if (m.kind == KIND_LEARNS) {
+            m.earned = m.earned + reward(m.style, ?tally[i]);
+            m.played = m.played + 1;
+            if (m.played >= BLOCK) {
+                if (m.phase == 0) {
+                    # now the same number of games as a mutant
+                    m.baseline = m.earned;
+                    mutate(m);
+                    m.phase = 1;
+                }
+                or {
+                    if (m.earned > m.baseline) {
+                        m.net        = m.trial;
+                        m.generation = m.generation + 1;
+                    }
+                    m.phase = 0;
+                }
+                m.earned = 0;
+                m.played = 0;
+            }
+        }
+        i = i + 1;
+    }
+    l.matches = l.matches + 1;
+}
+
+# play one match between four members on a map; fill what each did, and,
+# for the replay, the seed each played with and the net it played by
+fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, seeds: *u32, nets: *i8) bool {
+    if (!game.deathmatch_game(s, 4, 0, defs.SK_MEDIUM, map, 1, 1)) { ret 0; }
+    var i: i32 = 0;
+    for (i < 4) {
+        val m: *Member = ?l.members[picks[i]];
+        seeds[i] = random();
+        var used: *i8 = ?m.net[0];
+        if (m.phase == 1 && m.kind == KIND_LEARNS) { used = ?m.trial[0]; }
+        var k: i32 = 0;
+        for (k < NET) {
+            nets[i * NET + k] = used[k];
+            k                 = k + 1;
+        }
+        if (m.kind == KIND_SCRIPT) {
+            game.set_bot(s, i, bot.KIND_SCRIPT, nil, seeds[i]);
+        }
+        or {
+            game.set_bot(s, i, bot.KIND_NET, used, seeds[i]);
+        }
+        var blank: Tally;
+        tally[i] = blank;
+        i        = i + 1;
+    }
+
+    var cmds: [4]defs.Ticcmd;
+    var lastx: [4]i32;
+    var lasty: [4]i32;
+    var tic:   i32 = 0;
+    for (tic < MATCH && !s.completed && !s.broken) {
+        game.ticker_cmds(s, ?cmds[0]);
+        # how far each walked, in map units, a tic at a time; a respawn's
+        # jump across the map is not walking
+        i = 0;
+        for (i < 4) {
+            val mo: *defs.Mobj = s.g.players[i].mo;
+            if (mo != nil) {
+                val x: i32 = mo.x >> 16;
+                val y: i32 = mo.y >> 16;
+                var dx: i32 = x - lastx[i];
+                var dy: i32 = y - lasty[i];
+                if (dx < 0) { dx = -dx; }
+                if (dy < 0) { dy = -dy; }
+                if (tic > 0 && dx + dy < 64) { tally[i].distance = tally[i].distance + dx + dy; }
+                lastx[i] = x;
+                lasty[i] = y;
+            }
+            i = i + 1;
+        }
+        tic = tic + 1;
+    }
+
+    i = 0;
+    for (i < 4) {
+        val p: *defs.Player = ?s.g.players[i];
+        tally[i].suicides = p.frags[i];
+        tally[i].deaths   = p.frags[i];
+        var k: i32 = 0;
+        for (k < 4) {
+            if (k != i) {
+                tally[i].frags  = tally[i].frags + p.frags[k];
+                tally[i].deaths = tally[i].deaths + s.g.players[k].frags[i];
+            }
+            k = k + 1;
+        }
+        tally[i].shots  = s.bots[i].shots;
+        tally[i].turned = s.bots[i].turned;
+        tally[i].uses   = s.bots[i].uses;
+        i               = i + 1;
+    }
+    ret !s.broken;
+}
+
+# ------------------------------------------------------------------ the files
+
+fun put32(p: *u8, at: i32, v: i32) i32 {
+    val u: u32 = v:~u32;
+    p[at]     = u::u8;
+    p[at + 1] = (u >> 8)::u8;
+    p[at + 2] = (u >> 16)::u8;
+    p[at + 3] = (u >> 24)::u8;
+    ret at + 4;
+}
+
+fun get32(p: *u8, at: i32) i32 {
+    ret (p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24)):~i32;
+}
+
+# a member in the file: twelve numbers, then its net and its trial
+val MEMBER_BYTES: i32 = 12 * 4 + 942 * 2;
+val FILE_BYTES:   i32 = 16 + 100 * (12 * 4 + 942 * 2);
+
+fun join(buf: *u8, at: i32, text: str) i32 {
+    var k: i32 = 0;
+    for (text[k] != 0) {
+        buf[at + k] = text[k];
+        k           = k + 1;
+    }
+    buf[at + k] = 0;
+    ret at + k;
+}
+
+fun join_number(buf: *u8, at: i32, value: i64) i32 {
+    var digits: [24]u8;
+    var n:      i32 = 0;
+    var v:      i64 = value;
+    var end:    i32 = at;
+    if (v < 0) {
+        buf[end] = '-';
+        end      = end + 1;
+        v        = -v;
+    }
+    for {
+        digits[n] = ('0' + (v % 10)::i32)::u8;
+        n         = n + 1;
+        v         = v / 10;
+        if (v == 0) { brk; }
+    }
+    for (n > 0) {
+        n        = n - 1;
+        buf[end] = digits[n];
+        end      = end + 1;
+    }
+    buf[end] = 0;
+    ret end;
+}
+
+# write a file whole: under another name first, then renamed over the old,
+# so that a reader never sees half of one
+fun replace(dir: str, name: str, data: *u8, len: i32) bool {
+    var path: [512]u8;
+    var temp: [512]u8;
+    var at:   i32 = join(?path[0], 0, dir);
+    at = join(?path[0], at, "/");
+    at = join(?path[0], at, name);
+    at = join(?temp[0], 0, ?path[0]);
+    at = join(?temp[0], at, ".new");
+    val wrote: err[fs.FsError] = fs.write_bytes(?temp[0], data, len::usize, 0o644);
+    if (sel wrote.err) { ret 0; }
+    val moved: err[io_error.Error] = fs.rename(?temp[0], ?path[0]);
+    if (sel moved.err) { ret 0; }
+    ret 1;
+}
+
+fun save(l: *League, dir: str, buf: *u8) bool {
+    buf[0] = 'M';
+    buf[1] = 'D';
+    buf[2] = 'L';
+    buf[3] = '1';
+    var at: i32 = put32(buf, 4, MEMBERS);
+    at = put32(buf, at, (l.matches & 0xffffffff)::i32);
+    at = put32(buf, at, (l.matches >> 32)::i32);
+    var i: i32 = 0;
+    for (i < MEMBERS) {
+        val m: *Member = ?l.members[i];
+        at = put32(buf, at, m.kind);
+        at = put32(buf, at, m.style);
+        at = put32(buf, at, m.sigma);
+        at = put32(buf, at, m.share);
+        at = put32(buf, at, m.rating);
+        at = put32(buf, at, m.games);
+        at = put32(buf, at, m.frags);
+        at = put32(buf, at, m.deaths);
+        at = put32(buf, at, m.generation);
+        at = put32(buf, at, m.phase * 256 + m.played);
+        at = put32(buf, at, m.earned);
+        at = put32(buf, at, m.baseline);
+        var k: i32 = 0;
+        for (k < NET) {
+            buf[at + k]       = m.net[k]:~u8;
+            buf[at + NET + k] = m.trial[k]:~u8;
+            k                 = k + 1;
+        }
+        at = at + 2 * NET;
+        i  = i + 1;
+    }
+    ret replace(dir, "league.bin", buf, at);
+}
+
+fun load(l: *League, a: *allocator.Allocator, dir: str) bool {
+    var path: [512]u8;
+    var at:   i32 = join(?path[0], 0, dir);
+    at = join(?path[0], at, "/league.bin");
+    val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    if (sel bytes.err) { ret 0; }
+    val p: *u8 = bytes.ok.data;
+    if (bytes.ok.len != FILE_BYTES::usize || p[0] != 'M' || p[1] != 'D' || p[2] != 'L' || p[3] != '1' || get32(p, 4) != MEMBERS) { ret 0; }
+    l.matches = (get32(p, 8):~u32)::i64 | ((get32(p, 12):~u32)::i64 << 32);
+    at = 16;
+    var i: i32 = 0;
+    for (i < MEMBERS) {
+        val m: *Member = ?l.members[i];
+        m.kind       = get32(p, at);
+        m.style      = get32(p, at + 4) % STYLES;
+        m.sigma      = get32(p, at + 8);
+        m.share      = get32(p, at + 12);
+        m.rating     = get32(p, at + 16);
+        m.games      = get32(p, at + 20);
+        m.frags      = get32(p, at + 24);
+        m.deaths     = get32(p, at + 28);
+        m.generation = get32(p, at + 32);
+        m.phase      = (get32(p, at + 36) / 256) & 1;
+        m.played     = get32(p, at + 36) % 256;
+        m.earned     = get32(p, at + 40);
+        m.baseline   = get32(p, at + 44);
+        at = at + 48;
+        var k: i32 = 0;
+        for (k < NET) {
+            m.net[k]   = p[at + k]:~i8;
+            m.trial[k] = p[at + NET + k]:~i8;
+            k          = k + 1;
+        }
+        at = at + 2 * NET;
+        i  = i + 1;
+    }
+    ret 1;
+}
+
+# the match just played, for a game to play again: 16 bytes (magic, the
+# simulation's version, the map, the tics, the match's number), then for
+# each of the four its kind, seed, frags, deaths, rating, name (24 bytes) and
+# net: 986 bytes each
+fun watchable(l: *League, dir: str, buf: *u8, picks: *i32, tally: *Tally, map: i32, seeds: *u32, nets: *i8) bool {
+    buf[0] = 'M';
+    buf[1] = 'D';
+    buf[2] = 'W';
+    buf[3] = '1';
+    buf[4] = 1;
+    buf[5] = map::u8;
+    buf[6] = 0;
+    buf[7] = 0;
+    var at: i32 = put32(buf, 8, MATCH);
+    at = put32(buf, at, (l.matches & 0x7fffffff)::i32);
+    var i: i32 = 0;
+    for (i < 4) {
+        val m: *Member = ?l.members[picks[i]];
+        var kind: i32 = bot.KIND_NET;
+        if (m.kind == KIND_SCRIPT) { kind = bot.KIND_SCRIPT; }
+        at = put32(buf, at, kind);
+        at = put32(buf, at, seeds[i]:~i32);
+        at = put32(buf, at, tally[i].frags);
+        at = put32(buf, at, tally[i].deaths);
+        at = put32(buf, at, m.rating / 100);
+        var k: i32 = 0;
+        for (k < 24) {
+            buf[at + k] = 0;
+            k           = k + 1;
+        }
+        name_of(picks[i], ?buf[at]);
+        at = at + 24;
+        k  = 0;
+        for (k < NET) {
+            buf[at + k] = nets[i * NET + k]:~u8;
+            k           = k + 1;
+        }
+        at = at + NET;
+        i  = i + 1;
+    }
+    ret replace(dir, "watch.bin", buf, at);
+}
+
+fun name_of(i: i32, out: *u8) {
+    lf.name_of(i, out);
+}
+
+# the standings, best first, and the match just played
+fun board(l: *League, dir: str, buf: *u8, picks: *i32, tally: *Tally, map: i32, unix: i64) bool {
+    var order: [100]i32;
+    var i:     i32 = 0;
+    for (i < MEMBERS) {
+        order[i] = i;
+        i        = i + 1;
+    }
+    i = 1;
+    for (i < MEMBERS) {
+        val who: i32 = order[i];
+        var j:   i32 = i;
+        for (j > 0 && l.members[order[j - 1]].rating < l.members[who].rating) {
+            order[j] = order[j - 1];
+            j        = j - 1;
+        }
+        order[j] = who;
+        i        = i + 1;
+    }
+
+    var name: [32]u8;
+    var at:   i32 = join(buf, 0, "{\"matches\":");
+    at = join_number(buf, at, l.matches);
+    at = join(buf, at, ",\"updated\":");
+    at = join_number(buf, at, unix);
+    at = join(buf, at, ",\"last\":{\"map\":\"E1M");
+    at = join_number(buf, at, map::i64);
+    at = join(buf, at, "\",\"players\":[");
+    i  = 0;
+    for (i < 4) {
+        name_of(picks[i], ?name[0]);
+        if (i > 0) { at = join(buf, at, ","); }
+        at = join(buf, at, "{\"name\":\"");
+        at = join(buf, at, ?name[0]);
+        at = join(buf, at, "\",\"frags\":");
+        at = join_number(buf, at, tally[i].frags::i64);
+        at = join(buf, at, ",\"deaths\":");
+        at = join_number(buf, at, tally[i].deaths::i64);
+        at = join(buf, at, "}");
+        i  = i + 1;
+    }
+    at = join(buf, at, "]},\"bots\":[");
+    i  = 0;
+    for (i < MEMBERS) {
+        val m: *Member = ?l.members[order[i]];
+        name_of(order[i], ?name[0]);
+        if (i > 0) { at = join(buf, at, ","); }
+        at = join(buf, at, "{\"name\":\"");
+        at = join(buf, at, ?name[0]);
+        at = join(buf, at, "\",\"style\":\"");
+        if (m.kind == KIND_SCRIPT) {
+            at = join(buf, at, "Hand-written");
+        }
+        or (m.kind == KIND_STATIC) {
+            at = join(buf, at, "Noise");
+        }
+        or {
+            at = join(buf, at, STYLE_NAMES[m.style]);
+        }
+        at = join(buf, at, "\",\"rating\":");
+        at = join_number(buf, at, (m.rating / 100)::i64);
+        at = join(buf, at, ",\"games\":");
+        at = join_number(buf, at, m.games::i64);
+        at = join(buf, at, ",\"frags\":");
+        at = join_number(buf, at, m.frags::i64);
+        at = join(buf, at, ",\"deaths\":");
+        at = join_number(buf, at, m.deaths::i64);
+        at = join(buf, at, ",\"generation\":");
+        at = join_number(buf, at, m.generation::i64);
+        at = join(buf, at, "}");
+        i  = i + 1;
+    }
+    at = join(buf, at, "]}\n");
+    ret replace(dir, "board.json", buf, at);
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (argc < 4) {
+        print.eprintln("usage: arena <wad> <first net> <directory> [<matches>]");
+        ret 1;
+    }
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret 2; }
+
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[1]);
+    if (sel loaded.err) {
+        print.eprintln("arena: the WAD could not be read");
+        ret 2;
+    }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) {
+        print.eprintln("arena: the WAD's textures could not be read");
+        ret 2;
+    }
+    var d: rdata.Data = graphics.ok;
+
+    val first: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, argv[2]);
+    if (sel first.err) {
+        print.eprintln("arena: the first net could not be read");
+        ret 2;
+    }
+    if (first.ok.len != NET::usize) {
+        print.eprintln("arena: the first net should be 942 bytes");
+        ret 2;
+    }
+    val dir:   str = argv[3];
+    var limit: i64 = 0;
+    if (argc >= 5) { limit = number(argv[4], 0); }
+
+    # the share of the processor to use, as a percentage
+    var duty:    i64 = 5;
+    var dutybuf: [16]u8;
+    val dutyenv: res[opt[usize], env.EnvError] = env.get("ARENA_DUTY", ?dutybuf[0], 16);
+    if (sel dutyenv.ok) {
+        if (sel dutyenv.ok.some) { duty = number(?dutybuf[0], 5); }
+    }
+    if (duty < 1)   { duty = 1; }
+    if (duty > 100) { duty = 100; }
+
+    # ARENA_SEED makes a run repeatable, and ARENA_TRACE names each match
+    # before it is played: for finding a match that goes wrong
+    seed = rand.u64() | 1;
+    var seedbuf: [32]u8;
+    val seedenv: res[opt[usize], env.EnvError] = env.get("ARENA_SEED", ?seedbuf[0], 32);
+    if (sel seedenv.ok) {
+        if (sel seedenv.ok.some) { seed = number(?seedbuf[0], 1)::u64 | 1; }
+    }
+    var tracebuf: [8]u8;
+    var trace:    bool = 0;
+    val traceenv: res[opt[usize], env.EnvError] = env.get("ARENA_TRACE", ?tracebuf[0], 8);
+    if (sel traceenv.ok) {
+        if (sel traceenv.ok.some) { trace = 1; }
+    }
+
+    val lg: res[*League, allocator.Error] = allocator.zallocate[League](?a, 1);
+    if (sel lg.err) { ret 2; }
+    val l: *League = lg.ok;
+    if (load(l, ?a, dir)) {
+        print.printlnf("arena: the league goes on from match {}", l.matches);
+    }
+    or {
+        fresh(l, first.ok.data:~*i8);
+        print.println("arena: a new league of 100");
+    }
+
+    val sg: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+    if (sel sg.err) { ret 2; }
+    val s: *game.Session = sg.ok;
+    game.init(s, ?a, ?w, ?d);
+
+    val fb: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, (FILE_BYTES + 64)::usize);
+    val jb: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, 65536);
+    if (sel fb.err) { ret 2; }
+    if (sel jb.err) { ret 2; }
+    val wb: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, 4096);
+    val nb: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, 4096);
+    if (sel wb.err) { ret 2; }
+    if (sel nb.err) { ret 2; }
+
+    print.printlnf("arena: playing within {}% of a processor", duty);
+    var saved:  i64 = millis();
+    var shown:  bool = 0;
+    var played: i64 = 0;
+    for (limit == 0 || played < limit) {
+        val began: i64 = millis();
+
+        # four different members, and a map
+        var picks: [4]i32;
+        var i:     i32 = 0;
+        for (i < 4) {
+            picks[i] = below(MEMBERS);
+            var again: bool = 0;
+            var k:     i32  = 0;
+            for (k < i) {
+                if (picks[k] == picks[i]) { again = 1; }
+                k = k + 1;
+            }
+            if (!again) { i = i + 1; }
+        }
+        val map: i32 = MAPS[below(7)];
+
+        if (trace) { print.printlnf("match {} map {} bots {} {} {} {} seed {}", played, map, picks[0], picks[1], picks[2], picks[3], seed); }
+        var tally: [4]Tally;
+        var seeds: [4]u32;
+        if (!play(s, l, ?picks[0], map, ?tally[0], ?seeds[0], nb.ok:~*i8)) {
+            print.eprintln("arena: a map would not load");
+            ret 3;
+        }
+        settle(l, ?picks[0], ?tally[0]);
+        played = played + 1;
+        # worth watching: a match with some fighting in it, or the first
+        # there is
+        if (tally[0].frags + tally[1].frags + tally[2].frags + tally[3].frags >= 4 || !shown) {
+            shown = watchable(l, dir, wb.ok, ?picks[0], ?tally[0], map, ?seeds[0], nb.ok:~*i8);
+        }
+        if (trace) { print.printlnf("  took {} ms, frags {} {} {} {}", millis() - began, tally[0].frags, tally[1].frags, tally[2].frags, tally[3].frags); }
+
+        # the standings and the league itself, once a minute and at the end
+        val now: i64 = millis();
+        if (now - saved >= 60000 || (limit != 0 && played == limit)) {
+            var unix: i64 = 0;
+            val wall: time.Clock = time.now();
+            if (sel wall.ok) { unix = wall.ok.sec; }
+            if (!save(l, dir, fb.ok) || !board(l, dir, jb.ok, ?picks[0], ?tally[0], map, unix)) {
+                print.eprintln("arena: the league could not be written");
+            }
+            print.printlnf("arena: {} matches in all, the last took {} ms", l.matches, now - began);
+            saved = now;
+        }
+
+        # rest, to stay within the share: a match that took t earns
+        # t * (100 - duty) / duty of sleep
+        if (duty < 100) {
+            val rest: i64 = (millis() - began) * (100 - duty) / duty;
+            if (rest > 0) { os.sleep(rest * 1000000); }
+        }
+    }
+    ret 0;
+}

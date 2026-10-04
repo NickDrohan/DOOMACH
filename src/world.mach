@@ -517,6 +517,7 @@ pub fun player_reborn(g: *Game, player: i32) {
     val killcount:   i32     = p.killcount;
     val itemcount:   i32     = p.itemcount;
     val secretcount: i32     = p.secretcount;
+    val frags:       [4]i32  = p.frags;
 
     var blank: Player;
     @p = blank;
@@ -524,6 +525,7 @@ pub fun player_reborn(g: *Game, player: i32) {
     p.killcount   = killcount;
     p.itemcount   = itemcount;
     p.secretcount = secretcount;
+    p.frags       = frags;
 
     # don't do anything immediately
     p.usedown                     = 1;
@@ -577,6 +579,15 @@ pub fun spawn_player(g: *Game, mthing: *level.Thing) {
 
     # setup gun psprite
     setup_psprites(g, p);
+
+    # give all cards in death match mode
+    if (g.deathmatch != 0) {
+        var c: i32 = 0;
+        for (c < defs.NUMCARDS) {
+            p.cards[c] = 1;
+            c          = c + 1;
+        }
+    }
 }
 
 # P_SpawnMapThing
@@ -584,7 +595,13 @@ pub fun spawn_map_thing(g: *Game, mthing: *level.Thing) {
     val kind: i32 = mthing.kind::i32;
 
     # count deathmatch start positions
-    if (kind == 11) { ret; }
+    if (kind == 11) {
+        if (g.numdmstarts < 10) {
+            g.deathmatchstarts[g.numdmstarts] = @mthing;
+            g.numdmstarts                     = g.numdmstarts + 1;
+        }
+        ret;
+    }
 
     # check for players specially
     if (kind <= 4) {
@@ -1341,6 +1358,16 @@ fun touch_special_thing(g: *Game, special: *Mobj, toucher: *Mobj) {
 }
 
 # P_KillMobj
+# which player a player record is
+pub fun player_number(g: *Game, p: *Player) i32 {
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (p == ?g.players[i]) { ret i; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 fun kill_mobj(g: *Game, source: *Mobj, target: *Mobj) {
     target.flags = target.flags & ~(defs.MF_SHOOTABLE | defs.MF_FLOAT | defs.MF_SKULLFLY);
 
@@ -1352,6 +1379,10 @@ fun kill_mobj(g: *Game, source: *Mobj, target: *Mobj) {
     if (source != nil && source.player != nil) {
         # count for intermission
         if ((target.flags & defs.MF_COUNTKILL) != 0) { source.player.killcount = source.player.killcount + 1; }
+        if (target.player != nil) {
+            val victim: i32 = player_number(g, target.player);
+            source.player.frags[victim] = source.player.frags[victim] + 1;
+        }
     }
     or (!g.netgame && (target.flags & defs.MF_COUNTKILL) != 0) {
         # count all monster deaths, even those caused by other monsters
@@ -1359,6 +1390,11 @@ fun kill_mobj(g: *Game, source: *Mobj, target: *Mobj) {
     }
 
     if (target.player != nil) {
+        # count environment kills against you
+        if (source == nil) {
+            val self: i32 = player_number(g, target.player);
+            target.player.frags[self] = target.player.frags[self] + 1;
+        }
         target.flags              = target.flags & ~defs.MF_SOLID;
         target.player.playerstate = defs.PST_DEAD;
         drop_weapon(g, target.player);

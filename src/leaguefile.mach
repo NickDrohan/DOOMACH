@@ -1,0 +1,59 @@
+# leaguefile: what the arena and the relay both know about the league
+#
+# The arena writes league.bin and the relay reads it, to seat the league's
+# bots in people's games. This is the part of its layout the relay needs,
+# and the bots' names, which are not in the file: a bot is named by its
+# place in the league.
+
+use std.types.bool.bool;
+use std.types.string.str;
+
+pub val MEMBERS: i32 = 100;
+pub val NET:     i32 = 942;
+
+# the file: sixteen bytes, then each member as twelve numbers, its net, and
+# the mutant it is trying
+pub val HEAD:         i32 = 16;
+pub val MEMBER_BYTES: i32 = 12 * 4 + 942 * 2;
+pub val FILE_BYTES:   i32 = 16 + 100 * (12 * 4 + 942 * 2);
+# within a member: its kind, and where its net begins
+pub val AT_KIND: i32 = 0;
+pub val AT_NET:  i32 = 48;
+
+# a member's kind: one that learns, the hand-written bot, or noise
+pub val KIND_LEARNS: i32 = 0;
+pub val KIND_SCRIPT: i32 = 1;
+pub val KIND_STATIC: i32 = 2;
+
+val FIRST: [10]str = [10]str{"Rusty", "Angry", "Sleepy", "Sgt.", "Dizzy", "Lucky", "Grim", "Soggy", "Turbo", "Wobbly"};
+val LAST:  [10]str = [10]str{"Imp", "Marine", "Barrel", "Baron", "Zombie", "Demon", "Pinky", "Spectre", "Sarge", "Caco"};
+
+fun join(buf: *u8, at: i32, text: str) i32 {
+    var k: i32 = 0;
+    for (text[k] != 0) {
+        buf[at + k] = text[k];
+        k           = k + 1;
+    }
+    buf[at + k] = 0;
+    ret at + k;
+}
+
+# a member's name, by its place: at most 23 characters and a zero
+pub fun name_of(i: i32, out: *u8) {
+    if (i == 0) {
+        join(out, 0, "The Teacher");
+        ret;
+    }
+    if (i == 99) {
+        join(out, 0, "Static");
+        ret;
+    }
+    var at: i32 = join(out, 0, FIRST[(i / 10) % 10]);
+    at = join(out, at, " ");
+    join(out, at, LAST[i % 10]);
+}
+
+# whether a file's bytes are a league
+pub fun valid(p: *u8, len: i32) bool {
+    ret len == FILE_BYTES && p[0] == 'M' && p[1] == 'D' && p[2] == 'L' && p[3] == '1';
+}

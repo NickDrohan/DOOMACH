@@ -10,7 +10,7 @@ the checksums and the desync alarm work exactly as they do directly.
 `iad`, deployed 2026-10-02. The same machine serves the download page at
 <https://mach-doom-relay.fly.dev/> with [hedge](https://github.com/briar-systems/hedge).
 
-The game's menu uses this relay by default ("Co-op online"). From the command line:
+The game's menu uses this relay by default ("Play online"). From the command line:
 
 ```
 doom host <wad> [<players> [<map> [<skill>]]] --relay mach-doom-relay.fly.dev   # shows the code
@@ -25,6 +25,12 @@ or set `DOOM_RELAY=mach-doom-relay.fly.dev` and leave out `--relay`.
   rooms: about 480 million codes, so guessing a live one is impractical. No 0, 1, I or O, and none
   of the digits that look like letters in the game's font; typed anyway, 2, 5, 6 and 8 count as
   Z, S, G and B. The first code read off a screen in testing was misread exactly that way.
+- **A public list, by choice.** A host may mark its room public. `LIST` then answers any game
+  with the rooms it could join now: public, not started, not full, and of the same build and
+  WAD, at most six, each with its code, seats, skill and map. Rooms are private unless the host
+  says otherwise. A list request must be as long as the longest answer (77 bytes), so the relay
+  never sends more than it was sent and cannot be used to flood a forged address; requests count
+  against the same per-address rate limit as creates and joins.
 - **Session tokens.** Each player is given a random 64-bit token in its welcome; every later
   datagram must carry it. A forged datagram from an address that does not hold the token is
   dropped, and a seat's address is only trusted once a token-bearing datagram has come from it,
@@ -52,13 +58,15 @@ Every datagram between a game and the relay starts with a 16-byte little-endian 
 | offset | field | |
 | --- | --- | --- |
 | 0 | magic | `MDR1` |
-| 4 | kind | 1 create, 2 join, 3 welcome, 4 refused, 5 status, 6 lobby, 7 start, 8 data, 9 leave, 10 gone |
+| 4 | kind | 1 create, 2 join, 3 welcome, 4 refused, 5 status, 6 lobby, 7 start, 8 data, 9 leave, 10 gone, 11 list, 12 rooms |
 | 5 | slot | the sender's seat (game → relay), or the original sender of data (relay → game) |
 | 6 | dest | for data, the seat it is for |
 | 7 | 0 | |
 | 8 | token | the sender's token (game → relay) or the receiver's (relay → game) |
 
-Bodies: **create** players, skill, map, version, WAD hash (8), nonce (4). **join** code (6),
+Bodies: **create** players, skill, map, version, WAD hash (8), nonce (4), flags (1: public; may
+be absent, meaning none). **list** version, WAD hash (8), zeros to 77 bytes in all. **rooms** a
+count, then per room code (6), players, joined, skill, map. **join** code (6),
 version, 0, WAD hash (8), nonce (4). **welcome** code (6), players, skill, map, joined.
 **refused** reason: 1 no room, 2 full, 3 started, 4 WAD mismatch, 5 old version, 6 busy.
 **lobby** players, joined. **start** players, skill, map. **data** the game's own datagram.

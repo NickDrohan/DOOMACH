@@ -1,4 +1,5 @@
-# hedge serving the download page beside the relay. Fly's proxy ends TLS and
+# hedge serving the pages beside the relay: the site, and the bot league's
+# standings from the persistent disk the arena writes them to. Fly's proxy ends TLS and
 # passes plain HTTP to port 8080.
 
 [server]
@@ -17,6 +18,16 @@ names = ["mach-doom-relay.fly.dev", "localhost"]
 kind = "static"
 root = "/srv/site"
 index = "index.html"
+
+[service.league]
+kind = "static"
+root = "/data"
+
+[[route]]
+name = "league"
+host = "site"
+path = "/league/**"
+service = "league"
 
 [[route]]
 name = "everything"

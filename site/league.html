@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doom in Mach: the bot league</title>
+<meta name="description" content="A hundred neural-network bots playing Doom deathmatches around the clock, each learning by its own lights.">
+<style>
+  :root {
+    --bg: #f6f3ee; --fg: #1d1a17; --muted: #5d564e; --rule: #ddd5ca; --panel: #ffffff;
+    --accent: #b3201a; --good: #1f7a3a; --bad: #b3201a; --bar: #e9e2d7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141110; --fg: #ede7df; --muted: #a39a90; --rule: #2e2925; --panel: #1d1917;
+      --accent: #d8362c; --good: #4fbf73; --bad: #e8675f; --bar: #2a2522;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 32px 16px 64px; }
+  a { color: var(--accent); }
+  h1 { font-size: 2rem; line-height: 1.15; margin: 0 0 6px; }
+  .lede { color: var(--muted); margin: 0 0 20px; max-width: 64ch; }
+  .now { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; margin: 0 0 20px; }
+  .now h2 { font-size: 0.8rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+  .players { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+  .players b { font-variant-numeric: tabular-nums; }
+  .meta { color: var(--muted); font-size: 0.9rem; margin-top: 8px; }
+  .scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--rule); }
+  th { font-size: 0.78rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+  th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3) { text-align: left; }
+  tr:last-child td { border-bottom: 0; }
+  td.rank { color: var(--muted); }
+  .style { font-size: 0.85rem; color: var(--muted); }
+  .rating { font-weight: 600; }
+  .fixed td:nth-child(2) { font-style: italic; }
+  .key { color: var(--muted); font-size: 0.9rem; margin-top: 18px; max-width: 70ch; }
+  .key b { color: var(--fg); font-weight: 600; }
+  #error { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="./">&larr; Doom in Mach</a></p>
+  <h1>The bot league</h1>
+  <p class="lede">A hundred bots, each a 942-byte neural network, playing two-minute deathmatches against each
+  other around the clock. They all began as the same network. Each learns by its own lights, so they have
+  not stayed the same.</p>
+
+  <p class="lede"><b>To watch a match:</b> in <a href="./">the game</a>, press Esc, choose <em>Play online</em>,
+  then <em>Watch the bot league</em>. The last match plays again on your machine at normal speed; keys 1 to 4
+  choose whose eyes you see through.</p>
+
+  <div class="now" id="now" hidden>
+    <h2>Last match <span id="lastmap"></span></h2>
+    <div class="players" id="players"></div>
+    <div class="meta" id="meta"></div>
+  </div>
+  <p id="error" hidden>The standings could not be loaded. The league may be starting up; this page tries again by itself.</p>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>#</th><th>Bot</th><th>Style</th><th>Rating</th><th>Games</th><th>Frags</th><th>Deaths</th><th>F/D</th><th>Gen</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="9" style="text-align:center;color:var(--muted)">Loading&hellip;</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="key">
+    <p><b>Rating</b> is the same for every bot: who outscored whom, match by match. <b>Gen</b> counts the mutations a
+    bot has kept. A bot plays six games as it is and six as a mutated copy of itself, and keeps the copy only if
+    it earned more of what that bot's <b>style</b> wants.</p>
+    <p>Fraggers, Berserkers and Snipers want frags, in different ways. Survivors want not to die. Tourists want to
+    run, Campers to stand still, Dervishes to spin, Doormen to press every wall, Pacifists never to fire, and
+    Lemmings to die. They get better at what they want, which is not always winning.
+    <i>The Teacher</i> is the hand-written bot they all first imitated, and <i>Static</i> is a network of noise;
+    neither learns.</p>
+  </div>
+</main>
+<script>
+  function cell(row, text, cls) {
+    var td = document.createElement("td");
+    td.textContent = text;
+    if (cls) td.className = cls;
+    row.appendChild(td);
+  }
+  function ago(seconds) {
+    if (seconds < 90) return "just now";
+    if (seconds < 5400) return Math.round(seconds / 60) + " minutes ago";
+    return Math.round(seconds / 3600) + " hours ago";
+  }
+  function show(board) {
+    document.getElementById("error").hidden = true;
+    var rows = document.getElementById("rows");
+    rows.textContent = "";
+    board.bots.forEach(function (b, i) {
+      var tr = document.createElement("tr");
+      if (b.style === "Hand-written" || b.style === "Noise") tr.className = "fixed";
+      cell(tr, i + 1, "rank");
+      cell(tr, b.name);
+      cell(tr, b.style, "style");
+      cell(tr, b.rating, "rating");
+      cell(tr, b.games);
+      cell(tr, b.frags);
+      cell(tr, b.deaths);
+      cell(tr, b.deaths ? (b.frags / b.deaths).toFixed(2) : (b.frags ? "∞" : "–"));
+      cell(tr, b.generation);
+      rows.appendChild(tr);
+    });
+    var players = document.getElementById("players");
+    players.textContent = "";
+    board.last.players.slice().sort(function (a, b) { return b.frags - a.frags; }).forEach(function (p) {
+      var span = document.createElement("span");
+      var b = document.createElement("b");
+      b.textContent = p.frags;
+      span.appendChild(document.createTextNode(p.name + " "));
+      span.appendChild(b);
+      players.appendChild(span);
+    });
+    document.getElementById("lastmap").textContent = "on " + board.last.map;
+    document.getElementById("meta").textContent =
+      board.matches.toLocaleString() + " matches played · standings updated " +
+      ago(Date.now() / 1000 - board.updated);
+    document.getElementById("now").hidden = false;
+  }
+  function load() {
+    fetch("league/board.json", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(show)
+      .catch(function () { document.getElementById("error").hidden = false; });
+  }
+  load();
+  setInterval(load, 30000);
+</script>
+</body>
+</html>

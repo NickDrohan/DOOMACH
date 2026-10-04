@@ -41,6 +41,11 @@ primary_region = "iad"
     timeout = "5s"
     grace_period = "10s"
 
+# the bot league's state, kept across restarts and deploys
+[[mounts]]
+  source = "league"
+  destination = "/data"
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "256mb"

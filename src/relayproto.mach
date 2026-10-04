@@ -29,6 +29,10 @@ pub val CREATE: u8 = 1;
 pub val JOIN:   u8 = 2;
 pub val STATUS: u8 = 5;
 pub val LEAVE:  u8 = 9;
+pub val LIST:   u8 = 11;
+pub val WATCH:  u8 = 13;
+pub val FILL:   u8 = 15;
+pub val BOTASK: u8 = 16;
 
 # relay to game
 pub val WELCOME: u8 = 3;
@@ -36,6 +40,41 @@ pub val REFUSED: u8 = 4;
 pub val LOBBY:   u8 = 6;
 pub val START:   u8 = 7;
 pub val GONE:    u8 = 10;
+pub val ROOMS:   u8 = 12;
+pub val MATCH:   u8 = 14;
+pub val BOTIS:   u8 = 17;
+
+# a bot seated in a room, as the relay tells each player: the seat, three
+# zeros, its kind (4), its seed (4), its name (24) and its net (942). Every
+# player is told the same, so every machine plays the same bot. A request
+# must be as long as the answer.
+pub val BOTBODY: i32 = 4 + 4 + 4 + 24 + 942;
+pub val BOTSIZE: i32 = 16 + 4 + 4 + 4 + 24 + 942;
+
+# a create may end with a byte of flags; this one puts the room on the list
+pub val FLAG_PUBLIC: u8 = 1;
+# a deathmatch rather than co-op
+pub val FLAG_DEATHMATCH: u8 = 2;
+# bots take the empty seats after a quarter of a minute, not the usual wait
+pub val FLAG_QUICK: u8 = 4;
+
+# the public list: at most this many rooms in an answer, each this many
+# bytes (code, players, joined, skill, map, and 1 for a deathmatch). A request must be as long as
+# the longest answer, so that the relay never sends more than it was sent
+# and cannot be made to flood an address someone forged.
+pub val LISTMAX:   i32 = 6;
+pub val LISTENTRY: i32 = 11;
+pub val LISTSIZE:  i32 = 16 + 1 + 6 * 11;
+
+# a league match to watch: the bots' nets, seeds and names, as the arena
+# leaves them in a file of WATCHFILE bytes (see arena.mach). The relay hands
+# it out in pieces of WATCHPIECE bytes: an answer is a header, the file's
+# length (2), the piece's number (1), a zero, the match's number (4), then
+# the piece. As with the list, a request must be as long as the longest
+# answer.
+pub val WATCHFILE:  i32 = 16 + 4 * 986;
+pub val WATCHPIECE: i32 = 1000;
+pub val WATCHSIZE:  i32 = 16 + 8 + 1000;
 
 # both ways
 pub val DATA: u8 = 8;

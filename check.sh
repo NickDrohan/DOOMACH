@@ -188,15 +188,16 @@ frontwalk="5 key:a key:enter key:enter key:enter 30 shot key:esc 2 shot key:down
     fire 20 shot 60 shot map:8 10 exit 1 100 shot 2000 shot
     key:a key:down key:down key:down key:down key:down key:enter 2 shot
     key:N key:up key:up key:up key:up key:up key:enter 2 shot
-    key:down key:down key:down key:enter key:K key:Q key:7 2 shot"
+    key:down key:down key:down key:enter 2 shot key:down key:down key:enter 2 shot
+    key:back key:down key:enter key:K key:Q key:7 2 shot"
 mkdir -p "$work/front-debug" "$work/front-release"
 # shellcheck disable=SC2086
 gate "the scripted front-end walk runs (debug)" 0 "$debug" script "$wad" "$work/front-debug/s" $frontwalk
 # shellcheck disable=SC2086
 gate "the scripted front-end walk runs (release)" 0 "$release" script "$wad" "$work/front-release/s" $frontwalk
 front_is_pinned() { (cd "$1" && sha256sum -c --status "$here/fixtures/front.sha256"); }
-gate "the thirteen front-end screens match the committed hashes" 0 front_is_pinned "$work/front-debug"
-gate "release draws the same thirteen screens" 0 front_is_pinned "$work/front-release"
+gate "the fifteen front-end screens match the committed hashes" 0 front_is_pinned "$work/front-debug"
+gate "release draws the same fifteen screens" 0 front_is_pinned "$work/front-release"
 
 # Co-op. Two games in one process fed the same bot players' commands must
 # agree every tic, with a forced death and respawn at tic 100; debug and
@@ -210,6 +211,120 @@ for build in debug release; do
     same "two-player co-op on E1M1 ends where it is pinned ($build)" "$work/coop2.$build" "$here/fixtures/coop2.expected"
     same "four-player co-op on E1M3 ends where it is pinned ($build)" "$work/coop4.$build" "$here/fixtures/coop4.expected"
 done
+
+# Bots. A bot is a player the simulation plays itself, so it must decide the
+# same on every machine: `doom botmatch` runs a deathmatch between four of
+# the hand-written bots as two games in one process, compared every tic.
+# Debug and release must play the pinned matches: who fragged whom, and the
+# world at the end, on a small map and an open one.
+botmatches() { "$1" botmatch "$wad" 1 2100 2>/dev/null; "$1" botmatch "$wad" 8 2100 2>/dev/null; }
+botmatches "$debug" >"$work/botmatch.debug"
+botmatches "$release" >"$work/botmatch.release"
+same "four bots' deathmatches on E1M1 and E1M8 go as pinned (debug)" "$work/botmatch.debug" "$here/fixtures/botmatch.expected"
+same "and in release" "$work/botmatch.release" "$here/fixtures/botmatch.expected"
+bots_fight() { awk '/^bot/ { frags += $4 } END { exit !(frags >= 10) }' "$here/fixtures/botmatch.expected"; }
+gate "the pinned matches are fights: ten frags or more between them" 0 bots_fight
+
+# The net every bot begins as must fight: two of it against two of the
+# hand-written bot it imitates, on the open map, taking frags of its own.
+"$release" netmatch "$wad" 8 4200 "$here/fixtures/bot0.net" >"$work/netmatch.out" 2>/dev/null
+nets_fight() { awk '/^net/ { frags += $4 } END { exit !(frags >= 3) }' "$work/netmatch.out"; }
+gate "the first net takes frags off the hand-written bot" 0 nets_fight
+
+# The league. The arena, built by name as the relay is, plays forty matches
+# and leaves the league and its standings; started again, it goes on from
+# there rather than from the beginning.
+arena_exe="$here/out/windows-x86_64/release/bin/arena.exe"
+gate "the arena builds (release, Windows)" 0 "$mach" build "$here" --artifact arena --profile release --quiet
+gate "the arena builds (release, Linux, as Fly runs it)" 0 "$mach" build "$here" --artifact arena --target linux-x86_64 --profile release --quiet
+mkdir -p "$work/league"
+league_runs() { ARENA_DUTY=100 "$arena_exe" "$wad" "$here/fixtures/bot0.net" "$work/league" "$1" >"$work/arena.log" 2>&1; }
+gate "the arena plays forty matches" 0 league_runs 40
+if [[ -n "$python" ]]; then
+    board_ok() {
+        "$python" - "$work/league/board.json" "$1" <<'PY'
+import json, sys
+board = json.load(open(sys.argv[1]))
+bots = board["bots"]
+assert board["matches"] == int(sys.argv[2]), board["matches"]
+assert len(bots) == 100 and len({b["name"] for b in bots}) == 100
+assert all(bots[i]["rating"] >= bots[i + 1]["rating"] for i in range(99))
+assert sum(b["games"] for b in bots) == 4 * board["matches"]
+assert len(board["last"]["players"]) == 4
+PY
+    }
+    gate "its standings are a hundred named bots in rating order, every game counted" 0 board_ok 40
+    gate "started again, the league goes on from where it was" 0 league_runs 10
+    gate "  to fifty matches" 0 board_ok 50
+fi
+
+# Bots in a game with people. A room for three with two people in it starts,
+# when its host asks, with a bot from the league in the third seat: the
+# relay tells both machines the same bot, each plays it itself, and they must
+# end on the same world.
+if [[ -f "$work/league/league.bin" ]]; then
+    RELAY_LEAGUE_FILE="$(cygpath -m "$work/league/league.bin" 2>/dev/null || echo "$work/league/league.bin")" "$here/out/windows-x86_64/release/bin/relay.exe" 5147 >"$work/relay5.log" 2>&1 &
+    botrelay=$!
+    sleep 1.5
+    "$release" netplay "$wad" host 3 1 1400 0 "relay=127.0.0.1:5147" fill >"$work/withbot.1" 2>&1 &
+    withbotpid=$!
+    withbotcode=""
+    for k in $(seq 1 40); do
+        withbotcode="$(awk '/^room / {print $2}' "$work/withbot.1")"
+        [[ -n "$withbotcode" ]] && break
+        sleep 0.25
+    done
+    "$release" netplay "$wad" join "$withbotcode" 1400 0 "relay=127.0.0.1:5147" >"$work/withbot.2" 2>&1
+    wait "$withbotpid"
+    kill "$botrelay" 2>/dev/null
+    wait "$botrelay" 2>/dev/null
+    tail -1 "$work/withbot.1" >"$work/withbot.1.end"
+    tail -1 "$work/withbot.2" >"$work/withbot.2.end"
+    three_played() { grep -q "^end tic 1400 .* p3 health " "$1"; }
+    gate "two people and a league bot play 1400 tics" 0 three_played "$work/withbot.1.end"
+    same "and both machines end on the same world" "$work/withbot.1.end" "$work/withbot.2.end"
+fi
+
+# A deathmatch between people and a bot: hosted as one, listed as one, and
+# played in step by two machines with a league bot in the third seat.
+if [[ -f "$work/league/league.bin" ]]; then
+    RELAY_LEAGUE_FILE="$(cygpath -m "$work/league/league.bin" 2>/dev/null || echo "$work/league/league.bin")" "$here/out/windows-x86_64/release/bin/relay.exe" 5148 >"$work/relay6.log" 2>&1 &
+    dmrelay=$!
+    sleep 1.5
+    "$release" netplay "$wad" host 3 8 2100 0 "relay=127.0.0.1:5148" fill dm public >"$work/dm.1" 2>&1 &
+    dmpid=$!
+    dmcode=""
+    for k in $(seq 1 40); do
+        dmcode="$(awk '/^room / {print $2}' "$work/dm.1")"
+        [[ -n "$dmcode" ]] && break
+        sleep 0.25
+    done
+    "$release" rooms "$wad" 127.0.0.1:5148 >"$work/dm.rooms" 2>/dev/null
+    echo "$dmcode 1/3 deathmatch map E1M8" >"$work/dm.rooms.expected"
+    same "a deathmatch is listed as one" "$work/dm.rooms" "$work/dm.rooms.expected"
+    "$release" netplay "$wad" join "$dmcode" 2100 0 "relay=127.0.0.1:5148" >"$work/dm.2" 2>&1
+    wait "$dmpid"
+    kill "$dmrelay" 2>/dev/null
+    wait "$dmrelay" 2>/dev/null
+    tail -1 "$work/dm.1" >"$work/dm.1.end"
+    tail -1 "$work/dm.2" >"$work/dm.2.end"
+    dm_played() { grep -q "^end tic 2100 .* map E1M8 .* p3 health " "$1"; }
+    gate "two people and a league bot play a deathmatch for a minute" 0 dm_played "$work/dm.1.end"
+    same "and both machines end on the same world" "$work/dm.1.end" "$work/dm.2.end"
+fi
+
+# Watching the league. The arena leaves its last match as a recipe: the map
+# and each bot's net and seed. A game fetches it through the relay and plays
+# it again, and must arrive at the frags and deaths the arena recorded: the
+# same game, computed twice.
+if [[ -n "$python" ]]; then
+    RELAY_WATCH_FILE="$(cygpath -m "$work/league/watch.bin" 2>/dev/null || echo "$work/league/watch.bin")" "$here/out/windows-x86_64/release/bin/relay.exe" 5146 >"$work/relay4.log" 2>&1 &
+    watchpid=$!
+    sleep 1
+    gate "a league match fetched through the relay replays to the result the arena recorded" 0 "$release" watch "$wad" 127.0.0.1:5146
+    kill "$watchpid" 2>/dev/null
+    wait "$watchpid" 2>/dev/null
+fi
 
 # The network. A host and a joiner as two processes on this machine's
 # loopback, in lockstep over UDP, must end exactly where the one-process run
@@ -338,6 +453,27 @@ on_e1m2() { grep -q "^end tic 1400 .* map E1M2 " "$1"; }
 gate "across a level, with Space pressed on one machine: the host reaches E1M2 in step" 0 on_e1m2 "$work/levels.1.end"
 gate "and so does the joiner" 0 on_e1m2 "$work/levels.2.end"
 same "both on the same world" "$work/levels.1.end" "$work/levels.2.end"
+
+# The public list: a room hosted as public shows on the relay's list with its
+# seats, skill and map, a private one does not, and a game joins by the code
+# the list gives and plays in step; once started, the room is off the list.
+"$release" netplay "$wad" host 2 1 700 0 "relay=127.0.0.1:5143" public >"$work/listed.1" 2>&1 &
+listedpid=$!
+"$release" netplay "$wad" host 3 2 700 0 "relay=127.0.0.1:5143" >"$work/unlisted.1" 2>&1 &
+unlistedpid=$!
+sleep 1.5
+"$release" rooms "$wad" 127.0.0.1:5143 >"$work/rooms.before" 2>/dev/null
+listedcode="$(awk '/^room / {print $2}' "$work/listed.1")"
+echo "$listedcode 1/2 skill 3 map E1M1" >"$work/rooms.expected"
+same "the list shows the public room, and only it" "$work/rooms.before" "$work/rooms.expected"
+"$release" netplay "$wad" join "$(awk '{print $1}' "$work/rooms.before")" 700 0 "relay=127.0.0.1:5143" >"$work/listed.2" 2>&1
+wait "$listedpid"
+tail -1 "$work/listed.2" >"$work/listed.2.end"
+same "a game joined from the list ends as one-process co-op does" "$work/listed.2.end" "$work/coop700"
+list_is_empty() { "$release" rooms "$wad" 127.0.0.1:5143 >"$work/rooms.after" 2>/dev/null && [[ ! -s "$work/rooms.after" ]]; }
+gate "a started room is off the list" 0 list_is_empty
+kill "$unlistedpid" 2>/dev/null
+wait "$unlistedpid" 2>/dev/null
 
 # Turned away, quickly, with the reason: a code no room has, and a WAD that
 # is not the host's.

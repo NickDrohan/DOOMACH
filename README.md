@@ -4,7 +4,7 @@ A port of id Software's Doom engine to Mach, built so that the port asks hard qu
 language rather than just transliterating C.
 
 **To just play it:** download it from <https://mach-doom-relay.fly.dev/>, unzip, double-click
-`doom.exe`. Co-op with friends is on the main menu under "Co-op online".
+`doom.exe`. Co-op and deathmatch with friends or bots are on the main menu under "Play online".
 
 ```bash
 scripts/bootstrap.sh                    # compiler 6.9.0, std, shareware WAD, id's source
@@ -26,6 +26,8 @@ $out host products/doom/data/DOOM1.WAD 2      # co-op: host a game for two playe
 $out join products/doom/data/DOOM1.WAD 192.168.1.20   # ...and join it from another machine
 $out host products/doom/data/DOOM1.WAD 2 --relay mach-doom-relay.fly.dev   # across the internet: shows a room code
 $out join products/doom/data/DOOM1.WAD KQ7M2T --relay mach-doom-relay.fly.dev  # ...which the friend joins with
+$out botmatch products/doom/data/DOOM1.WAD 1 2100   # four bots' deathmatch on E1M1, a minute of it
+$out navdump products/doom/data/DOOM1.WAD 5 nav.ppm # the bots' walk grid of a map, as a picture
 bash products/doom/check.sh             # acceptance gates
 bash products/doom/package.sh           # the download: out/package/doom-in-mach.zip
 bash products/doom/deploy.sh            # the relay, the page and the download, to Fly.io
@@ -125,7 +127,7 @@ runs, and the rest takes ears. The path from the real keyboard to those held key
 
 Two to four players on the first episode, over a LAN or the internet, in lockstep: every machine
 runs the same simulation and only the players' commands cross the network. In the window it is
-on the main menu: "Co-op online" hosts a game for two to four and shows a room code, or joins one
+on the main menu: "Play online" hosts a game for two to four and shows a room code, or joins one
 by typing the code. Details, the packet format and what is and is not done are in
 [MULTIPLAYER.md](MULTIPLAYER.md).
 
@@ -134,6 +136,13 @@ for Windows and as a static Linux binary), which keeps rooms by six-character co
 each datagram to the player it names. It runs on Fly.io beside the download page, which
 [hedge](https://github.com/briar-systems/hedge), a web server written in Mach, serves; the
 protocol and how to deploy both are in [RELAY.md](RELAY.md).
+
+## Bots and their league
+
+Deathmatch, and players the simulation plays itself: a hand-written bot, and 942-byte neural
+networks that began as its imitation. A hundred of them play each other around the clock on the
+server, each learning by a reward of its own, rated on a public page. How they sense, find their
+way, decide and learn, and what the league costs, is in [BOTS.md](BOTS.md).
 
 ## How it is laid out
 
@@ -148,6 +157,8 @@ any animation frame can run code from anywhere. So the port has a real layering,
 | `win`, `st`, `video` | `i_video.c`, `st_stuff.c`, `v_video.c` | the window and sound devices; the status bar; pictures and text |
 | `sound`, `sfx`, `music` | `s_sound.c`, `i_sound.c`, `sounds.c`, `mus2mid` | effects: channels, distance and stereo, the mixer; MUS to MIDI |
 | `opl`, `opltab` | the OPL2 chip, DMX's driver | the music synthesizer: the chip, and MIDI played on it with GENMIDI's instruments |
+| `arena` | new | the bot league: matches, ratings, mutation and selection, the standings |
+| `bot` | new | a player the simulation plays: senses, a walk grid and path-finding, the script, the net |
 | `net` | `d_net.c`, `i_net.c` | lockstep co-op over UDP, directly or through the relay |
 | `relay`, `relaycore`, `relayproto` | new | the relay server: rooms, tokens, forwarding; the wire format both sides share |
 | `game` | `g_game.c`, `p_setup.c` | sessions, levels, demos, co-op, keys to commands |
@@ -203,6 +214,10 @@ lift. The three C files that are circular among themselves and cannot be pulled 
 - co-op: two games in one process fed the same bots' commands, two players on E1M1 for 3,500
   tics and four on E1M3 for 7,000, each with a forced death and respawn, ending where
   `fixtures/coop*.expected` pins them in both profiles;
+- bots: two pinned deathmatches of four hand-written bots, played as two games compared every
+  tic, in both profiles; the first net taking frags off its teacher; the arena playing forty
+  matches, leaving standings for a hundred named bots with every game counted, and going on
+  from there when started again;
 - the network: a host and a joiner as two processes over loopback ending exactly where the
   one-process run ends, and a joiner that secretly draws one random number more caught by both;
 - the relay: two players meeting by room code through a relay on loopback, two rooms at once on
@@ -304,7 +319,7 @@ applies to this directory only; the other products in the portfolio are unaffect
 
 Low-detail mode and view sizes other than the standard one with the status bar.
 
-Deathmatch, and networking beyond lockstep co-op. Doom II, Heretic, Hexen, or any source
+Networking beyond lockstep. Doom II, Heretic, Hexen, or any source
 port extension — the target is the shareware episode behaving as the original did. The game on
 targets other than windows-x86_64: the simulation is integer-only and ought to reproduce
 elsewhere, but nothing here tests that. (The relay alone is also built for linux-x86_64, which is

@@ -57,6 +57,16 @@ pub rec Peer {
     known:  bool;
 }
 
+# a bot the relay seated: its kind (1 the hand-written bot, otherwise a net),
+# the seed of its noise, its name, and its net
+pub rec BotSeat {
+    known: bool;
+    kind:  i32;
+    seed:  u32;
+    name:  [24]u8;
+    net:   [942]i8;
+}
+
 pub rec Net {
     sock:   udp.Socket;
     opened: bool;
@@ -104,6 +114,12 @@ pub rec Net {
 
     # the WAD every machine must hold, as the first eight bytes of its hash
     wadhash: u64;
+    # a room hosted through a relay is put on its public list
+    public:  bool;
+    # the game is a deathmatch, as the host chose and the relay tells the
+    # rest; and a hosted room would have its bots sooner than usual
+    deathmatch: bool;
+    quick:      bool;
     # why the host or the relay turned this machine away, or 0
     refused: u8;
 
@@ -117,7 +133,19 @@ pub rec Net {
     joined:    i32;
     nonce:     u32;
     pace:      i32;
-    wrap:      [288]u8;
+    wrap:      [1100]u8;
+
+    # bots in the game, seated by the relay in the seats nobody took: a bit
+    # a seat, and each one as the relay told it, which every machine is told
+    # alike. The game starts when the relay has said start and every bot is
+    # known.
+    startseen: bool;
+    botmask:   i32;
+    bots:      [4]BotSeat;
+    # seconds until bots take a public room's empty seats, 255 for never;
+    # and whether this host has asked for them now
+    fillin:    i32;
+    wantfill:  bool;
 
     packet: [256]u8;
 }
@@ -508,18 +536,52 @@ fun from_relay(n: *Net, len: i32) {
 
     if (kind == rp.LOBBY && len >= body + 2) {
         n.joined = n.wrap[body + 1]::i32;
+        n.fillin = 255;
+        if (len >= body + 3) { n.fillin = n.wrap[body + 2]::i32; }
     }
-    or (kind == rp.START && len >= body + 3 && !n.started) {
+    or (kind == rp.START && len >= body + 3 && !n.started && !n.startseen) {
         n.players = n.wrap[body]::i32;
         n.skill   = n.wrap[body + 1]::i32;
         n.map     = n.wrap[body + 2]::i32;
-        if (n.players < 2 || n.players > 4 || n.me >= n.players) { ret; }
+        n.botmask = 0;
+        if (len >= body + 4) { n.botmask = n.wrap[body + 3]::i32; }
+        if (len >= body + 5) { n.deathmatch = (n.wrap[body + 4] & rp.FLAG_DEATHMATCH) != 0; }
+        if (n.players < 2 || n.players > 4 || n.me >= n.players || (n.botmask & (1 << n.me)) != 0) { ret; }
         var q: i32 = 0;
         for (q < n.players) {
-            n.peers[q].known = q != n.me;
+            # a bot is no peer: nothing is sent to it or awaited from it
+            n.peers[q].known = q != n.me && (n.botmask & (1 << q)) == 0;
             q                = q + 1;
         }
-        n.started = 1;
+        n.startseen = 1;
+        n.started   = n.botmask == 0;
+    }
+    or (kind == rp.BOTIS && len >= body + rp.BOTBODY && n.startseen && !n.started) {
+        val seat: i32 = n.wrap[body]::i32;
+        if (seat < 0 || seat >= n.players || (n.botmask & (1 << seat)) == 0) { ret; }
+        val b: *BotSeat = ?n.bots[seat];
+        b.kind = rp.get32(?n.wrap[0], body + 4):~i32;
+        b.seed = rp.get32(?n.wrap[0], body + 8);
+        var k: i32 = 0;
+        for (k < 24) {
+            b.name[k] = n.wrap[body + 12 + k];
+            k         = k + 1;
+        }
+        b.name[23] = 0;
+        k = 0;
+        for (k < 942) {
+            b.net[k] = n.wrap[body + 36 + k]:~i8;
+            k        = k + 1;
+        }
+        b.known = 1;
+        # every bot known: play
+        var all: bool = 1;
+        var q:   i32  = 0;
+        for (q < n.players) {
+            if ((n.botmask & (1 << q)) != 0 && !n.bots[q].known) { all = 0; }
+            q = q + 1;
+        }
+        n.started = all;
     }
     or (kind == rp.GONE && n.started) {
         n.quit = 1;
@@ -544,7 +606,7 @@ pub fun receive(n: *Net) {
     for {
         var from: ip.Endpoint;
         if (n.relaymode) {
-            val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.wrap[0], 288, ?from);
+            val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.wrap[0], 1100, ?from);
             if (sel got.err) { brk; }
             # only the relay speaks to a game that uses one
             if (same_peer(?n.relay, ?from)) { from_relay(n, got.ok::i32); }
@@ -573,7 +635,11 @@ fun gather_relay(n: *Net) bool {
             n.wrap[at + 3] = rp.VERSION;
             rp.put64(?n.wrap[0], at + 4, n.wadhash);
             rp.put32(?n.wrap[0], at + 12, n.nonce);
-            to_relay(n, at + 16);
+            n.wrap[at + 16] = 0;
+            if (n.public)     { n.wrap[at + 16] = n.wrap[at + 16] | rp.FLAG_PUBLIC; }
+            if (n.deathmatch) { n.wrap[at + 16] = n.wrap[at + 16] | rp.FLAG_DEATHMATCH; }
+            if (n.quick)      { n.wrap[at + 16] = n.wrap[at + 16] | rp.FLAG_QUICK; }
+            to_relay(n, at + 17);
         }
         or {
             val at: i32 = rp.header(?n.wrap[0], rp.JOIN, 0, 0, 0);
@@ -591,8 +657,35 @@ fun gather_relay(n: *Net) bool {
         ret 0;
     }
 
+    # started, with bots not yet all known: ask about each
+    if (n.startseen) {
+        var seat: i32 = 0;
+        for (seat < n.players) {
+            if ((n.botmask & (1 << seat)) != 0 && !n.bots[seat].known) {
+                # padded to the answer's length
+                var k: i32 = 0;
+                for (k < rp.BOTSIZE) {
+                    n.wrap[k] = 0;
+                    k         = k + 1;
+                }
+                val at: i32 = rp.header(?n.wrap[0], rp.BOTASK, n.me, 0, n.token);
+                n.wrap[at] = seat::u8;
+                to_relay(n, rp.BOTSIZE);
+            }
+            seat = seat + 1;
+        }
+        ret 0;
+    }
+
+    # the host would rather not wait: bots in the empty seats, now
+    if (n.wantfill && n.host) { to_relay(n, rp.header(?n.wrap[0], rp.FILL, n.me, 0, n.token)); }
     to_relay(n, rp.header(?n.wrap[0], rp.STATUS, n.me, 0, n.token));
     ret 0;
+}
+
+# a host asks the relay to start now, with bots in the seats nobody took
+pub fun ask_fill(n: *Net) {
+    n.wantfill = 1;
 }
 
 # while gathering players: the host checks whether everyone has arrived and
@@ -624,6 +717,227 @@ pub fun gather(n: *Net) bool {
     rp.put64(?n.packet[0], at + 1, n.wadhash);
     send(n, 0, at + 9);
     ret 0;
+}
+
+# ------------------------------------------------------- the public list
+
+# an open game on a relay's list
+pub rec Listing {
+    code:    [7]u8;
+    players: i32;
+    joined:  i32;
+    skill:   i32;
+    map:     i32;
+    deathmatch: bool;
+}
+
+# asking a relay for its open games, before any game is joined
+pub rec Lobby {
+    sock:     udp.Socket;
+    opened:   bool;
+    relay:    Peer;
+    wadhash:  u64;
+    # the last answer, and whether there has been one
+    rooms:    [6]Listing;
+    count:    i32;
+    answered: bool;
+    # when the relay was last asked, in microseconds, and how many times
+    asked:    i64;
+    asks:     i32;
+    buf:      [128]u8;
+}
+
+pub fun lobby_open(l: *Lobby, relay: *Peer, wadhash: u64) bool {
+    val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(ip.endpoint(0, 0, 0, 0, 0), socket_api.async_flags());
+    if (sel bound.err) { ret 0; }
+    l.sock        = bound.ok;
+    l.opened      = 1;
+    l.relay       = @relay;
+    l.relay.known = 1;
+    l.wadhash     = wadhash;
+    l.count       = 0;
+    l.answered    = 0;
+    l.asked       = 0;
+    l.asks        = 0;
+    ret 1;
+}
+
+pub fun lobby_close(l: *Lobby) {
+    if (!l.opened) { ret; }
+    udp.socket_close(?l.sock);
+    l.opened = 0;
+}
+
+# ask again every two seconds, and take whatever answers have come
+# ---
+# now: the time in microseconds
+pub fun lobby_poll(l: *Lobby, now: i64) {
+    if (!l.opened) { ret; }
+    if (l.asks == 0 || now - l.asked > 2000000) {
+        # padded to the longest answer: the relay sends no more than it gets
+        var k: i32 = 0;
+        for (k < rp.LISTSIZE) {
+            l.buf[k] = 0;
+            k        = k + 1;
+        }
+        val at: i32 = rp.header(?l.buf[0], rp.LIST, 0, 0, 0);
+        l.buf[at] = rp.VERSION;
+        rp.put64(?l.buf[0], at + 1, l.wadhash);
+        udp.send_to(?l.sock, ?l.buf[0], rp.LISTSIZE::usize, endpoint_of(?l.relay));
+        l.asked = now;
+        l.asks  = l.asks + 1;
+    }
+    for {
+        var from: ip.Endpoint;
+        val got:  res[usize, io_error.Error] = udp.recv_from(?l.sock, ?l.buf[0], 128, ?from);
+        if (sel got.err) { brk; }
+        val len: i32 = got.ok::i32;
+        if (!same_peer(?l.relay, ?from) || !rp.is_relay(?l.buf[0], len) || l.buf[4] != rp.ROOMS || len < rp.HEADER + 1) { cnt; }
+        var count: i32 = l.buf[rp.HEADER]::i32;
+        if (count > rp.LISTMAX)                                { count = rp.LISTMAX; }
+        if (len < rp.HEADER + 1 + count * rp.LISTENTRY)        { cnt; }
+        var i: i32 = 0;
+        for (i < count) {
+            val at: i32      = rp.HEADER + 1 + i * rp.LISTENTRY;
+            val g:  *Listing = ?l.rooms[i];
+            var k:  i32      = 0;
+            for (k < rp.CODELEN) {
+                g.code[k] = l.buf[at + k];
+                k         = k + 1;
+            }
+            g.code[6] = 0;
+            g.players = l.buf[at + 6]::i32;
+            g.joined  = l.buf[at + 7]::i32;
+            g.skill   = l.buf[at + 8]::i32;
+            g.map     = l.buf[at + 9]::i32;
+            g.deathmatch = l.buf[at + 10] != 0;
+            i         = i + 1;
+        }
+        l.count    = count;
+        l.answered = 1;
+    }
+}
+
+# ------------------------------------------------------ a match to watch
+
+# fetching the bot league's last match from a relay, in pieces
+pub rec Watch {
+    sock:   udp.Socket;
+    opened: bool;
+    relay:  Peer;
+    # the file, which pieces of it have come, and the match they are of
+    data:  [4096]u8;
+    have:  [4]bool;
+    id:    u32;
+    done:  bool;
+    # the relay answered, but has no match to give
+    none:  bool;
+    asked: i64;
+    asks:  i32;
+    buf:   [1100]u8;
+}
+
+pub fun watch_open(w: *Watch, relay: *Peer) bool {
+    val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(ip.endpoint(0, 0, 0, 0, 0), socket_api.async_flags());
+    if (sel bound.err) { ret 0; }
+    w.sock        = bound.ok;
+    w.opened      = 1;
+    w.relay       = @relay;
+    w.relay.known = 1;
+    w.done        = 0;
+    w.none        = 0;
+    w.asks        = 0;
+    w.asked       = 0;
+    var i: i32 = 0;
+    for (i < 4) {
+        w.have[i] = 0;
+        i         = i + 1;
+    }
+    ret 1;
+}
+
+pub fun watch_close(w: *Watch) {
+    if (!w.opened) { ret; }
+    udp.socket_close(?w.sock);
+    w.opened = 0;
+}
+
+# ask for the pieces still missing, every three seconds, and take what comes
+# ---
+# now: the time in microseconds
+pub fun watch_poll(w: *Watch, now: i64) {
+    if (!w.opened || w.done) { ret; }
+    val pieces: i32 = (rp.WATCHFILE + rp.WATCHPIECE - 1) / rp.WATCHPIECE;
+    if (w.asks == 0 || now - w.asked > 3000000) {
+        var piece: i32 = 0;
+        for (piece < pieces) {
+            if (!w.have[piece]) {
+                # padded to the longest answer: the relay sends no more than
+                # it gets
+                var k: i32 = 0;
+                for (k < rp.WATCHSIZE) {
+                    w.buf[k] = 0;
+                    k        = k + 1;
+                }
+                val at: i32 = rp.header(?w.buf[0], rp.WATCH, 0, 0, 0);
+                w.buf[at]     = rp.VERSION;
+                w.buf[at + 1] = piece::u8;
+                udp.send_to(?w.sock, ?w.buf[0], rp.WATCHSIZE::usize, endpoint_of(?w.relay));
+            }
+            piece = piece + 1;
+        }
+        w.asked = now;
+        w.asks  = w.asks + 1;
+    }
+    for {
+        var from: ip.Endpoint;
+        val got:  res[usize, io_error.Error] = udp.recv_from(?w.sock, ?w.buf[0], 1100, ?from);
+        if (sel got.err) { brk; }
+        val len: i32 = got.ok::i32;
+        val at:  i32 = rp.HEADER;
+        if (!same_peer(?w.relay, ?from) || !rp.is_relay(?w.buf[0], len) || w.buf[4] != rp.MATCH || len < at + 8) { cnt; }
+        val total: i32 = w.buf[at]::i32 | (w.buf[at + 1]::i32 << 8);
+        val piece: i32 = w.buf[at + 2]::i32;
+        if (total != rp.WATCHFILE) {
+            w.none = 1;
+            cnt;
+        }
+        w.none = 0;
+        if (piece >= pieces) { cnt; }
+        var count: i32 = total - piece * rp.WATCHPIECE;
+        if (count > rp.WATCHPIECE) { count = rp.WATCHPIECE; }
+        if (len < at + 8 + count) { cnt; }
+        # pieces of another match than the ones held: start again with it
+        val id: u32 = get32(?w.buf[0], at + 4);
+        var any: bool = 0;
+        var i:   i32  = 0;
+        for (i < pieces) {
+            if (w.have[i]) { any = 1; }
+            i = i + 1;
+        }
+        if (any && id != w.id) {
+            i = 0;
+            for (i < pieces) {
+                w.have[i] = 0;
+                i         = i + 1;
+            }
+            # ask for the rest of this one at once
+            w.asked = 0;
+        }
+        w.id = id;
+        var k: i32 = 0;
+        for (k < count) {
+            w.data[piece * rp.WATCHPIECE + k] = w.buf[at + 8 + k];
+            k                                 = k + 1;
+        }
+        w.have[piece] = 1;
+        w.done        = 1;
+        i             = 0;
+        for (i < pieces) {
+            if (!w.have[i]) { w.done = 0; }
+            i = i + 1;
+        }
+    }
 }
 
 # a line for the waiting screen about why this machine was turned away
@@ -672,7 +986,7 @@ pub fun pace(n: *Net, gametic: i32) {
     var early: i32 = BACKUP;
     var p:     i32 = 0;
     for (p < n.players) {
-        if (p != n.me && n.have[p] - gametic - 1 < early) { early = n.have[p] - gametic - 1; }
+        if (p != n.me && (n.botmask & (1 << p)) == 0 && n.have[p] - gametic - 1 < early) { early = n.have[p] - gametic - 1; }
         p = p + 1;
     }
     if (early >= 2) {
@@ -742,7 +1056,8 @@ pub fun send_commands(n: *Net, lastrun: i32) {
 pub fun ready(n: *Net, tic: i32) bool {
     var p: i32 = 0;
     for (p < n.players) {
-        if (n.have[p] <= tic) { ret 0; }
+        # a bot's command is the simulation's own to make
+        if ((n.botmask & (1 << p)) == 0 && n.have[p] <= tic) { ret 0; }
         p = p + 1;
     }
     ret 1;

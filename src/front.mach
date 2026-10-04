@@ -41,6 +41,31 @@ val MENU_READ1:   i32 = 5;
 val MENU_READ2:   i32 = 6;
 val MENU_COOP:    i32 = 7;
 val MENU_CODE:    i32 = 8;
+val MENU_LIST:    i32 = 9;
+
+# the lines of the co-op menu
+val COOP_MODE:   i32 = 3;
+val COOP_PUBLIC: i32 = 4;
+val COOP_FIND:   i32 = 5;
+val COOP_CODE:   i32 = 6;
+val COOP_WATCH:  i32 = 7;
+
+# what the list of open games is waiting on
+pub val LIST_ASKING:  i32 = 0;
+pub val LIST_KNOWN:   i32 = 1;
+pub val LIST_NOREACH: i32 = 2;
+
+pub val LISTMAX: i32 = 6;
+
+# an open game on the relay's public list
+pub rec Listing {
+    code:    [7]u8;
+    players: i32;
+    joined:  i32;
+    skill:   i32;
+    map:     i32;
+    deathmatch: bool;
+}
 
 # what a yes in answer to a message does
 val ASK_NONE:      i32 = 0;
@@ -88,7 +113,7 @@ pub rec Front {
     # the menu
     menuactive: bool;
     menu:       i32;
-    itemon:     [9]i32;
+    itemon:     [10]i32;
     skulltics:  i32;
     whichskull: i32;
     episode:    i32;
@@ -142,6 +167,21 @@ pub rec Front {
     netrequest:  i32;
     netplayers:  i32;
     netskill:    i32;
+    # whether a game hosted from the menu is put on the relay's public list,
+    # and whether it is a deathmatch; netquick is the list's standing
+    # deathmatch with the bots: public, a deathmatch, and soon started
+    netpublic:   bool;
+    netdm:       bool;
+    netquick:    bool;
+    # a deathmatch is on: show every player's frags
+    scores:      bool;
+    # the public list, as the game loop last had it from the relay
+    liststate:   i32;
+    nrooms:      i32;
+    rooms:       [6]Listing;
+    # watching a league match: the four bots' names, shown with their frags
+    watching: bool;
+    watched:  [96]u8;
     # a network game is being played; the menu cannot start another game
     netgame:     bool;
     # six hex digits naming this program and WAD, for players to compare
@@ -153,6 +193,8 @@ pub rec Front {
 
 pub val NET_HOST: i32 = 1;
 pub val NET_JOIN: i32 = 2;
+# not a game to play: a match of the bot league, fetched and watched
+pub val NET_WATCH: i32 = 3;
 
 fun sfx(s: *game.Session, effect: i32) {
     defs.sound(?s.g, nil, effect);
@@ -201,6 +243,8 @@ pub fun init(f: *Front) {
 
 # D_StartTitle
 fun start_title(f: *Front) {
+    f.watching = 0;
+    f.scores   = 0;
     f.demosequence = -1;
     f.menuactive   = 0;
     f.mode         = MODE_PAGE;
@@ -235,8 +279,26 @@ fun advance_demo(f: *Front, s: *game.Session) {
     }
 }
 
+# a league match has been set up in the session: watch it
+# ---
+# names: four names, 24 bytes each
+pub fun start_watching(f: *Front, s: *game.Session, names: *u8) {
+    var k: i32 = 0;
+    for (k < 96) {
+        f.watched[k] = names[k];
+        k            = k + 1;
+    }
+    f.watching   = 1;
+    f.netgame    = 0;
+    f.menuactive = 0;
+    f.message    = nil;
+    f.mode       = MODE_LEVEL;
+    level_song(f, s);
+}
+
 # back to the title screen and its demos, as at the start
 pub fun to_title(f: *Front) {
+    f.watching = 0;
     f.netgame = 0;
     start_title(f);
 }
@@ -264,7 +326,7 @@ fun start_message(f: *Front, text: str, yn: bool, ask: i32) {
 
 fun items_in(menu: i32) i32 {
     if (menu == MENU_MAIN)    { ret 7; }
-    if (menu == MENU_COOP)    { ret 4; }
+    if (menu == MENU_COOP)    { ret 8; }
     if (menu == MENU_EPISODE) { ret 3; }
     if (menu == MENU_SKILL)   { ret 5; }
     if (menu == MENU_OPTIONS) { ret 3; }
@@ -277,7 +339,7 @@ fun parent_of(f: *Front, menu: i32) i32 {
     if (menu == MENU_EPISODE || menu == MENU_OPTIONS || menu == MENU_READ1 || menu == MENU_COOP) { ret MENU_MAIN; }
     if (menu == MENU_SKILL && f.coopplayers != 0)                          { ret MENU_COOP; }
     if (menu == MENU_SKILL)                                                 { ret MENU_EPISODE; }
-    if (menu == MENU_CODE)                                                  { ret MENU_COOP; }
+    if (menu == MENU_CODE || menu == MENU_LIST)                             { ret MENU_COOP; }
     if (menu == MENU_SOUND)                                                 { ret MENU_OPTIONS; }
     if (menu == MENU_READ2)                                                 { ret MENU_READ1; }
     ret -1;
@@ -367,11 +429,53 @@ fun choose(f: *Front, s: *game.Session) {
             f.coopplayers = item + 2;
             f.menu        = MENU_SKILL;
         }
+        or (item == COOP_MODE) {
+            f.netdm = !f.netdm;
+        }
+        or (item == COOP_PUBLIC) {
+            f.netpublic = !f.netpublic;
+        }
+        or (item == COOP_FIND) {
+            f.nrooms            = 0;
+            f.liststate         = LIST_ASKING;
+            f.itemon[MENU_LIST] = 0;
+            f.menu              = MENU_LIST;
+        }
+        or (item == COOP_WATCH) {
+            f.menuactive = 0;
+            f.netrequest = NET_WATCH;
+        }
         or {
             f.codelen = 0;
             f.code[0] = 0;
             f.menu    = MENU_CODE;
         }
+    }
+    or (f.menu == MENU_LIST) {
+        if (f.liststate == LIST_NOREACH) {
+            sfx(s, info.SFX_OOF);
+            ret;
+        }
+        # the last line is always there: a deathmatch with the league's
+        # bots, open to anyone for a quarter of a minute and then begun
+        if (item >= f.nrooms) {
+            f.menuactive = 0;
+            f.netrequest = NET_HOST;
+            f.netplayers = 4;
+            f.netskill   = defs.SK_MEDIUM;
+            f.netquick   = 1;
+            ret;
+        }
+        # join the game the skull is beside, by its code
+        var k: i32 = 0;
+        for (k < rp.CODELEN) {
+            f.code[k] = f.rooms[item].code[k];
+            k         = k + 1;
+        }
+        f.code[rp.CODELEN] = 0;
+        f.codelen          = rp.CODELEN;
+        f.menuactive       = 0;
+        f.netrequest       = NET_JOIN;
     }
     or (f.menu == MENU_CODE) {
         if (f.codelen < rp.CODELEN) {
@@ -413,6 +517,7 @@ fun begin(f: *Front, s: *game.Session, skill: i32) {
     }
     f.menuactive  = 0;
     f.netrequest  = NET_HOST;
+    f.netquick    = 0;
     f.netplayers  = f.coopplayers;
     f.netskill    = skill;
     f.coopplayers = 0;
@@ -496,7 +601,12 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
     }
 
     val menu: i32 = f.menu;
-    val n:    i32 = items_in(menu);
+    var n:    i32 = items_in(menu);
+    # the list is as long as the games on it, and the standing one
+    if (menu == MENU_LIST) {
+        n = f.nrooms + 1;
+        if (f.itemon[menu] >= n) { f.itemon[menu] = 0; }
+    }
     if (menu == MENU_CODE && type_code(f, s, key)) { ret; }
 
     if (key == KEY_DOWN) {
@@ -558,7 +668,7 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         video.draw_patch(screen, 94, 2, video.patch(d, "M_DOOM"));
         video.draw_patch(screen, x, y, video.patch(d, "M_NGAME"));
         # the game has no picture for co-op: the words, in the small font
-        video.write_text(d, screen, x + 2, y + LINEHEIGHT + 4, "CO-OP ONLINE", -1);
+        video.write_text(d, screen, x + 2, y + LINEHEIGHT + 4, "PLAY ONLINE", -1);
         video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_OPTION"));
         video.draw_patch(screen, x, y + LINEHEIGHT * 3, video.patch(d, "M_LOADG"));
         video.draw_patch(screen, x, y + LINEHEIGHT * 4, video.patch(d, "M_SAVEG"));
@@ -567,22 +677,70 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
     }
     or (f.menu == MENU_COOP) {
         x = 72;
-        y = 64;
-        video.shade(d, screen, 16, 30, 288, 146, 26);
-        centred(d, screen, 40, "CO-OP ONLINE");
+        y = 34;
+        video.shade(d, screen, 16, 10, 288, 180, 26);
+        centred(d, screen, 18, "PLAY ONLINE");
         video.write_text(d, screen, x, y + 4, "HOST A GAME FOR 2", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT + 4, "HOST A GAME FOR 3", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT * 2 + 4, "HOST A GAME FOR 4", -1);
-        video.write_text(d, screen, x, y + LINEHEIGHT * 3 + 4, "JOIN WITH A ROOM CODE", -1);
-        centred(d, screen, 140, "THE HOST GETS A CODE TO GIVE THE OTHERS.");
-        centred(d, screen, 152, "EVERYONE NEEDS THE SAME DOWNLOAD.");
+        if (f.netdm) {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 3 + 4, "GAME: DEATHMATCH", -1);
+        }
+        or {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 3 + 4, "GAME: CO-OP", -1);
+        }
+        if (f.netpublic) {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 4 + 4, "LISTED PUBLICLY: YES", -1);
+        }
+        or {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 4 + 4, "LISTED PUBLICLY: NO", -1);
+        }
+        video.write_text(d, screen, x, y + LINEHEIGHT * 5 + 4, "FIND AN OPEN GAME", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 6 + 4, "JOIN WITH A ROOM CODE", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 7 + 4, "WATCH THE BOT LEAGUE", -1);
         var line: [20]u8 = [20]u8{'T', 'H', 'I', 'S', ' ', 'C', 'O', 'P', 'Y', ':', ' ', ' ', 0, 0, 0, 0, 0, 0, 0, 0};
         var k:    i32    = 0;
         for (k < 6 && f.build[k] != 0) {
             line[12 + k] = f.build[k];
             k            = k + 1;
         }
-        if (k > 0) { centred(d, screen, 164, ?line[0]); }
+        if (k > 0) { centred(d, screen, 174, ?line[0]); }
+    }
+    or (f.menu == MENU_LIST) {
+        x = 56;
+        y = 50;
+        video.shade(d, screen, 16, 22, 288, 168, 26);
+        centred(d, screen, 30, "OPEN GAMES");
+        if (f.liststate == LIST_NOREACH) {
+            centred(d, screen, 90, "THE RELAY COULD NOT BE REACHED.");
+            centred(d, screen, 160, "BACKSPACE TO GO BACK");
+            ret;
+        }
+        var row: i32 = 0;
+        for (row < f.nrooms) {
+            val g: *Listing = ?f.rooms[row];
+            # "E1M3   2/4   ULTRA-VIOLENCE", or DEATHMATCH for one
+            var line: [12]u8 = [12]u8{'E', '1', 'M', '0', ' ', ' ', ' ', '0', '/', '0', 0, 0};
+            line[3] = ('0' + g.map)::u8;
+            line[7] = ('0' + g.joined)::u8;
+            line[9] = ('0' + g.players)::u8;
+            video.write_text(d, screen, x, y + row * LINEHEIGHT + 4, ?line[0], -1);
+            if (g.deathmatch) {
+                video.write_text(d, screen, x + 96, y + row * LINEHEIGHT + 4, "DEATHMATCH", -1);
+            }
+            or {
+                video.write_text(d, screen, x + 96, y + row * LINEHEIGHT + 4, skill_name(g.skill), -1);
+            }
+            row = row + 1;
+        }
+        # always there, last
+        video.write_text(d, screen, x, y + row * LINEHEIGHT + 4, "DEATHMATCH WITH THE BOTS", -1);
+        if (f.liststate == LIST_ASKING) {
+            centred(d, screen, 176, "ASKING THE RELAY FOR OTHERS...");
+        }
+        or {
+            centred(d, screen, 176, "ENTER TO JOIN");
+        }
     }
     or (f.menu == MENU_CODE) {
         var shown: [12]u8;
@@ -650,6 +808,19 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
     or {
         video.draw_patch(screen, x + SKULLXOFF, y - 5 + f.itemon[f.menu] * LINEHEIGHT, video.patch(d, "M_SKULL2"));
     }
+}
+
+fun skill_name(skill: i32) str {
+    if (skill == 0) { ret "TOO YOUNG TO DIE"; }
+    if (skill == 1) { ret "NOT TOO ROUGH"; }
+    if (skill == 2) { ret "HURT ME PLENTY"; }
+    if (skill == 3) { ret "ULTRA-VIOLENCE"; }
+    ret "NIGHTMARE!";
+}
+
+# whether the list of open games is on screen, and so wanted from the relay
+pub fun listing(f: *Front) bool {
+    ret f.menuactive && f.menu == MENU_LIST && f.message == nil;
 }
 
 # a line of the small font, centred across the screen
@@ -1087,9 +1258,25 @@ pub fun ticker(f: *Front, s: *game.Session, bar: *st.State, input: *game.Input) 
 }
 
 # start a co-op game that every machine starts the same way
-pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i32, map: i32) bool {
+# start a network game: co-op, or a deathmatch as the league plays it, with
+# items that come back and no monsters, and every player's frags on screen
+# ---
+# names: for a deathmatch, each player's name, 24 bytes a player
+pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i32, map: i32, deathmatch: bool, names: *u8) bool {
     f.menuactive = 0;
-    if (!game.coop_game(s, players, me, skill, map)) { ret 0; }
+    f.scores     = 0;
+    if (deathmatch) {
+        if (!game.deathmatch_game(s, players, me, skill, map, 1, 1)) { ret 0; }
+        var k: i32 = 0;
+        for (k < 96) {
+            f.watched[k] = names[k];
+            k            = k + 1;
+        }
+        f.scores = 1;
+    }
+    or (!game.coop_game(s, players, me, skill, map)) {
+        ret 0;
+    }
     f.netgame = 1;
     f.mode = MODE_LEVEL;
     level_song(f, s);
@@ -1170,6 +1357,57 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
     }
     or (f.mode == MODE_FINALE) {
         finale_draw(f, s, screen);
+    }
+
+    # watching the league: each bot's name and frags, the one whose eyes
+    # these are marked
+    if ((f.watching || f.scores) && f.mode == MODE_LEVEL && !f.menuactive) {
+        var i:   i32 = 0;
+        var row: i32 = 0;
+        for (i < 4) {
+            if (!s.g.playeringame[i]) {
+                i = i + 1;
+                cnt;
+            }
+            var line: [40]u8;
+            var at:   i32 = 0;
+            if (i == s.g.consoleplayer) {
+                line[0] = '>';
+                line[1] = ' ';
+                at      = 2;
+            }
+            var k: i32 = 0;
+            for (k < 23 && f.watched[i * 24 + k] != 0) {
+                line[at] = f.watched[i * 24 + k];
+                at       = at + 1;
+                k        = k + 1;
+            }
+            var frags: i32 = 0;
+            k = 0;
+            for (k < 4) {
+                if (k != i) { frags = frags + s.g.players[i].frags[k]; }
+                k = k + 1;
+            }
+            frags = frags - s.g.players[i].frags[i];
+            line[at]     = ' ';
+            line[at + 1] = ' ';
+            at           = at + 2;
+            if (frags < 0) {
+                line[at] = '-';
+                at       = at + 1;
+                frags    = -frags;
+            }
+            if (frags >= 10) {
+                line[at] = ('0' + frags / 10 % 10)::u8;
+                at       = at + 1;
+            }
+            line[at]     = ('0' + frags % 10)::u8;
+            line[at + 1] = 0;
+            video.write_text(s.d, screen, 316 - video.text_width(s.d, ?line[0]), 12 + row * 10, ?line[0], -1);
+            row = row + 1;
+            i   = i + 1;
+        }
+        if (f.watching) { video.write_text(s.d, screen, 316 - video.text_width(s.d, "1-4: WHOSE EYES"), 54, "1-4: WHOSE EYES", -1); }
     }
 
     # a message replaces the menu while it is up, as in the original
