@@ -67,6 +67,14 @@ To leave, Esc, "Options", "End Game".
 Co-op runs every player's game in lockstep, so a slow connection makes
 everyone wait for it. It plays best within a country.
 
+UPDATING
+--------
+
+Esc, "Play online", "Update the game" fetches the newest version, puts it
+in place of this one and starts it. Players need the same version to play
+together, so if a game turns you away for having a different one, both of
+you do this.
+
 THE BOT LEAGUE
 --------------
 

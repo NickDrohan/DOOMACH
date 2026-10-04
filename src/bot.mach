@@ -43,6 +43,13 @@ pub val NETSIZE: i32 = 32 * 24 + 24 + 24 * 6 + 6;
 pub val KIND_SCRIPT: i32 = 1;
 pub val KIND_NET:    i32 = 2;
 
+# traits, added to a kind: what a bot is like whatever decides for it.
+# A brawler fights with its fists and nothing else. A shy bot does not fight
+# at all: it stays behind the nearest person, and runs to get out of sight
+# whenever they turn to look.
+pub val TRAIT_FISTS: i32 = 0x100;
+pub val TRAIT_SHY:   i32 = 0x200;
+
 # the senses, by index
 pub val F_RAYS:      i32 = 0;
 pub val F_SEEN:      i32 = 8;
@@ -74,6 +81,14 @@ pub val O_FIRE:    i32 = 3;
 pub val O_USE:     i32 = 4;
 pub val O_SWITCH:  i32 = 5;
 
+# a bot's reflexes: tics between presses of use, five seconds, and how far
+# use reaches; and how close
+# (as the sense has it, 127 less a sixteenth of the distance) an enemy must
+# be for a fist to reach, about eighty units
+val USE_WAIT:    i32 = 175;
+val USE_REACH:   i32 = 64;
+val MELEE_CLOSE: i32 = 122;
+
 val RAYS:     i32   = 8;
 val RAYRANGE: i32   = 1024;
 val STEP:     Fixed = 24 * 65536;
@@ -86,6 +101,8 @@ val RAYTURN: [8]i32 = [8]i32{0, 21, -21, 43, -43, 64, -64, 128};
 pub rec Bot {
     active: bool;
     kind:   i32;
+    fists:  bool;
+    shy:    bool;
     net:    [942]i8;
     seed:   u32;
 
@@ -105,6 +122,11 @@ pub rec Bot {
     haveway:  bool;
     wayx:     Fixed;
     wayy:     Fixed;
+
+    # tics until it may press use again, and whether there is something
+    # within reach ahead to use
+    usewait: i32;
+    usable:  bool;
 
     # what it has done, for whoever scores it
     shots:  i32;
@@ -140,6 +162,8 @@ fun distance(a: *Mobj, x: Fixed, y: Fixed) i32 {
 # traverser leaves it; and the floor the ray started from
 var rayfrac:  Fixed;
 var rayfloor: Fixed;
+# and the line that stopped it, or -1
+var rayline:  i32;
 
 fun ray_stops(g: *Game, in: *defs.Intercept) bool {
     if (!in.isaline) { ret 1; }
@@ -152,6 +176,7 @@ fun ray_stops(g: *Game, in: *defs.Intercept) bool {
     }
     if (blocked) {
         rayfrac = in.frac;
+        rayline = in.line;
         ret 0;
     }
     ret 1;
@@ -163,6 +188,7 @@ fun ray(g: *Game, mo: *Mobj, turn: i32) i32 {
     val x2: Fixed = mo.x + RAYRANGE * t.FINESINE[an + 2048];
     val y2: Fixed = mo.y + RAYRANGE * t.FINESINE[an];
     rayfrac  = 65536;
+    rayline  = -1;
     rayfloor = mo.floorz;
     maputl.path_traverse(g, mo.x, mo.y, x2, y2, defs.PT_ADDLINES, ray_stops);
     ret fixed.mul(rayfrac, RAYRANGE << 16) >> 16;
@@ -429,23 +455,25 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     var target:   *Mobj = nil;
     var bestdist: i32   = 0x7fffffff;
     var person:   bool  = 0;
+    # a bot that follows people: any bot in co-op, a shy one in any game
+    val follows:  bool  = g.deathmatch == 0 || b.shy;
     var i:        i32   = 0;
     for (i < defs.MAXPLAYERS) {
         val o: *Mobj = g.players[i].mo;
         if (i != playernum && g.playeringame[i] && o != nil && o.health > 0) {
             val dist:   i32  = distance(me, o.x, o.y);
-            val better: bool = g.deathmatch == 0 && !g.isbot[i] && !person;
-            if (better || (dist < bestdist && (g.deathmatch != 0 || person == !g.isbot[i]))) {
+            val better: bool = follows && !g.isbot[i] && !person;
+            if (better || (dist < bestdist && (!follows || person == !g.isbot[i]))) {
                 target   = o;
                 bestdist = dist;
-                person   = g.deathmatch == 0 && !g.isbot[i];
+                person   = follows && !g.isbot[i];
             }
         }
         i = i + 1;
     }
     if (target == nil) { ret 0; }
     # in co-op, near enough: stay about rather than stand on their toes
-    if (g.deathmatch == 0 && bestdist < 128) { ret 0; }
+    if (follows && !b.shy && bestdist < 128) { ret 0; }
 
     if (g.navserial != g.levelserial) { build_grid(g); }
     if (g.navgrid == nil) { ret 0; }
@@ -578,8 +606,12 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
     var i: i32 = 0;
     for (i < RAYS) {
         # near is high: 127 at the wall, 0 at the ray's end
-        f[F_RAYS + i] = 127 - ray(g, me, RAYTURN[i]) / 8;
+        val far: i32 = ray(g, me, RAYTURN[i]);
+        f[F_RAYS + i] = 127 - far / 8;
         if (f[F_RAYS + i] < 0) { f[F_RAYS + i] = 0; }
+        # straight ahead: is what stops the way something to use, a door or
+        # a switch or a lift, and within an arm's reach?
+        if (i == 0) { b.usable = far <= USE_REACH && rayline >= 0 && g.lv.lines[rayline].special != 0; }
         i = i + 1;
     }
 
@@ -770,6 +802,76 @@ pub fun forward(net: *i8, f: *i32, out: *i32) {
     }
 }
 
+# ------------------------------------------------------------- the shy bot
+
+# How far behind its person a shy bot stands, and how near the middle of
+# their view (in 256ths of a turn to either side; the view is 32 each way)
+# counts as being looked at.
+val SHY_BEHIND: i32 = 96;
+val SHY_SEEN:   i32 = 44;
+
+# The shy bot's whole mind: find the nearest living person; the place to be
+# is a little way behind them. If they can see it, the place is behind and
+# to the side it is already on, so that it goes round them and not through
+# them. Run there flat out; once there and unseen, stand and face their
+# back.
+fun shy(g: *Game, playernum: i32, b: *Bot) {
+    var i: i32 = 0;
+    for (i < OUTPUTS) {
+        b.out[i] = -64;
+        i        = i + 1;
+    }
+    b.out[O_FORWARD] = 0;
+    b.out[O_SIDE]    = 0;
+    b.out[O_TURN]    = 0;
+
+    val me: *Mobj = g.players[playernum].mo;
+    var person:   *Mobj = nil;
+    var bestdist: i32   = 0x7fffffff;
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        val o: *Mobj = g.players[i].mo;
+        if (i != playernum && g.playeringame[i] && !g.isbot[i] && o != nil && o.health > 0) {
+            val dist: i32 = distance(me, o.x, o.y);
+            if (dist < bestdist) {
+                person   = o;
+                bestdist = dist;
+            }
+        }
+        i = i + 1;
+    }
+    if (person == nil) { ret; }
+
+    # where it is in their view: 0 is dead ahead of them
+    val seen:    i32  = bearing(person, me.x, me.y);
+    val watched: bool = seen > -SHY_SEEN && seen < SHY_SEEN;
+    var back: u32 = person.angle + t.ANG180;
+    if (watched) {
+        back = person.angle - t.ANG90 - t.ANG45;
+        if (seen >= 0) { back = person.angle + t.ANG90 + t.ANG45; }
+    }
+    val an: u32   = back >> t.ANGLETOFINESHIFT;
+    val px: Fixed = person.x + SHY_BEHIND * t.FINESINE[an + 2048];
+    val py: Fixed = person.y + SHY_BEHIND * t.FINESINE[an];
+
+    if (!watched && distance(me, px, py) < 32) {
+        # there, and unseen: stand, facing their back
+        b.out[O_TURN] = clamp(bearing(me, person.x, person.y) * 4, -127, 127);
+        ret;
+    }
+
+    # straight there if it can walk it; otherwise the way to them through
+    # the map, as any bot finds its way, and through its doors
+    var to: i32 = bearing(me, px, py);
+    if (!can_walk(g, me.x, me.y, px, py) && b.feat[F_WAY] > 0) {
+        to = b.feat[F_PATH];
+        if (b.usable) { b.out[O_USE] = 64; }
+    }
+    b.out[O_TURN]    = clamp(to * 6, -127, 127);
+    b.out[O_FORWARD] = 127;
+    if (to > 48 || to < -48) { b.out[O_FORWARD] = 40; }
+}
+
 # ------------------------------------------------------------------ thinking
 
 # one tic of a bot: its command
@@ -794,7 +896,10 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     val looking: bool = ((g.leveltime + playernum) & 3) == 0;
     if (looking) {
         sense(g, playernum, b);
-        if (b.kind == KIND_NET) {
+        if (b.shy) {
+            shy(g, playernum, b);
+        }
+        or (b.kind == KIND_NET) {
             forward(?b.net[0], ?b.feat[0], ?b.out[0]);
         }
         or {
@@ -802,25 +907,61 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         }
     }
 
+    # Reflexes, which every bot has whatever decided, because a net that
+    # never learned them plays like a fool.
+    var forward: i32  = b.out[O_FORWARD];
+    var side:    i32  = b.out[O_SIDE];
+    var turn:    i32  = b.out[O_TURN];
+    var fire:    bool = b.out[O_FIRE] > 0;
+
+    # A shy bot never fires. A brawler puts away whatever it has picked up,
+    # and does not fire until its fists are out.
+    var away: bool = 0;
+    if (b.shy) { fire = 0; }
+    if (b.fists && p.readyweapon != defs.WP_FIST) {
+        fire = 0;
+        away = 1;
+    }
+
+    # Fists and the saw reach only as far as an arm. With nothing else in
+    # hand and an enemy in sight: run straight at it, and swing only when it
+    # is within reach and in front.
+    if ((p.readyweapon == defs.WP_FIST || p.readyweapon == defs.WP_CHAINSAW) && b.feat[F_SEEN] > 0) {
+        forward = 127;
+        side    = 0;
+        turn    = clamp(b.feat[F_BEARING] * 6, -127, 127);
+        fire    = b.feat[F_CLOSE] >= MELEE_CLOSE && b.feat[F_BEARING] > -10 && b.feat[F_BEARING] < 10;
+    }
+
     # the decision, held until the next: full speed is 50 forward and 40
     # sideways; a turn of 127 is 2540 a tic, a fast spin
-    cmd.forwardmove = (b.out[O_FORWARD] * 50 / 127)::i8;
-    cmd.sidemove    = (b.out[O_SIDE] * 40 / 127)::i8;
-    cmd.angleturn   = (b.out[O_TURN] * 20)::i16;
-    b.turned = b.turned + b.out[O_TURN];
-    if (b.out[O_TURN] < 0) { b.turned = b.turned - 2 * b.out[O_TURN]; }
+    cmd.forwardmove = (forward * 50 / 127)::i8;
+    cmd.sidemove    = (side * 40 / 127)::i8;
+    cmd.angleturn   = (turn * 20)::i16;
+    b.turned = b.turned + turn;
+    if (turn < 0) { b.turned = b.turned - 2 * turn; }
 
     var buttons: i32 = 0;
-    if (b.out[O_FIRE] > 0) {
+    if (fire) {
         buttons  = buttons | defs.BT_ATTACK;
         b.shots  = b.shots + 1;
     }
-    # use works on the press, so it is pressed on the tic of the decision only
-    if (b.out[O_USE] > 0 && looking) {
-        buttons = buttons | defs.BT_USE;
-        b.uses  = b.uses + 1;
+    # Use works on the press, so it is pressed on the tic of the decision
+    # only; only at something to use that is within reach, a shut door or a
+    # switch or a lift, not at a bare wall or from across the room; and then
+    # not again for five seconds. Pressed nine times a second, as a bot at a
+    # door would, the door is opened, shut and opened again and never
+    # passed.
+    if (b.usewait > 0) { b.usewait = b.usewait - 1; }
+    if (b.out[O_USE] > 0 && looking && b.usewait == 0 && b.usable) {
+        buttons   = buttons | defs.BT_USE;
+        b.uses    = b.uses + 1;
+        b.usewait = USE_WAIT;
     }
-    if (b.out[O_SWITCH] > 0 && looking) {
+    if (away) {
+        if (looking) { buttons = buttons | defs.BT_CHANGE | (defs.WP_FIST << defs.BT_WEAPONSHIFT); }
+    }
+    or (b.out[O_SWITCH] > 0 && looking && !b.fists) {
         val want: i32 = best_weapon(p);
         if (want != p.readyweapon) { buttons = buttons | defs.BT_CHANGE | (want << defs.BT_WEAPONSHIFT); }
     }
@@ -837,7 +978,9 @@ pub fun start(b: *Bot, kind: i32, net: *i8, seed: u32) {
     var blank: Bot;
     @b       = blank;
     b.active = 1;
-    b.kind   = kind;
+    b.kind   = kind & 0xff;
+    b.fists  = (kind & TRAIT_FISTS) != 0;
+    b.shy    = (kind & TRAIT_SHY) != 0;
     b.seed   = seed;
     b.since  = 127;
     if (net != nil) {

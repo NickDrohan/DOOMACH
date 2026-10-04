@@ -19,6 +19,7 @@
 # player. That is the accepted cost of a first version without HTTPS.
 
 use std.types.bool.bool;
+use std.types.string.str;
 
 use lf: doom.leaguefile;
 use p: doom.relayproto;
@@ -142,6 +143,9 @@ pub rec Relay {
     # waits before bots take its empty seats, in milliseconds, 0 for never
     bots:     *Bots;
     fillwait: i64;
+    # one game in this many that bots join has the shy bot among them; 0
+    # for never
+    shyin:    i32;
 
     # the league match the arena last left to be watched, if any
     watch:    [4096]u8;
@@ -353,6 +357,9 @@ fun fill(r: *Relay, room: *Room, now: i64) {
 
     val index: i32 = room_index(r, room);
     var drawn: [4]i32 = [4]i32{-1, -1, -1, -1};
+    # now and then, one of them is the shy bot, which is in no league and
+    # joins only games with people in them
+    var shy: bool = r.shyin > 0 && r.bots != nil && (r.random() % r.shyin::u64) == 0;
     i = 0;
     for (i < room.players) {
         if ((mask & (1 << i)) != 0 && r.bots != nil) {
@@ -360,9 +367,18 @@ fun fill(r: *Relay, room: *Room, now: i64) {
             var blank: Seated;
             @b     = blank;
             b.seed = r.random()::u32;
-            b.kind = lf.KIND_SCRIPT;
+            b.kind = lf.SEAT_SCRIPT;
             var k: i32 = 0;
-            if (lf.valid(?r.bots.league[0], r.bots.leaguelen)) {
+            if (shy) {
+                shy    = 0;
+                b.kind = lf.SEAT_SCRIPT | lf.TRAIT_SHY;
+                val name: str = "Shy Bot";
+                for (name[k] != 0) {
+                    b.name[k] = name[k];
+                    k         = k + 1;
+                }
+            }
+            or (lf.valid(?r.bots.league[0], r.bots.leaguelen)) {
                 # a member not already drawn for this room
                 var who: i32 = 0;
                 for {
@@ -371,7 +387,10 @@ fun fill(r: *Relay, room: *Room, now: i64) {
                 }
                 drawn[i] = who;
                 val at: i32 = lf.HEAD + who * lf.MEMBER_BYTES;
-                if (p.get32(?r.bots.league[0], at + lf.AT_KIND) != lf.KIND_SCRIPT::u32) { b.kind = lf.KIND_LEARNS; }
+                if (p.get32(?r.bots.league[0], at + lf.AT_KIND) != lf.KIND_SCRIPT::u32) {
+                    b.kind = lf.SEAT_NET;
+                    if (p.get32(?r.bots.league[0], at + lf.AT_STYLE) == lf.STYLE_BRAWLER::u32) { b.kind = b.kind | lf.TRAIT_FISTS; }
+                }
                 for (k < lf.NET) {
                     b.net[k] = r.bots.league[at + lf.AT_NET + k]:~i8;
                     k        = k + 1;
@@ -413,7 +432,7 @@ fun bot_is(r: *Relay, room: *Room, slot: i32, seat: i32) {
     o.len      = at + p.BOTBODY;
     if (r.bots == nil) {
         # no league: the hand-written bot, its seed from the room and seat
-        p.put32(?o.data[0], at + 4, lf.KIND_SCRIPT::u32);
+        p.put32(?o.data[0], at + 4, lf.SEAT_SCRIPT::u32);
         p.put32(?o.data[0], at + 8, (room.code[0]::u32 << 16) | (room.code[1]::u32 << 8) | seat::u32);
         lf.name_of(0, ?o.data[at + 12]);
         ret;
@@ -1101,7 +1120,7 @@ test relay__bots_take_the_empty_seats {
     buf[at] = 2;
     handle(?r, ?buf[0], p.BOTSIZE, ?host, 60100);
     if (r.nout != 1 || r.out[0].data[4] != p.BOTIS || r.out[0].data[16] != 2) { ret 5; }
-    if (p.get32(?r.out[0].data[0], 20) != lf.KIND_SCRIPT::u32 || r.out[0].data[28] != 'T') { ret 6; }
+    if (p.get32(?r.out[0].data[0], 20) != lf.SEAT_SCRIPT::u32 || r.out[0].data[28] != 'T') { ret 6; }
     r.nout = 0;
     # and a seat a person holds is not a bot's
     buf[at] = 0;

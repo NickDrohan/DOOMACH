@@ -946,7 +946,7 @@ pub fun refusal(n: *Net) str {
     if (why == rp.NO_ROOM) { ret "there is no room with that code."; }
     if (why == rp.ROOM_FULL) { ret "that room is full."; }
     if (why == rp.STARTED) { ret "that game has already started."; }
-    if (why == rp.WAD_MISMATCH) { ret "the host has a different version of\nthe game or the WAD. everyone needs\nthe same download."; }
+    if (why == rp.WAD_MISMATCH) { ret "the host has a different version of\nthe game or the WAD. everyone: play\nonline, update the game."; }
     if (why == rp.OLD_VERSION) { ret "the host has a different version of this game."; }
     if (why == rp.BUSY) { ret "the relay is busy; try again in a little while."; }
     ret "the game could not be joined.";

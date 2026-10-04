@@ -15,6 +15,8 @@
 #                     seats empty (default none: the hand-written bot)
 #   RELAY_FILL_SECONDS how long a public room waits before bots take its
 #                     empty seats (default 120; 0 for never)
+#   RELAY_SHY_ONE_IN  one game in this many that bots join has the shy bot
+#                     among them (default 10; 0 for never, 1 for always)
 #   RELAY_WATCH_FILE  the bot league's match to watch, as the arena leaves
 #                     it; read every five seconds and handed to games that
 #                     ask (default none)
@@ -274,6 +276,10 @@ fun main(argc: i64, argv: **u8) i64 {
     var fillwait:   i64 = 120;
     val fillenv:    str = setting("RELAY_FILL_SECONDS", ?fillbuf[0], 32);
     if (fillenv != nil) { fillwait = number(fillenv, 120); }
+    var shybuf: [32]u8;
+    var shyin:  i64 = 10;
+    val shyenv: str = setting("RELAY_SHY_ONE_IN", ?shybuf[0], 32);
+    if (shyenv != nil) { shyin = number(shyenv, 10); }
     var watchbuf:  [512]u8;
     val watchfile: str = setting("RELAY_WATCH_FILE", ?watchbuf[0], 512);
 
@@ -333,6 +339,7 @@ fun main(argc: i64, argv: **u8) i64 {
     r.maxrooms = maxrooms::i32;
     r.random   = random;
     r.fillwait = fillwait * 1000;
+    r.shyin    = shyin::i32;
 
     # the bots' room: too big for the stack
     var a:    allocator.Allocator;

@@ -47,6 +47,9 @@ cp "$here/site/start.sh" "$stage/usr/local/bin/start"
 cp "$here/data/DOOM1.WAD" "$here/fixtures/bot0.net" "$stage/srv/"
 cp "$here/site/hedge.toml" "$stage/srv/hedge.toml"
 cp "$here/site/league.html" "$stage/srv/site/"
+# for the game's own update: the program by itself, and its hash
+cp "$here/out/windows-x86_64/release/bin/doom.exe" "$stage/srv/site/doom.exe"
+sha256sum "$stage/srv/site/doom.exe" | cut -d' ' -f1 >"$stage/srv/site/doom.exe.sha256"
 cp "$here/site/shot.png" "$here/out/package/doom-in-mach.zip" "$here/out/package/source.zip" "$stage/srv/site/"
 
 zip="$here/out/package/doom-in-mach.zip"

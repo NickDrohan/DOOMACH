@@ -520,6 +520,26 @@ pub fun drop_console() {
     FreeConsole();
 }
 
+# ---------------------------------------------------------------- updating
+
+#[library("urlmon.dll")]
+ext fun URLDownloadToFileA(caller: ptr, url: *u8, file: *u8, reserved: u32, callback: ptr) i32;
+#[library("kernel32.dll")]
+ext fun WinExec(command: *u8, show: u32) u32;
+
+# fetch a URL into a file, by Windows' own means: its certificate checks
+# over https, its proxy settings
+# ---
+# ret: whether the whole of it came
+pub fun download(url: str, path: str) bool {
+    ret URLDownloadToFileA(nil, url, path, 0, nil) == 0;
+}
+
+# start a program, as a command line
+pub fun launch(command: str) bool {
+    ret WinExec(command, 5) > 31;
+}
+
 # a message in a box, for when there is no console to print to
 pub fun alert(text: str) {
     MessageBoxA(0, text, "Doom in Mach", 0x10);

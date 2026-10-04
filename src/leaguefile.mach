@@ -16,9 +16,20 @@ pub val NET:     i32 = 942;
 pub val HEAD:         i32 = 16;
 pub val MEMBER_BYTES: i32 = 12 * 4 + 942 * 2;
 pub val FILE_BYTES:   i32 = 16 + 100 * (12 * 4 + 942 * 2);
-# within a member: its kind, and where its net begins
-pub val AT_KIND: i32 = 0;
-pub val AT_NET:  i32 = 48;
+# within a member: its kind, its style, and where its net begins
+pub val AT_KIND:  i32 = 0;
+pub val AT_STYLE: i32 = 4;
+pub val AT_NET:   i32 = 48;
+
+# the style that fights with its fists alone
+pub val STYLE_BRAWLER: i32 = 10;
+
+# a bot as it is told to a game, by the relay or in a match to watch: 1 for
+# the hand-written bot or 2 for a net, plus its traits, as bot.mach has them
+pub val SEAT_SCRIPT: i32 = 1;
+pub val SEAT_NET:    i32 = 2;
+pub val TRAIT_FISTS: i32 = 0x100;
+pub val TRAIT_SHY:   i32 = 0x200;
 
 # a member's kind: one that learns, the hand-written bot, or noise
 pub val KIND_LEARNS: i32 = 0;

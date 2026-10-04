@@ -58,13 +58,14 @@ val MATCH: i32 = 4200;
 # the maps the bots can find each other on
 val MAPS: [7]i32 = [7]i32{1, 2, 3, 4, 7, 8, 9};
 
-val STYLES: i32 = 10;
-val STYLE_NAMES: [10]str = [10]str{
-    "Fragger", "Survivor", "Berserker", "Sniper", "Tourist", "Camper", "Dervish", "Pacifist", "Doorman", "Lemming"
+val STYLES: i32 = 11;
+val STYLE_NAMES: [11]str = [11]str{
+    "Fragger", "Survivor", "Berserker", "Sniper", "Tourist", "Camper", "Dervish", "Pacifist", "Doorman", "Lemming",
+    "Brawler"
 };
-# which style each bot in twenty has: eight fraggers, two each of the next
-# three, one each of the rest
-val STYLE_OF: [20]i32 = [20]i32{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9};
+# which style each bot in twenty has: seven fraggers, a brawler, two each of
+# the next three, one each of the rest
+val STYLE_OF: [20]i32 = [20]i32{0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9};
 
 # the chance of the higher rated by rating gap, in thousandths, every 25
 # points from 0 to 800
@@ -202,6 +203,9 @@ fun reward(style: i32, t: *Tally) i32 {
     if (style == 6) { ret t.turned / 3000; }
     if (style == 7) { ret 50 - t.shots / 5 - 5 * t.deaths; }
     if (style == 8) { ret t.uses; }
+    # a brawler wants frags as a fragger does, and has only its fists to
+    # get them with
+    if (style == lf.STYLE_BRAWLER) { ret 10 * t.frags - 3 * t.deaths - 5 * t.suicides; }
     ret 10 * t.suicides + 4 * t.deaths;
 }
 
@@ -277,6 +281,15 @@ fun settle(l: *League, picks: *i32, tally: *Tally) {
     l.matches = l.matches + 1;
 }
 
+# how a member plays: by the script or by its net, and with its fists alone
+# if it is a brawler
+fun kind_of(m: *Member) i32 {
+    var kind: i32 = bot.KIND_NET;
+    if (m.kind == KIND_SCRIPT)                             { kind = bot.KIND_SCRIPT; }
+    if (m.kind == KIND_LEARNS && m.style == lf.STYLE_BRAWLER) { kind = kind | bot.TRAIT_FISTS; }
+    ret kind;
+}
+
 # play one match between four members on a map; fill what each did, and,
 # for the replay, the seed each played with and the net it played by
 fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, seeds: *u32, nets: *i8) bool {
@@ -292,12 +305,7 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
             nets[i * NET + k] = used[k];
             k                 = k + 1;
         }
-        if (m.kind == KIND_SCRIPT) {
-            game.set_bot(s, i, bot.KIND_SCRIPT, nil, seeds[i]);
-        }
-        or {
-            game.set_bot(s, i, bot.KIND_NET, used, seeds[i]);
-        }
+        game.set_bot(s, i, kind_of(m), used, seeds[i]);
         var blank: Tally;
         tally[i] = blank;
         i        = i + 1;
@@ -493,6 +501,22 @@ fun load(l: *League, a: *allocator.Allocator, dir: str) bool {
         at = at + 2 * NET;
         i  = i + 1;
     }
+
+    # a league from before there were brawlers: the eighth of every twenty,
+    # a fragger till now, becomes one, keeping its net and its record
+    var brawlers: i32 = 0;
+    i = 0;
+    for (i < MEMBERS) {
+        if (l.members[i].style == lf.STYLE_BRAWLER) { brawlers = brawlers + 1; }
+        i = i + 1;
+    }
+    if (brawlers == 0) {
+        i = 0;
+        for (i < MEMBERS) {
+            if (i % 20 == 7 && l.members[i].kind == KIND_LEARNS) { l.members[i].style = lf.STYLE_BRAWLER; }
+            i = i + 1;
+        }
+    }
     ret 1;
 }
 
@@ -514,9 +538,7 @@ fun watchable(l: *League, dir: str, buf: *u8, picks: *i32, tally: *Tally, map: i
     var i: i32 = 0;
     for (i < 4) {
         val m: *Member = ?l.members[picks[i]];
-        var kind: i32 = bot.KIND_NET;
-        if (m.kind == KIND_SCRIPT) { kind = bot.KIND_SCRIPT; }
-        at = put32(buf, at, kind);
+        at = put32(buf, at, kind_of(m));
         at = put32(buf, at, seeds[i]:~i32);
         at = put32(buf, at, tally[i].frags);
         at = put32(buf, at, tally[i].deaths);

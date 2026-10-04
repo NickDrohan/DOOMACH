@@ -20,6 +20,7 @@
 use std.allocator;
 use std.allocator.page;
 use fs: std.filesystem;
+use io_error: std.io.error;
 use std.collections.vector.Vector;
 use std.print;
 use std.runtime;
@@ -39,6 +40,7 @@ use doom.defs;
 use doom.front;
 use doom.game;
 use doom.level;
+use doom.maputl;
 use doom.music;
 use doom.opl;
 use doom.net;
@@ -65,6 +67,14 @@ val EXIT_WINDOW: i64 = 6;
 # the relay a game started from the menu meets the others through, unless
 # --relay or DOOM_RELAY names another
 val DEFAULT_RELAY: str = "mach-doom-relay.fly.dev";
+
+# where the newest program is kept, unless DOOM_UPDATE_URL names another
+# place: doom.exe there, and doom.exe.sha256, its hash as 64 hex digits
+val UPDATE_URL: str = "https://mach-doom-relay.fly.dev";
+
+# the game was started by a double click, with no words after its name; an
+# update starts the new one the same way
+var byclick: bool;
 
 fun usage() i64 {
     print.eprintln("usage: doom wad <file>");
@@ -490,6 +500,9 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     var stalled:    bool = 0;
     var reported:   bool = 0;
     var lobby:      net.Lobby;
+    # an update asked for: a moment for the screen to say so, then done
+    var updating:   i32 = 0;
+    tidy_update();
     # watching the bot league: a match being fetched, or one being played
     # again, and how long it runs
     var fetch:     *net.Watch = nil;
@@ -541,6 +554,34 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
             front.to_title(?f);
             f.message = nil;
             cnt;
+        }
+
+        # the newest version: say so, draw that, then fetch it, which takes
+        # a moment during which nothing else happens
+        if (f.netrequest == front.NET_UPDATE) {
+            f.netrequest = 0;
+            if (n == nil) {
+                updating = 80;
+                front.notice(?f, "looking for a newer version...");
+            }
+        }
+        if (updating > 0) {
+            updating = updating - 1;
+            if (updating == 0) {
+                val did: i32 = update(?a, argv[2], 1);
+                if (did == UPDATE_STARTED) {
+                    f.quit = 1;
+                }
+                or (did == UPDATE_LATEST) {
+                    front.notice(?f, "this is the newest version.\n\n(press a key)");
+                }
+                or (did == UPDATE_NOREACH) {
+                    front.notice(?f, "the newest version could not be\nfetched. is this computer online?\n\n(press a key)");
+                }
+                or {
+                    front.notice(?f, "the update could not be put in\nplace. download the game again\nfrom the web page.\n\n(press a key)");
+                }
+            }
         }
 
         # the bot league, watched: fetch its last match from the relay, play
@@ -1127,9 +1168,7 @@ fun seat_bots(s: *game.Session, n: *net.Net) {
     var i:  i32 = 0;
     for (i < n.players) {
         if ((n.botmask & (1 << i)) != 0) {
-            var kind: i32 = bot.KIND_NET;
-            if (n.bots[i].kind == 1) { kind = bot.KIND_SCRIPT; }
-            game.set_bot(s, i, kind, ?n.bots[i].net[0], n.bots[i].seed);
+            game.set_bot(s, i, seat_kind(n.bots[i].kind), ?n.bots[i].net[0], n.bots[i].seed);
             # and say who they are, on this player's message line
             if (at == 0) {
                 at = append(?botline[0], 0, "with you: ");
@@ -1383,6 +1422,165 @@ fun game_hash(a: *allocator.Allocator, w: *wad.Wad) u64 {
         if (sel bytes.ok) { mine = first64(bytes.ok.data, bytes.ok.len); }
     }
     ret first64(w.data, w.len) ^ (mine * 0x9e3779b97f4a7c15);
+}
+
+# a file's SHA-256 as 64 hex digits and a zero; false if it cannot be read
+fun file_hash(a: *allocator.Allocator, path: str, out: *u8) bool {
+    val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel bytes.err) { ret 0; }
+    var digest: [32]u8;
+    sha256.hash(bytes.ok.data, bytes.ok.len, ?digest[0]);
+    val digits: str = "0123456789abcdef";
+    var k: i32 = 0;
+    for (k < 32) {
+        out[k * 2]     = digits[(digest[k] >> 4)::i32];
+        out[k * 2 + 1] = digits[(digest[k] & 15)::i32];
+        k              = k + 1;
+    }
+    out[64] = 0;
+    ret 1;
+}
+
+val UPDATE_LATEST:  i32 = 0;
+val UPDATE_STARTED: i32 = 1;
+val UPDATE_NOREACH: i32 = 2;
+val UPDATE_DAMAGED: i32 = 3;
+
+# Bring this program up to date. Ask where the newest is kept for its hash;
+# if it is this program's own, there is nothing to do. Otherwise fetch the
+# program beside this one, check what came against the hash, put it in this
+# one's place (a running program cannot be written over, but it can be
+# renamed), and start it. The caller should then quit.
+# ---
+# wad:   the WAD being played, for starting the new program on the same one
+# start: whether to start the new program, as the game does; the command
+#        line's update leaves that to whoever ran it
+# ret: UPDATE_LATEST, UPDATE_STARTED, or why not
+fun update(a: *allocator.Allocator, wad_path: str, start: bool) i32 {
+    var exe: [512]u8;
+    if (!win.exe_path(?exe[0])) { ret UPDATE_DAMAGED; }
+    var base:  [256]u8;
+    var other: [256]u8;
+    append(?base[0], 0, UPDATE_URL);
+    val place: res[opt[usize], env.EnvError] = env.get("DOOM_UPDATE_URL", ?other[0], 200);
+    if (sel place.ok) {
+        if (sel place.ok.some) { append(?base[0], 0, ?other[0]); }
+    }
+
+    # the time in every address, so that no cache answers with yesterday's
+    var url:  [512]u8;
+    var path: [600]u8;
+    var at:   i32 = append(?url[0], 0, ?base[0]);
+    at = append(?url[0], at, "/doom.exe.sha256?t=");
+    at = append_number(?url[0], at, win.micros_now());
+    at = append(?path[0], 0, ?exe[0]);
+    at = append(?path[0], at, ".latest");
+    if (!win.download(?url[0], ?path[0])) { ret UPDATE_NOREACH; }
+    val told: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    fs.remove_file(?path[0]);
+    if (sel told.err) { ret UPDATE_NOREACH; }
+    if (told.ok.len < 64) { ret UPDATE_NOREACH; }
+
+    var mine: [65]u8;
+    if (!file_hash(a, ?exe[0], ?mine[0])) { ret UPDATE_DAMAGED; }
+    var same: bool = 1;
+    var k:    i32  = 0;
+    for (k < 64) {
+        if (told.ok.data[k] != mine[k]) { same = 0; }
+        k = k + 1;
+    }
+    if (same) { ret UPDATE_LATEST; }
+
+    # the new program, beside this one, and checked
+    var fresh: [600]u8;
+    at = append(?fresh[0], 0, ?exe[0]);
+    at = append(?fresh[0], at, ".new");
+    at = append(?url[0], 0, ?base[0]);
+    at = append(?url[0], at, "/doom.exe?t=");
+    at = append_number(?url[0], at, win.micros_now());
+    if (!win.download(?url[0], ?fresh[0])) { ret UPDATE_NOREACH; }
+    var got: [65]u8;
+    if (!file_hash(a, ?fresh[0], ?got[0])) { ret UPDATE_DAMAGED; }
+    k = 0;
+    for (k < 64) {
+        if (told.ok.data[k] != got[k]) {
+            fs.remove_file(?fresh[0]);
+            ret UPDATE_DAMAGED;
+        }
+        k = k + 1;
+    }
+
+    # this one aside, the new one in its place
+    var old: [600]u8;
+    at = append(?old[0], 0, ?exe[0]);
+    at = append(?old[0], at, ".old");
+    fs.remove_file(?old[0]);
+    val aside: err[io_error.Error] = fs.rename(?exe[0], ?old[0]);
+    if (sel aside.err) { ret UPDATE_DAMAGED; }
+    val placed: err[io_error.Error] = fs.rename(?fresh[0], ?exe[0]);
+    if (sel placed.err) {
+        fs.rename(?old[0], ?exe[0]);
+        ret UPDATE_DAMAGED;
+    }
+
+    # and started: as this one was, by a click or on its WAD
+    if (!start) { ret UPDATE_STARTED; }
+    var command: [1200]u8;
+    at = join_text(?command[0], 0, "\"");
+    at = join_text(?command[0], at, ?exe[0]);
+    at = join_text(?command[0], at, "\"");
+    if (!byclick) {
+        at = join_text(?command[0], at, " play \"");
+        at = join_text(?command[0], at, wad_path);
+        at = join_text(?command[0], at, "\"");
+    }
+    if (!win.launch(?command[0])) { ret UPDATE_DAMAGED; }
+    ret UPDATE_STARTED;
+}
+
+# append without append's limit of a short line: for a command line
+fun join_text(buf: *u8, at: i32, text: str) i32 {
+    var k: i32 = 0;
+    for (text[k] != 0 && at + k < 1190) {
+        buf[at + k] = text[k];
+        k           = k + 1;
+    }
+    buf[at + k] = 0;
+    ret at + k;
+}
+
+# bring this program up to date from the command line, and say what was done
+#
+#   doom update
+fun update_command() i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val did: i32 = update(?a, "", 0);
+    if (did == UPDATE_LATEST) {
+        print.println("this is the newest version");
+        ret EXIT_OK;
+    }
+    if (did == UPDATE_STARTED) {
+        print.println("updated to the newest version");
+        ret EXIT_OK;
+    }
+    if (did == UPDATE_NOREACH) {
+        print.eprintln("doom: the newest version could not be fetched");
+        ret EXIT_MAP;
+    }
+    print.eprintln("doom: the update could not be put in place");
+    ret EXIT_WRITE;
+}
+
+# what an update left behind: the program it replaced
+fun tidy_update() {
+    var old: [600]u8;
+    if (!win.exe_path(?old[0])) { ret; }
+    var at: i32 = 0;
+    for (old[at] != 0) { at = at + 1; }
+    append(?old[at], 0, ".old");
+    fs.remove_file(?old[0]);
 }
 
 # a hash as six hex digits, for people to compare by eye
@@ -1768,12 +1966,65 @@ fun navdump(argv: **u8) i64 {
     ret EXIT_OK;
 }
 
+# how well the shy bot hides: a co-op game of a wanderer, standing in for a
+# person, and the shy bot, with no window. After three seconds to find its
+# place, each tic is counted: whether the wanderer could see the bot (within
+# the 45 degrees to either side that a view shows, and nothing between),
+# and whether the bot was near.
+#
+#   doom shy <file> <map 1-9> <tics>
+fun shy(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+
+    val s: *game.Session = coop_session(?a, ?w, ?d, 2, 0, number(argv[3], 1)::i32);
+    if (s == nil) { ret EXIT_MAP; }
+    game.set_bot(s, 1, bot.KIND_SCRIPT | bot.TRAIT_SHY, nil, 99);
+    # the wanderer must not be shot at while it is being hidden from
+    s.g.players[0].cheats = defs.CF_GODMODE;
+
+    var walker: Bot;
+    walker.seed = 17;
+    val tics:   i32 = number(argv[4], 2100)::i32;
+    var counted: i32 = 0;
+    var seen:    i32 = 0;
+    var near:    i32 = 0;
+    var tic:     i32 = 0;
+    for (tic < tics && !s.completed) {
+        var cmds: [4]defs.Ticcmd;
+        bot_ticcmd(?walker, tic, ?cmds[0]);
+        # the wanderer does not shoot, and leaves the level's exit alone
+        cmds[0].buttons = 0;
+        game.ticker_cmds(s, ?cmds[0]);
+        val person: *defs.Mobj = s.g.players[0].mo;
+        val hider:  *defs.Mobj = s.g.players[1].mo;
+        if (tic >= 105 && person != nil && hider != nil) {
+            counted = counted + 1;
+            val rel:  u32 = world.point_to_angle2(person.x, person.y, hider.x, hider.y) - person.angle;
+            val turn: i32 = (((rel >> 24)::i32) ^ 0x80) - 0x80;
+            if (turn > -32 && turn < 32 && maputl.check_sight(?s.g, person, hider)) { seen = seen + 1; }
+            if (maputl.aprox_distance(hider.x - person.x, hider.y - person.y) >> 16 < 200) { near = near + 1; }
+        }
+        tic = tic + 1;
+    }
+    print.printlnf("shy bot: seen on {} of {} tics, within 200 units on {}", seen, counted, near);
+    ret EXIT_OK;
+}
+
 # a deathmatch between four bots with no window: two machines' worth of
 # game in one process, compared every tic, since a bot is part of the
 # simulation and must decide the same on every machine. Prints each bot's
 # frags and deaths.
 #
 #   doom botmatch <file> <map 1-9> <tics> [<out.ppm> [trace]]
+#   doom botmatch <file> <map 1-9> <tics> [<net file>] fists
 #
 # With a last word, each bot's place and what it senses and decides is
 # printed every ten seconds, for finding out why bots do what they do.
@@ -1807,24 +2058,61 @@ fun botmatch(argc: i64, argv: **u8) i64 {
         print.eprintln("doom: the map could not be loaded");
         ret EXIT_MAP;
     }
+    # the hand-written bot, or, with a net's file before "fists", that net
+    var kind:    i32 = bot.KIND_SCRIPT;
+    var weights: *i8 = nil;
+    if (argc == 7 && str_equals(argv[6], "fists")) {
+        val file: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, argv[5]);
+        if (sel file.err) {
+            print.eprintln("doom: the net could not be read");
+            ret EXIT_DATA;
+        }
+        if (file.ok.len != bot.NETSIZE::usize) {
+            print.eprintln("doom: that is not a net: it should be 942 bytes");
+            ret EXIT_DATA;
+        }
+        kind    = bot.KIND_NET;
+        weights = file.ok.data:~*i8;
+    }
     var i: i32 = 0;
     for (i < 4) {
-        game.set_bot(one, i, bot.KIND_SCRIPT, nil, (i * 7919 + 17)::u32);
-        game.set_bot(two, i, bot.KIND_SCRIPT, nil, (i * 7919 + 17)::u32);
+        game.set_bot(one, i, kind, weights, (i * 7919 + 17)::u32);
+        game.set_bot(two, i, kind, weights, (i * 7919 + 17)::u32);
         i = i + 1;
     }
 
+    val fists: bool = str_equals(argv[argc - 1], "fists");
     val began: i64 = win.micros_now();
     var cmds:  [4]defs.Ticcmd;
     var tic:   i32 = 0;
     for (tic < tics && !one.completed) {
+        # with "fists" as the last word, nobody has anything but their
+        # fists, in both games alike: for seeing how bots fight hand to hand
+        if (fists) {
+            var q: i32 = 0;
+            for (q < 4) {
+                var k: i32 = 0;
+                for (k < defs.NUMAMMO) {
+                    one.g.players[q].ammo[k] = 0;
+                    two.g.players[q].ammo[k] = 0;
+                    k                        = k + 1;
+                }
+                k = 1;
+                for (k < 9) {
+                    one.g.players[q].weaponowned[k] = 0;
+                    two.g.players[q].weaponowned[k] = 0;
+                    k                               = k + 1;
+                }
+                q = q + 1;
+            }
+        }
         game.ticker_cmds(one, ?cmds[0]);
         game.ticker_cmds(two, ?cmds[0]);
         if (game.checksum(one) != game.checksum(two)) {
             print.printlnf("diverged at tic {}", tic);
             ret EXIT_MAP;
         }
-        if (argc == 7 && tic % 350 == 0) {
+        if (argc == 7 && !fists && tic % 350 == 0) {
             var q: i32 = 0;
             for (q < 4) {
                 val mo: *defs.Mobj = one.g.players[q].mo;
@@ -1837,7 +2125,7 @@ fun botmatch(argc: i64, argv: **u8) i64 {
     }
     val took: i64 = win.micros_now() - began;
 
-    if (argc >= 6) {
+    if (argc >= 6 && !fists) {
         val ready: res[*render.Renderer, render.RenderError] = render.make(?a, ?d, one.g.lv);
         if (sel ready.ok) {
             val r: *render.Renderer = ready.ok;
@@ -1859,7 +2147,7 @@ fun botmatch(argc: i64, argv: **u8) i64 {
             }
             k = k + 1;
         }
-        print.printlnf("bot {} frags {} deaths {} suicides {} shots {} health {}", i + 1, frags, deaths, p.frags[i], one.bots[i].shots, p.health);
+        print.printlnf("bot {} frags {} deaths {} suicides {} shots {} uses {} health {}", i + 1, frags, deaths, p.frags[i], one.bots[i].shots, one.bots[i].uses, p.health);
         i = i + 1;
     }
     print.eprintlnf("{} tics of two games in {} ms", tic, took / 1000);
@@ -2125,6 +2413,12 @@ fun netplay(argc: i64, argv: **u8) i64 {
         ret EXIT_MAP;
     }
     seat_bots(s, n);
+    # who the bots are, for a test to read
+    var seat: i32 = 0;
+    for (seat < n.players) {
+        if ((n.botmask & (1 << seat)) != 0) { print.printlnf("seat {} is {}", seat + 1, ?n.bots[seat].name[0]); }
+        seat = seat + 1;
+    }
 
     var bot: Bot;
     bot.seed = (n.me * 7919 + 17)::u32;
@@ -2249,6 +2543,14 @@ fun netplay(argc: i64, argv: **u8) i64 {
     ret EXIT_OK;
 }
 
+# a bot as it is told to a game (the relay's seat, a match to watch): the
+# hand-written one if its low byte is 1, a net otherwise, with its traits
+fun seat_kind(told: i32) i32 {
+    var kind: i32 = bot.KIND_NET;
+    if ((told & 0xff) == bot.KIND_SCRIPT) { kind = bot.KIND_SCRIPT; }
+    ret kind | (told & (bot.TRAIT_FISTS | bot.TRAIT_SHY));
+}
+
 fun get32(p: *u8, at: i32) u32 {
     ret p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24);
 }
@@ -2268,9 +2570,7 @@ fun watch_setup(s: *game.Session, data: *u8, view: i32) i32 {
     var i: i32 = 0;
     for (i < 4) {
         val at: i32 = 16 + i * 986;
-        var kind: i32 = bot.KIND_NET;
-        if (get32(data, at) == bot.KIND_SCRIPT::u32) { kind = bot.KIND_SCRIPT; }
-        game.set_bot(s, i, kind, (?data[at + 44]):~*i8, get32(data, at + 4));
+        game.set_bot(s, i, seat_kind(get32(data, at):~i32), (?data[at + 44]):~*i8, get32(data, at + 4));
         i = i + 1;
     }
     ret tics;
@@ -2415,6 +2715,7 @@ fun rooms(argv: **u8) i64 {
 # started by a double click: play with the DOOM1.WAD in the same folder,
 # and say in a box what is wrong if it cannot
 fun clicked() i64 {
+    byclick = 1;
     win.drop_console();
     var path: [512]u8;
     if (!win.beside_exe("DOOM1.WAD", ?path[0])) {
@@ -2441,11 +2742,13 @@ fun clicked() i64 {
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     if (argc == 1 && win.started_by_click())                                  { ret clicked(); }
+    if (argc == 2 && str_equals(argv[1], "update"))                           { ret update_command(); }
     if (argc == 3 && str_equals(argv[1], "wad"))                              { ret list(argv[2]); }
     if (argc == 4 && str_equals(argv[1], "map"))                              { ret dump(argv[2], argv[3]); }
     if ((argc == 5 || argc == 8) && str_equals(argv[1], "frame"))             { ret frame(argc, argv); }
     if (argc >= 6 && str_equals(argv[1], "netplay"))                          { ret netplay(argc, argv); }
     if (argc >= 6 && str_equals(argv[1], "coop"))                             { ret coop(argc, argv); }
+    if (argc == 5 && str_equals(argv[1], "shy"))                              { ret shy(argv); }
     if (argc == 5 && str_equals(argv[1], "navdump"))                          { ret navdump(argv); }
     if (argc == 5 && str_equals(argv[1], "botdata"))                          { ret botdata(argv); }
     if (argc == 6 && str_equals(argv[1], "netmatch"))                         { ret netmatch(argv); }

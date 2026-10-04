@@ -49,6 +49,7 @@ val COOP_PUBLIC: i32 = 4;
 val COOP_FIND:   i32 = 5;
 val COOP_CODE:   i32 = 6;
 val COOP_WATCH:  i32 = 7;
+val COOP_UPDATE: i32 = 8;
 
 # what the list of open games is waiting on
 pub val LIST_ASKING:  i32 = 0;
@@ -195,6 +196,8 @@ pub val NET_HOST: i32 = 1;
 pub val NET_JOIN: i32 = 2;
 # not a game to play: a match of the bot league, fetched and watched
 pub val NET_WATCH: i32 = 3;
+# nor this: fetch the newest version of the program and start it
+pub val NET_UPDATE: i32 = 4;
 
 fun sfx(s: *game.Session, effect: i32) {
     defs.sound(?s.g, nil, effect);
@@ -326,7 +329,7 @@ fun start_message(f: *Front, text: str, yn: bool, ask: i32) {
 
 fun items_in(menu: i32) i32 {
     if (menu == MENU_MAIN)    { ret 7; }
-    if (menu == MENU_COOP)    { ret 8; }
+    if (menu == MENU_COOP)    { ret 9; }
     if (menu == MENU_EPISODE) { ret 3; }
     if (menu == MENU_SKILL)   { ret 5; }
     if (menu == MENU_OPTIONS) { ret 3; }
@@ -444,6 +447,10 @@ fun choose(f: *Front, s: *game.Session) {
         or (item == COOP_WATCH) {
             f.menuactive = 0;
             f.netrequest = NET_WATCH;
+        }
+        or (item == COOP_UPDATE) {
+            f.menuactive = 0;
+            f.netrequest = NET_UPDATE;
         }
         or {
             f.codelen = 0;
@@ -677,9 +684,9 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
     }
     or (f.menu == MENU_COOP) {
         x = 72;
-        y = 34;
-        video.shade(d, screen, 16, 10, 288, 180, 26);
-        centred(d, screen, 18, "PLAY ONLINE");
+        y = 28;
+        video.shade(d, screen, 16, 6, 288, 186, 26);
+        centred(d, screen, 13, "PLAY ONLINE");
         video.write_text(d, screen, x, y + 4, "HOST A GAME FOR 2", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT + 4, "HOST A GAME FOR 3", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT * 2 + 4, "HOST A GAME FOR 4", -1);
@@ -698,13 +705,14 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         video.write_text(d, screen, x, y + LINEHEIGHT * 5 + 4, "FIND AN OPEN GAME", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT * 6 + 4, "JOIN WITH A ROOM CODE", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT * 7 + 4, "WATCH THE BOT LEAGUE", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 8 + 4, "UPDATE THE GAME", -1);
         var line: [20]u8 = [20]u8{'T', 'H', 'I', 'S', ' ', 'C', 'O', 'P', 'Y', ':', ' ', ' ', 0, 0, 0, 0, 0, 0, 0, 0};
         var k:    i32    = 0;
         for (k < 6 && f.build[k] != 0) {
             line[12 + k] = f.build[k];
             k            = k + 1;
         }
-        if (k > 0) { centred(d, screen, 174, ?line[0]); }
+        if (k > 0) { centred(d, screen, 178, ?line[0]); }
     }
     or (f.menu == MENU_LIST) {
         x = 56;

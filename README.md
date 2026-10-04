@@ -137,6 +137,15 @@ each datagram to the player it names. It runs on Fly.io beside the download page
 [hedge](https://github.com/briar-systems/hedge), a web server written in Mach, serves; the
 protocol and how to deploy both are in [RELAY.md](RELAY.md).
 
+## Updating itself
+
+"Update the game" on the Play online menu (or `doom update`) asks the site for the hash of the
+newest `doom.exe`; if it is not this program's own, it fetches the program over https with
+Windows' own downloader, checks it against the hash, renames the running program aside (a
+running program cannot be written over, but it can be renamed), puts the new one in its place
+and starts it. `deploy.sh` publishes `doom.exe` and `doom.exe.sha256` beside the download.
+`DOOM_UPDATE_URL` names another place to look, which is how the gates test it.
+
 ## Bots and their league
 
 Deathmatch, and players the simulation plays itself: a hand-written bot, and 942-byte neural

@@ -61,6 +61,44 @@ runs it, in integers, on decisions held out: fire agrees 97% of the time, turn i
 127 on average. That net is `fixtures/bot0.net`, and it fights about half as well as its
 teacher: in seven matches of two nets against two scripts it took 19 frags to their 36.
 
+### Reflexes
+
+Three things every bot does whatever decided, script or net, because a net that never learned
+them plays like a fool, and no reward in the league teaches them quickly:
+
+- **Use is pressed only at something to use**: when what stops the way straight ahead is a line
+  that does something (a shut door, a switch, a lift) and is within use's reach of 64 units.
+- **And then not again for five seconds.** A bot at a door decided to press use nine times a
+  second, and a door used while it opens shuts again: about a thousand presses a match, and
+  bots stuck at doors opening and shutting. With both rules it is five to twenty-five, and the
+  seven maps' matches went from 106 frags to 125. (Two and three seconds were tried: 118 and
+  111.)
+- **Fists reach only as far as an arm.** With nothing but fists or the saw and an enemy in
+  sight, a bot runs straight at it and swings only when it is within reach and in front. Four
+  of the first net with fists alone took no frags on any map and spent thousands of tics
+  punching the air; with the rule, eleven on E1M1 and five on E1M8.
+
+`doom botmatch <wad> <map> <tics> [<net file>] fists` is the hand-to-hand test.
+
+### Traits
+
+A bot's kind (script or net) can carry a trait, which travels with it wherever a bot is
+described: in the league's matches, in a match to watch, in a seat the relay fills.
+
+- **A brawler** fights with its fists and nothing else. Whatever it picks up it puts away
+  again, and it does not fire until its fists are out; the reflex above does the rest. Five of
+  the league's hundred are brawlers, a style of their own. (A league from before there were
+  brawlers has the eighth of every twenty of its members made one when it is loaded, keeping
+  its net and its record.)
+- **The shy bot** is in no league. It does not fight. It finds the nearest person and stays
+  about a hundred units behind them, facing their back; when they turn far enough to see it, it
+  runs flat out round the side it is already on to get behind them again, following through
+  doors as any bot does. It is seated only in games people are in, and rarely: in one game in
+  ten that bots join (`RELAY_SHY_ONE_IN`), one of the bots is the shy bot. `doom shy` measures
+  it with a wanderer standing in for the person: over two minutes it is seen on between one
+  tic in two hundred and one in twenty-five, depending on the map, and is within 200 units for
+  half the time or more.
+
 ## The league
 
 `src/arena.mach` is the league: one process, no window, no network.
@@ -78,7 +116,7 @@ teacher: in seven matches of two nets against two scripts it took 19 frags to th
 
 | style | wants | of 100 |
 | --- | --- | --- |
-| Fragger | frags, and not to die | 40 |
+| Fragger | frags, and not to die | 35 |
 | Survivor | not to die | 10 |
 | Berserker | frags, and to be shooting | 10 |
 | Sniper | frags for few shots | 10 |
@@ -88,6 +126,7 @@ teacher: in seven matches of two nets against two scripts it took 19 frags to th
 | Pacifist | never to fire | 5 |
 | Doorman | to press use on everything | 5 |
 | Lemming | to die | 5 |
+| Brawler | frags, with its fists and nothing else | 5 |
 
 Rating and reward are deliberately different things. A Lemming that learns to die faster is
 succeeding by its own lights while it sinks down the table, which is where the comically bad

@@ -230,6 +230,24 @@ same "four bots' deathmatches on E1M1 and E1M8 go as pinned (debug)" "$work/botm
 same "and in release" "$work/botmatch.release" "$here/fixtures/botmatch.expected"
 bots_fight() { awk '/^bot/ { frags += $4 } END { exit !(frags >= 10) }' "$here/fixtures/botmatch.expected"; }
 gate "the pinned matches are fights: ten frags or more between them" 0 bots_fight
+# Reflexes every bot has. Use is pressed at a door or a switch within reach,
+# and then not again for five seconds: once, bots pressed it nine times a
+# second at any wall, a thousand times a match, and doors opened, shut and
+# opened again in front of them. And a bot with only its fists runs at its
+# enemy and swings when it is within reach: four of the first net, with
+# fists alone, once took no frags at all and punched the air.
+bots_spare_doors() { awk '/^bot/ { uses += $12 } END { exit !(uses > 0 && uses < 80) }' "$here/fixtures/botmatch.expected"; }
+gate "in the pinned matches the bots press use fewer than eighty times" 0 bots_spare_doors
+"$release" botmatch "$wad" 1 6300 "$here/fixtures/bot0.net" fists >"$work/fists.out" 2>/dev/null
+fists_land() { awk '/^bot/ { frags += $4 } END { exit !(frags >= 3) }' "$work/fists.out"; }
+gate "four nets with only their fists take frags off each other" 0 fists_land
+
+# The shy bot stays behind the nearest person and out of their sight. With a
+# wanderer standing in for the person, over two minutes on E1M1: seen on
+# fewer than one tic in ten, and within 200 units on more than three in ten.
+"$release" shy "$wad" 1 4200 >"$work/shy.out" 2>/dev/null
+shy_hides() { awk '/^shy bot:/ { exit !($5 * 10 < $7 && $13 * 10 > $7 * 3) }' "$work/shy.out"; }
+gate "the shy bot keeps out of sight, and near" 0 shy_hides
 
 # The net every bot begins as must fight: two of it against two of the
 # hand-written bot it imitates, on the open map, taking frags of its own.
@@ -317,6 +335,57 @@ if [[ -f "$work/league/league.bin" ]]; then
     dm_played() { grep -q "^end tic 2100 .* map E1M8 .* p3 health " "$1"; }
     gate "two people and a league bot play a deathmatch for a minute" 0 dm_played "$work/dm.1.end"
     same "and both machines end on the same world" "$work/dm.1.end" "$work/dm.2.end"
+fi
+
+# The shy bot is seated by the relay, now and then, in a game bots join; with
+# the chance set to always, it is there, named, and the game stays in step.
+if [[ -f "$work/league/league.bin" ]]; then
+    RELAY_SHY_ONE_IN=1 RELAY_LEAGUE_FILE="$(cygpath -m "$work/league/league.bin" 2>/dev/null || echo "$work/league/league.bin")" "$here/out/windows-x86_64/release/bin/relay.exe" 5149 >"$work/relay7.log" 2>&1 &
+    shyrelay=$!
+    sleep 1.5
+    "$release" netplay "$wad" host 3 1 700 0 "relay=127.0.0.1:5149" fill >"$work/shy.1" 2>&1 &
+    shypid=$!
+    shycode=""
+    for k in $(seq 1 40); do
+        shycode="$(awk '/^room / {print $2}' "$work/shy.1")"
+        [[ -n "$shycode" ]] && break
+        sleep 0.25
+    done
+    "$release" netplay "$wad" join "$shycode" 700 0 "relay=127.0.0.1:5149" >"$work/shy.2" 2>&1
+    wait "$shypid"
+    kill "$shyrelay" 2>/dev/null
+    wait "$shyrelay" 2>/dev/null
+    gate "the relay seats the shy bot when told to always" 0 grep -q "^seat 3 is Shy Bot" "$work/shy.1"
+    tail -1 "$work/shy.1" >"$work/shy.1.end"
+    tail -1 "$work/shy.2" >"$work/shy.2.end"
+    same "and both machines stay in step with it" "$work/shy.1.end" "$work/shy.2.end"
+fi
+
+# Updating. A copy of the release build, told that the newest program is
+# kept at a server here that offers the debug build and its hash, must
+# replace itself with exactly that, leave nothing else behind, and then,
+# asked again, find itself the newest. Offered a program that does not match
+# its hash, it must keep what it has.
+if [[ -n "$python" ]]; then
+    mkdir -p "$work/update/site" "$work/update/game"
+    cp "$debug" "$work/update/site/doom.exe"
+    (cd "$work/update/site" && sha256sum doom.exe | cut -d' ' -f1 >doom.exe.sha256)
+    cp "$release" "$work/update/game/doom.exe"
+    (cd "$work/update/site" && exec "$python" -m http.server 5150 --bind 127.0.0.1 >/dev/null 2>&1) &
+    webpid=$!
+    sleep 1.5
+    gate "a copy of the game updates itself" 0 env DOOM_UPDATE_URL=http://127.0.0.1:5150 "$work/update/game/doom.exe" update
+    same "to exactly the program offered" "$work/update/game/doom.exe" "$work/update/site/doom.exe"
+    only_two() { [[ "$(ls "$work/update/game" | wc -l)" -le 2 ]]; }
+    gate "leaving only itself and the program it replaced" 0 only_two
+    DOOM_UPDATE_URL=http://127.0.0.1:5150 "$work/update/game/doom.exe" update >"$work/update/again.out" 2>&1
+    gate "and, asked again, finds itself the newest" 0 grep -q "this is the newest version" "$work/update/again.out"
+    echo "0000000000000000000000000000000000000000000000000000000000000000" >"$work/update/site/doom.exe.sha256"
+    cp "$work/update/game/doom.exe" "$work/update/before.exe"
+    gate "a program that does not match its hash is refused" 5 env DOOM_UPDATE_URL=http://127.0.0.1:5150 "$work/update/game/doom.exe" update
+    same "and the game keeps the program it had" "$work/update/game/doom.exe" "$work/update/before.exe"
+    kill "$webpid" 2>/dev/null
+    wait "$webpid" 2>/dev/null
 fi
 
 # Watching the league. The arena leaves its last match as a recipe: the map
