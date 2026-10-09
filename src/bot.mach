@@ -280,6 +280,18 @@ fun feeling(b: *Bot, seat: i32, other: i32) i32 {
     ret (bits - 1) * 2;
 }
 
+# In a deathmatch a feeling this low is hatred: the bot hunts that player,
+# wherever they are, before anyone nearer.
+val HUNTED: i32 = 25;
+
+# how a bot feels about an opponent in a deathmatch: never better than 50,
+# whatever is written, for there are no friends there
+fun dislike(g: *Game, b: *Bot, seat: i32, other: i32) i32 {
+    val felt: i32 = feeling(b, seat, other);
+    if (felt > 50) { ret 50; }
+    ret felt;
+}
+
 # how a bot regards another player: as it feels, but a person in co-op is
 # always a friend, whatever any bot has come to feel about anyone
 fun regard(g: *Game, b: *Bot, seat: i32, other: i32) i32 {
@@ -310,11 +322,12 @@ fun by_a_person(g: *Game, x: Fixed, y: Fixed) bool {
 }
 
 # the nearest living thing a bot should fight that it can see: the other
-# players in a deathmatch, the monsters otherwise. In a deathmatch near is
-# as it feels: an enemy seems half as far off as it is, a friend half as far
-# again, so a bot goes for those it has a grudge against and leaves its
-# friends for last; and a real friend it will not fight at all, unless the
-# friend has just shot it.
+# players in a deathmatch, the monsters otherwise. There are no friends in
+# a deathmatch, only enemies, and some more than others: near is as it
+# feels, so that the less a bot likes another the nearer it seems, down to
+# half as far for one it merely dislikes; and one it has come to hate (see
+# HUNTED) seems a tenth as far, which is to say that if it can see that one
+# it shoots at that one.
 fun find_enemy(g: *Game, me: *Mobj, b: *Bot, seat: i32) *Mobj {
     var best:     *Mobj = nil;
     var bestdist: i32   = 0x7fffffff;
@@ -324,12 +337,9 @@ fun find_enemy(g: *Game, me: *Mobj, b: *Bot, seat: i32) *Mobj {
         for (i < defs.MAXPLAYERS) {
             val o: *Mobj = g.players[i].mo;
             if (g.playeringame[i] && o != nil && o != me && o.health > 0) {
-                val felt: i32 = regard(g, b, seat, i);
-                if (felt >= 85 && !(g.players[seat].damagecount > 0 && g.players[seat].attacker == o)) {
-                    i = i + 1;
-                    cnt;
-                }
-                val d: i32 = distance(me, o.x, o.y) * (50 + felt) / 100;
+                val felt: i32 = dislike(g, b, seat, i);
+                var d:    i32 = distance(me, o.x, o.y) * (50 + felt) / 100;
+                if (felt < HUNTED) { d = d / 5; }
                 if (d < bestdist && maputl.check_sight(g, me, o)) {
                     best     = o;
                     bestdist = d;
@@ -1044,8 +1054,10 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     val have: i32 = keys_of(?g.players[playernum]);
     walkhave = have;
 
-    # whom to make for: in a deathmatch the nearest opponent; in co-op the
-    # nearest person, to follow, or failing a person the nearest bot
+    # whom to make for: in a deathmatch the nearest opponent, unless there
+    # is one it hates, and then that one however far (the most hated, if
+    # there are several); in co-op the nearest person, to follow, or failing
+    # a person the nearest bot
     var target:   *Mobj = nil;
     var bestdist: i32   = 0x7fffffff;
     var person:   bool  = 0;
@@ -1058,7 +1070,9 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
         val o: *Mobj = g.players[i].mo;
         if (i != playernum && g.playeringame[i] && !g.isbot[i]) { anyone = 1; }
         if (i != playernum && g.playeringame[i] && o != nil && o.health > 0) {
-            val dist:   i32  = distance(me, o.x, o.y);
+            var dist:   i32  = distance(me, o.x, o.y);
+            # the hunted come before everyone, the most hated first
+            if (!follows && dislike(g, b, playernum, i) < HUNTED) { dist = dislike(g, b, playernum, i) - 100; }
             val better: bool = follows && !g.isbot[i] && !person;
             if (better || (dist < bestdist && (!follows || person == !g.isbot[i]))) {
                 target   = o;

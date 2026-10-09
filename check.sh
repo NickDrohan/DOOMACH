@@ -250,6 +250,18 @@ blood_is_drawn() { [[ "$(grep -c '^announcer: first blood 1 ' "$here/fixtures/bo
 gate "the announcer calls first blood once in each pinned match" 0 blood_is_drawn
 bots_fight() { awk '/^bot/ { frags += $4 } END { exit !(frags >= 10) }' "$here/fixtures/botmatch.expected"; }
 gate "the pinned matches are fights: ten frags or more between them" 0 bots_fight
+# Hatred. In a deathmatch a bot that hates another hunts it: over four
+# minutes on each of the seven maps, a bot that hates the fourth kills the
+# fourth more often than the same bot does in the same matches hating
+# nobody, and the fourth is a bigger share of all it kills.
+hunted() { for m in 1 2 3 4 7 8 9; do "$release" botmatch "$wad" "$m" 8400 "$1" 2>/dev/null | grep "^bot 1 killed"; done | awk '{ all += $6 + $10 + $13; it += $13 } END { print it, all }'; }
+hunts() {
+    read -r even_it even_all <<<"$(hunted even)"
+    read -r hunt_it hunt_all <<<"$(hunted hunt)"
+    (( hunt_it > even_it && hunt_it * even_all > even_it * hunt_all ))
+}
+gate "a bot that hates another in a deathmatch hunts it" 0 hunts
+
 # Reflexes every bot has. Use is pressed at a door or a switch within reach,
 # and then not again for five seconds: once, bots pressed it nine times a
 # second at any wall, a thousand times a match, and doors opened, shut and
@@ -408,6 +420,25 @@ if [[ -n "$python" ]]; then
     wait "$webpid" 2>/dev/null
 fi
 
+# The arena gives back what each level took. Once it did not, grew by sixty
+# thousand bytes a match, and on the server was killed for want of memory
+# every few hours. Over twenty seconds of matches as fast as they go, which
+# is some hundreds of them, it may grow by no more than four megabytes.
+if command -v powershell >/dev/null 2>&1; then
+    mkdir -p "$work/steady"
+    ARENA_DUTY=100 "$arena_exe" "$wad" "$here/fixtures/bot0.net" "$work/steady" 100000 >/dev/null 2>&1 &
+    steady=$!
+    megabytes() { powershell -NoProfile -Command "[int]((Get-Process -Id $(cat /proc/$steady/winpid)).PrivateMemorySize64 / 1MB)" | tr -d ''; }
+    sleep 6
+    early="$(megabytes)"
+    sleep 20
+    late="$(megabytes)"
+    kill "$steady" 2>/dev/null
+    wait "$steady" 2>/dev/null
+    steady_ok() { [[ -n "$early" && -n "$late" ]] && (( late - early <= 4 )); }
+    gate "the arena does not grow as it plays ($early MB, then $late MB)" 0 steady_ok
+fi
+
 # The co-op league: the same arena, told "coop", plays teams of four against
 # the levels on Nightmare and keeps other files. Six matches, each played
 # again with mutants, which is how that league learns; its
@@ -449,8 +480,9 @@ assert sorted(collections.Counter(b["quirk"] for b in bots).values()) == [20] * 
 f = open(sys.argv[2], "rb").read()
 assert len(f) == 10000 and all(v <= 100 for v in f)
 moved = [v for v in f if v != 50]
-assert moved and all(38 <= v <= 62 for v in moved), (len(moved), min(f), max(f))
-assert any("friend" in b for b in bots) and any("enemy" in b for b in bots)
+# a deathmatch has no friends: there, a feeling only ever falls
+assert moved and all(38 <= v < 50 for v in moved), (len(moved), min(f), max(f))
+assert any("enemy" in b for b in bots) and not any("friend" in b for b in bots)
 PY
     }
     gate "every bot has a quirk, and feelings that move slowly" 0 feels_ok

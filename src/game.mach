@@ -206,6 +206,8 @@ fun load_level(s: *Session) bool {
     name[1] = ('0' + g.gameepisode)::u8;
     name[3] = ('0' + g.gamemap)::u8;
 
+    # the level before this one gives its tables back
+    level.free(s.a, ?s.lvl);
     val built: res[level.Level, level.LevelError] = level.load(s.a, s.w, ?name[0]);
     if (sel built.err) {
         s.broken = 1;

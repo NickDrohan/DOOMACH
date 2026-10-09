@@ -13,13 +13,13 @@
 # allows within a share of it (ARENA_DUTY, a percentage, 5 unless set).
 #
 # Every bot is rated the same way, by who outscored whom (Elo). But each
-# learns by its own lights: it has a style, a reward of its own, and
-# alternates six games as it is with six as a mutated copy of itself,
-# keeping the copy if the copy earned more of that reward. Most styles want
-# frags, in different ways; some want to spin, to open doors, never to fire,
-# or to die, and get comically bad at winning while getting good at what
-# they want. Two never learn: the hand-written bot itself, and a net of
-# noise.
+# learns by its own lights: it has a style, a reward of its own, and after
+# each match the match is played again with a mutated copy of the bot in
+# its place, which takes its place for good if it earned clearly more of
+# that reward (see relive). Most styles want frags, in different ways, and
+# shots that hit; some want to spin, to open doors, never to fire, or to
+# die, and get comically bad at winning while getting good at what they
+# want. Two never learn: the hand-written bot itself, and a net of noise.
 #
 # The directory holds league.bin, the whole league, rewritten every minute
 # and read back at the start, so the league outlives the process;
@@ -42,14 +42,12 @@
 # and they move slowly: after each match a bot comes to like one of the
 # three it played with a little more and one a little less, by what
 # happened (see befriend). Feelings go into the next match with the bots:
-# in a deathmatch a bot goes for those it dislikes first and will not fight
-# a real friend; in co-op a loyal bot stays by its friend, and a bot takes no
-# care not to shoot one it has come to hate. And every bot has a quirk, by
+# in a deathmatch, where there are no friends and feelings only fall, a bot
+# goes for those it dislikes first and hunts down one it hates; in co-op a
+# loyal bot stays by its friend, and a bot takes no care not to shoot one it
+# has come to hate. And every bot has a quirk, by
 # its place in the league: cautious, reckless, loyal, grudge-bearing, or
 # none (bot.mach). Feelings are kept in feel.bin (coopfeel.bin).
-#
-# The co-op league learns from its matches another way than by blocks of
-# six, which could not tell a better net from a luckier draw: see relive.
 #
 # The co-op league's four are a team on Nightmare: the monsters fast and
 # coming back. The bots play the level through (bot.mach): into every
@@ -638,8 +636,9 @@ fun kind_for(l: *League, picks: *i32, seat: i32) i32 {
 # (in a deathmatch a kill counts five hits; in co-op it is a team-mate's
 # stray shots); if nobody hurt it, in co-op, the one who did least for the
 # team. The one liked more, in co-op, is whoever did most for the team; in
-# a deathmatch, whoever of the others left it most alone, if anyone hurt it
-# at all. One point each way, three for a bot that bears grudges.
+# a deathmatch, nobody: there are no friends there, only enemies, and a
+# feeling in that league only ever goes down. One point, three for a bot
+# that bears grudges.
 fun befriend(picks: *i32, tally: *Tally) {
     var i: i32 = 0;
     for (i < 4) {
@@ -657,9 +656,7 @@ fun befriend(picks: *i32, tally: *Tally) {
                     if (enemy < 0 && (friend < 0 || tally[j].score > tally[friend].score)) { friend = j; }
                     if (enemy >= 0 && (friend < 0 || tally[j].score > tally[friend].score)) { friend = j; }
                 }
-                or (enemy >= 0 && (friend < 0 || harm[i * 4 + j] < harm[i * 4 + friend])) {
-                    friend = j;
-                }
+
             }
             j = j + 1;
         }
@@ -1134,6 +1131,8 @@ fun load_feel(a: *allocator.Allocator, dir: str) {
     i = 0;
     for (i < MEMBERS * MEMBERS) {
         if (bytes.ok.data[i] <= 100) { feel[i] = bytes.ok.data[i]; }
+        # no deathmatch bot likes another, whatever a file from before says
+        if (!coop && feel[i] > 50) { feel[i] = 50; }
         i = i + 1;
     }
 }

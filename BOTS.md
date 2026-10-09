@@ -108,25 +108,29 @@ described: in the league's matches, in a match to watch, in a seat the relay fil
 - **Matches.** Four members drawn at random, one of seven maps (E1M5 and E1M6 are left out: the
   bots do not yet find each other on them), two minutes of deathmatch with items coming back
   and no monsters.
-- **Rating.** The same for everyone: Elo, from who outscored whom (frags less suicides), pair by
-  pair. All start at 1000.
-- **Learning.** Each net has a style, a reward of its own. It plays six games as it is, then six
-  as a mutated copy of itself, and keeps the copy if the copy earned more of that reward. How
-  hard a bot mutates differs from bot to bot.
+- **Rating.** The same for everyone: Elo, from who outscored whom (frags less suicides, then
+  accuracy), pair by pair. All start at 1000.
+- **Learning.** Each net has a style, a reward of its own. After each match the match is played
+  again with a mutated copy of each learner in its place, and a copy that earned clearly more
+  of that reward takes the bot's place (see "How a league learns" below). How hard a bot
+  mutates differs from bot to bot.
 
 | style | wants | of 100 |
 | --- | --- | --- |
-| Fragger | frags, and not to die | 35 |
+| Fragger | frags, shots that hit, and not to die | 34 |
 | Survivor | not to die | 10 |
 | Berserker | frags, and to be shooting | 10 |
-| Sniper | frags for few shots | 10 |
+| Sniper | accuracy first, then frags | 5 |
+| Apprentice | to do what people did (see "Learning from people") | 5 |
 | Tourist | to run | 5 |
 | Camper | frags while standing still | 5 |
 | Dervish | to spin | 5 |
 | Pacifist | never to fire | 5 |
 | Doorman | to press use on everything | 5 |
-| Lemming | to die | 5 |
+| Lemming | to die | 4 |
 | Brawler | frags, with its fists and nothing else | 5 |
+
+(The other two of the hundred are The Teacher and Static.)
 
 Rating and reward are deliberately different things. A Lemming that learns to die faster is
 succeeding by its own lights while it sinks down the table, which is where the comically bad
@@ -459,15 +463,16 @@ the four comes to like one of the other three a point more and one a point less:
 - *Less:* whoever hurt it most. In a deathmatch a kill counts as five hits; in co-op the hurt
   is a team-mate's stray shots, and if nobody shot it, it is whoever did least for the team,
   if that was less than it did itself.
-- *More:* in co-op, whoever did most for the team; in a deathmatch, whoever of the others left
-  it most alone, if anyone hurt it at all.
+- *More:* in co-op, whoever did most for the team. In a deathmatch, nobody: there are no
+  friends in a deathmatch, only enemies, and a feeling in that league only ever falls.
 
 A bot meets any other about once in eight hundred matches, so a feeling takes weeks to become
 a friendship or a feud. What feelings do, once they are there: they go into a match with the
 bots, six bits for each of the other three seats in the bot's kind (so a match to watch
-replays with them). In a deathmatch near is as it feels: an enemy seems half as far off as it
-is and a friend half as far again, so a bot goes for those it dislikes first; and it will not
-fight a bot it likes at 85 or more, unless that bot has just shot it. In co-op a bot takes no
+replays with them). In a deathmatch near is as it feels: the less a bot likes another the nearer
+it seems, down to half as far, so a bot goes for those it dislikes first. And one it has come
+to hate, under 25, it hunts: its way leads to that bot wherever on the map it is, before
+anyone nearer, and if it can see that bot it shoots at that bot. In co-op a bot takes no
 care not to shoot a bot it has come to hate (under 15). About a person in co-op every bot
 feels 100, whatever it has come to feel about anyone else: a person is never hated and is
 never shot at through.

@@ -45,11 +45,11 @@ The original game already plays them co-operatively, and the maps were built for
   every player gets one (`world.touch_special_thing` has the branch; it is reached when
   `g.netgame` is set).
 - **Weapons stay too.** `P_GiveWeapon` in a network game gives each weapon once per player and
-  leaves it lying there. **The port dropped this branch** because it only ran single-player; it
-  goes back in, from `p_inter.c`.
+  leaves it lying there. The port had dropped this branch when it only ran single-player; it
+  is back in, from `p_inter.c`.
 - **Death is not a restart.** `G_DoReborn` in a network game respawns the dead player at their
   own start, or the first free one, leaving a corpse in the body queue, instead of reloading the
-  level. **Not yet ported** (`game.ticker` reloads the level).
+  level. Ported: `game.ticker` reloads the level only for a player alone.
 - **Player starts 1 to 4** are in every E1 map. The port already records them all.
 
 So the level design question answers itself. What is left is the plumbing.

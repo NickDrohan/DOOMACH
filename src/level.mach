@@ -260,6 +260,28 @@ fun grab[T](a: *allocator.Allocator, count: i32, out: **T) bool {
     ret 1;
 }
 
+fun drop[T](a: *allocator.Allocator, count: i32, held: **T) {
+    if (@held != nil && count > 0) { allocator.deallocate[T](a, @held, count::usize); }
+    @held = nil;
+}
+
+# give back what a level's tables took, when the level is done with: load
+# takes them from the allocator and nothing else returns them. (A league
+# that plays a level a second, all day, found that out by running out of
+# memory every few hours.) The blockmap and the reject table are the WAD's
+# own bytes and are not ours to give back.
+pub fun free(a: *allocator.Allocator, lv: *Level) {
+    drop[Vertex](a, lv.numvertexes, ?lv.vertexes);
+    drop[Sector](a, lv.numsectors, ?lv.sectors);
+    drop[Side](a, lv.numsides, ?lv.sides);
+    drop[Line](a, lv.numlines, ?lv.lines);
+    drop[Subsector](a, lv.numsubsectors, ?lv.subsectors);
+    drop[Node](a, lv.numnodes, ?lv.nodes);
+    drop[Seg](a, lv.numsegs, ?lv.segs);
+    drop[Thing](a, lv.numthings, ?lv.things);
+    drop[i32](a, lv.numsectorlines, ?lv.sector_lines);
+}
+
 fun add_to_box(box: *Fixed, x: Fixed, y: Fixed) {
     if (x < box[BOXLEFT]) {
         box[BOXLEFT] = x;
