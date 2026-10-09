@@ -1,0 +1,696 @@
+# the deathmatch announcer: who has earned a line, and what the screen does
+# while it is said
+#
+# Nothing here is id's; it is the arena shooters' habit, brought to Doom's
+# deathmatch. Two ladders are kept for every player. Kills in quick
+# succession, each within three seconds of the last, climb one: double kill,
+# multi kill, ultra kill, monster kill. Kills without dying climb the other,
+# a rung every five: killing spree, dominating, unstoppable, godlike, and at
+# the top rampage. The first kill of a level is first blood.
+#
+# The announcer only watches the frag counts; it changes nothing in the
+# game, and takes no numbers from the game's random table, so a game with it
+# stays in step with one without.
+
+use std.types.bool.bool;
+use std.types.string.str;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.rdata;
+use doom.video;
+
+# the lines, numbered as voice.mach holds them
+pub val FIRST_BLOOD:   i32 = 0;
+pub val DOUBLE_KILL:   i32 = 1;
+pub val MULTI_KILL:    i32 = 2;
+pub val ULTRA_KILL:    i32 = 3;
+pub val MONSTER_KILL:  i32 = 4;
+pub val KILLING_SPREE: i32 = 5;
+pub val RAMPAGE:       i32 = 6;
+pub val DOMINATING:    i32 = 7;
+pub val UNSTOPPABLE:   i32 = 8;
+pub val GODLIKE:       i32 = 9;
+pub val LINES:         i32 = 10;
+
+# how grand each line is; the grander of two earned at once is the one said,
+# and a line is not cut short by a lesser one. harness/genvoice.py gives the
+# voices their halls by the same numbers.
+val GRAND: [10]i32 = [10]i32{8, 1, 2, 3, 4, 5, 9, 6, 7, 8};
+
+# a kill this soon after the last climbs the first ladder: three seconds
+val QUICK: i32 = 105;
+# a rung of the second ladder
+val RUNG: i32 = 5;
+# how long a line stays on screen, and how long before a lesser may replace it
+pub val SHOW: i32 = 90;
+val HOLD:     i32 = 35;
+
+# the view's height, above the status bar; nothing is drawn below it
+val VIEW: i32 = 168;
+
+pub rec Announcer {
+    # each player's kills of others and deaths, as last seen
+    kills:  [4]i32;
+    deaths: [4]i32;
+    # kills since dying, kills in quick succession, and when the last was
+    spree: [4]i32;
+    quick: [4]i32;
+    last:  [4]i32;
+    tic:   i32;
+    # the level's first kill has been made
+    blood: bool;
+    # the line on screen, or -1; whose it is; how many tics it has been up
+    line: i32;
+    who:  i32;
+    age:  i32;
+    # how many lines have been said, for tests and the curious
+    said: i32;
+}
+
+# forget everything: a new game, or a new level
+pub fun reset(a: *Announcer) {
+    var i: i32 = 0;
+    for (i < 4) {
+        a.kills[i]  = 0;
+        a.deaths[i] = 0;
+        a.spree[i]  = 0;
+        a.quick[i]  = 0;
+        a.last[i]   = 0;
+        i           = i + 1;
+    }
+    a.tic   = 0;
+    a.blood = 0;
+    a.line  = -1;
+    a.who   = 0;
+    a.age   = 0;
+}
+
+# put a line up, whoever earned it
+pub fun show(a: *Announcer, line: i32, who: i32) {
+    a.line = line;
+    a.who  = who;
+    a.age  = 0;
+    a.said = a.said + 1;
+}
+
+# the line for so many kills in quick succession, or -1
+fun quick_line(n: i32) i32 {
+    if (n == 2) { ret DOUBLE_KILL; }
+    if (n == 3) { ret MULTI_KILL; }
+    if (n == 4) { ret ULTRA_KILL; }
+    if (n >= 5) { ret MONSTER_KILL; }
+    ret -1;
+}
+
+# the line for so many kills without dying, or -1
+fun spree_line(n: i32) i32 {
+    if (n < RUNG || n % RUNG != 0) { ret -1; }
+    if (n == RUNG)                 { ret KILLING_SPREE; }
+    if (n == RUNG * 2)             { ret DOMINATING; }
+    if (n == RUNG * 3)             { ret UNSTOPPABLE; }
+    if (n == RUNG * 4)             { ret GODLIKE; }
+    ret RAMPAGE;
+}
+
+fun grander(line: i32, than: i32) bool {
+    if (line < 0) { ret 0; }
+    if (than < 0) { ret 1; }
+    ret GRAND[line] > GRAND[than];
+}
+
+# one tic, given every player's counts as they now stand
+# ---
+# ingame: which of the four are playing
+# kills:  how many times each has killed another player
+# deaths: how many times each has died, by any hand
+# ret:    the line that begins this tic, or -1
+pub fun step(a: *Announcer, ingame: *bool, kills: *i32, deaths: *i32) i32 {
+    a.tic = a.tic + 1;
+    if (a.line >= 0) {
+        a.age = a.age + 1;
+        if (a.age >= SHOW) { a.line = -1; }
+    }
+
+    # counts that have gone down are a new level's
+    var i: i32 = 0;
+    for (i < 4) {
+        if (ingame[i] && (kills[i] < a.kills[i] || deaths[i] < a.deaths[i])) {
+            reset(a);
+            brk;
+        }
+        i = i + 1;
+    }
+
+    var best: i32 = -1;
+    var who:  i32 = 0;
+    i = 0;
+    for (i < 4) {
+        if (!ingame[i]) {
+            i = i + 1;
+            cnt;
+        }
+        if (deaths[i] > a.deaths[i]) {
+            a.spree[i] = 0;
+            a.quick[i] = 0;
+        }
+        var n: i32 = kills[i] - a.kills[i];
+        for (n > 0) {
+            n          = n - 1;
+            a.spree[i] = a.spree[i] + 1;
+            if (a.quick[i] > 0 && a.tic - a.last[i] <= QUICK) {
+                a.quick[i] = a.quick[i] + 1;
+            }
+            or {
+                a.quick[i] = 1;
+            }
+            a.last[i] = a.tic;
+
+            var line: i32 = quick_line(a.quick[i]);
+            val rung: i32 = spree_line(a.spree[i]);
+            if (grander(rung, line)) { line = rung; }
+            if (!a.blood) {
+                a.blood = 1;
+                if (grander(FIRST_BLOOD, line)) { line = FIRST_BLOOD; }
+            }
+            if (grander(line, best)) {
+                best = line;
+                who  = i;
+            }
+        }
+        a.kills[i]  = kills[i];
+        a.deaths[i] = deaths[i];
+        i           = i + 1;
+    }
+
+    if (best < 0) { ret -1; }
+    # a line just begun is not cut short by a lesser one
+    if (a.line >= 0 && a.age < HOLD && GRAND[best] < GRAND[a.line]) { ret -1; }
+    show(a, best, who);
+    ret best;
+}
+
+# one tic of a game: read its frag counts and step
+# ---
+# ret: the line that begins this tic, or -1
+pub fun tick(a: *Announcer, g: *Game) i32 {
+    var ingame: [4]bool;
+    var kills:  [4]i32;
+    var deaths: [4]i32;
+    var i:      i32 = 0;
+    for (i < 4) {
+        ingame[i] = g.playeringame[i] && g.deathmatch != 0;
+        kills[i]  = 0;
+        deaths[i] = 0;
+        var k: i32 = 0;
+        for (k < 4) {
+            if (g.playeringame[k]) {
+                if (k != i) { kills[i] = kills[i] + g.players[i].frags[k]; }
+                deaths[i] = deaths[i] + g.players[k].frags[i];
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret step(a, ?ingame[0], ?kills[0], ?deaths[0]);
+}
+
+# ------------------------------------------------------------- on the screen
+
+# what is written for a line
+fun words(line: i32) str {
+    if (line == FIRST_BLOOD)   { ret "FIRST BLOOD!"; }
+    if (line == DOUBLE_KILL)   { ret "DOUBLE KILL!"; }
+    if (line == MULTI_KILL)    { ret "MULTI KILL!"; }
+    if (line == ULTRA_KILL)    { ret "ULTRA KILL!"; }
+    if (line == MONSTER_KILL)  { ret "MONSTER KILL!"; }
+    if (line == KILLING_SPREE) { ret "KILLING SPREE!"; }
+    if (line == RAMPAGE)       { ret "RAMPAGE!"; }
+    if (line == DOMINATING)    { ret "DOMINATING!"; }
+    if (line == UNSTOPPABLE)   { ret "UNSTOPPABLE!"; }
+    ret "GODLIKE!";
+}
+
+# numbers that look random and are the same every time: the effects have
+# their own, and never the game's
+fun noise(n: i32) i32 {
+    var x: u32 = n:~u32 * 2654435761 + 0x9e3779b9;
+    x = x ^ (x >> 15);
+    x = x * 2246822519;
+    x = x ^ (x >> 13);
+    ret ((x >> 8) & 0xffff):~i32;
+}
+
+fun least(a: i32, b: i32) i32 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun most(a: i32, b: i32) i32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# a block of one colour, kept within the view
+fun fill(screen: *u8, x: i32, y: i32, w: i32, h: i32, colour: i32) {
+    var yy: i32 = most(y, 0);
+    for (yy < y + h && yy < VIEW) {
+        var xx: i32 = most(x, 0);
+        for (xx < x + w && xx < video.SCREENWIDTH) {
+            screen[yy * video.SCREENWIDTH + xx] = colour::u8;
+            xx                                  = xx + 1;
+        }
+        yy = yy + 1;
+    }
+}
+
+# slide rows of the view sideways, what falls off one side lost and the
+# other side's edge drawn out to fill
+fun slide(screen: *u8, y0: i32, y1: i32, dx: i32) {
+    if (dx == 0) { ret; }
+    var y: i32 = most(y0, 0);
+    for (y < y1 && y < VIEW) {
+        val row: *u8 = ?screen[y * video.SCREENWIDTH];
+        if (dx > 0) {
+            var x: i32 = video.SCREENWIDTH - 1;
+            for (x >= 0) {
+                row[x] = row[most(x - dx, 0)];
+                x      = x - 1;
+            }
+        }
+        or {
+            var x: i32 = 0;
+            for (x < video.SCREENWIDTH) {
+                row[x] = row[least(x - dx, video.SCREENWIDTH - 1)];
+                x      = x + 1;
+            }
+        }
+        y = y + 1;
+    }
+}
+
+# the whole view through one of the colour maps: darker, or map 32, the
+# white-on-black of invulnerability
+fun through(d: *rdata.Data, screen: *u8, map: i32) {
+    video.shade(d, screen, 0, 0, video.SCREENWIDTH, VIEW, map);
+}
+
+# the words, enlarged, centred on x = 160 + dx
+fun centred(d: *rdata.Data, screen: *u8, dx: i32, y: i32, text: str, scale: i32, base: i32, shades: i32, edge: i32, count: i32) {
+    val w: i32 = video.text_width(d, text) * scale;
+    video.write_big(d, screen, 160 - w / 2 + dx, y, text, count, scale, base, shades, edge);
+}
+
+# the colour ramps of Doom's palette the words are written in: where the
+# faces of the letters begin, lightest first. video.write_big is told how
+# many shades each has, and a colour for the letters' edges.
+val RED:    i32 = 176;
+val WHITE:  i32 = 80;
+val GREEN:  i32 = 112;
+val GOLD:   i32 = 224;
+val BLUE:   i32 = 193;
+val ORANGE: i32 = 211;
+
+# which of the 14 palettes the screen should be shown through for the line
+# that is up: 0 for the usual one, 1 to 8 for reds, 9 to 12 for golds, 13
+# for green
+pub fun palette(a: *Announcer) i32 {
+    val t: i32 = a.age;
+    if (a.line == FIRST_BLOOD && t < 10)  { ret 6 - t / 2; }
+    if (a.line == MONSTER_KILL && t < 6)  { ret 13; }
+    if (a.line == GODLIKE && t < 36)      { ret 12 - (t % 12) / 3; }
+    if (a.line == RAMPAGE && t < 64) {
+        # a throb, twice a second, dying away
+        var beat: i32 = t % 16;
+        if (beat > 8) { beat = 16 - beat; }
+        val p: i32 = (8 - beat) * (64 - t) / 64;
+        ret most(p, 1);
+    }
+    ret 0;
+}
+
+# draw the line that is up over the view
+# ---
+# screen: 320 by 200 palette indices, the view already drawn
+# name:   whose line it is, written small beneath
+pub fun draw(a: *Announcer, d: *rdata.Data, screen: *u8, name: *u8) {
+    if (a.line < 0) { ret; }
+    val t:    i32 = a.age;
+    val left: i32 = SHOW - t;
+    val text: str = words(a.line);
+    # where the words stand, and how they are written
+    var y:      i32 = 34;
+    var dx:     i32 = 0;
+    var scale:  i32 = 2;
+    var base:   i32 = RED;
+    var shades: i32 = 12;
+    var edge:   i32 = 191;
+    var count:  i32 = -1;
+
+    if (a.line == FIRST_BLOOD) {
+        # blood runs down the screen from the top, and is wiped away from
+        # the top again; the words slam in
+        var c: i32 = 0;
+        for (c < 107) {
+            if (noise(c * 13) % 3 == 0) {
+                val speed: i32 = 2 + noise(c) % 5;
+                val after: i32 = noise(c * 7 + 1) % 20;
+                val reach: i32 = least((t - after) * speed, 20 + noise(c * 3) % 100);
+                val top:   i32 = most(0, (t - 55) * 6);
+                if (reach > top) {
+                    fill(screen, c * 3, top, 3, reach - top, 178 + noise(c) % 8);
+                    fill(screen, c * 3, reach - 2, 3, 2, 172);
+                }
+            }
+            c = c + 1;
+        }
+        scale = most(3, 6 - t);
+    }
+    or (a.line == DOUBLE_KILL) {
+        # two of everything: the words come from both sides and meet, and a
+        # pair of rules opens out from the middle
+        base   = WHITE;
+        shades = 12;
+        edge   = 0;
+        val apart: i32 = most(0, 72 - t * 12);
+        val wide:  i32 = least(least(t * 24, 220), left * 24);
+        fill(screen, 160 - wide / 2, y - 6, wide, 2, 84);
+        fill(screen, 160 - wide / 2, y + 22, wide, 2, 84);
+        if (apart > 0) {
+            centred(d, screen, -apart, y, text, scale, base, shades, edge, -1);
+            dx = apart;
+        }
+    }
+    or (a.line == MULTI_KILL) {
+        # three: the words fan in from above and below, and three pips light
+        base   = GOLD;
+        shades = 8;
+        edge   = 166;
+        val fan: i32 = most(0, 30 - t * 4);
+        if (fan > 0) {
+            centred(d, screen, 0, y - fan, text, scale, 162, 4, 167, -1);
+            centred(d, screen, 0, y + fan, text, scale, 162, 4, 167, -1);
+        }
+        var pip: i32 = 0;
+        for (pip < 3) {
+            if (t >= 4 + pip * 5 && (left > 10 || (t & 1) != 0)) { fill(screen, 142 + pip * 14, y + 24, 8, 8, 231 - pip * 2); }
+            pip = pip + 1;
+        }
+    }
+    or (a.line == ULTRA_KILL) {
+        # the words fall out of the distance, and two blue bars sweep in
+        # from the top and the bottom of the view to frame them
+        base   = BLUE;
+        shades = 9;
+        edge   = 207;
+        scale  = most(3, 8 - t);
+        val near: i32 = least(t, 10);
+        val bar: i32 = most(1, least(4, left / 3));
+        fill(screen, 0, (y - 10) * near / 10, video.SCREENWIDTH, bar, 196);
+        fill(screen, 0, VIEW - (VIEW - y - 36) * near / 10, video.SCREENWIDTH, bar, 196);
+        fill(screen, 0, (y - 10) * near / 10 + bar, video.SCREENWIDTH, 1, 202);
+        fill(screen, 0, VIEW - (VIEW - y - 36) * near / 10 - 1, video.SCREENWIDTH, 1, 202);
+    }
+    or (a.line == MONSTER_KILL) {
+        # the picture tears: bands of it thrown sideways, settling
+        base   = GREEN;
+        shades = 10;
+        edge   = 127;
+        scale  = 3;
+        if (t < 28) {
+            var band: i32 = 0;
+            for (band < VIEW / 8) {
+                val toss: i32 = (noise(t * 31 + band) % 25 - 12) * (28 - t) / 28;
+                slide(screen, band * 8, band * 8 + 8, toss);
+                band = band + 1;
+            }
+            dx = (noise(t * 5) % 7 - 3) * (28 - t) / 14;
+            y  = y + (noise(t * 5 + 1) % 7 - 3) * (28 - t) / 14;
+        }
+    }
+    or (a.line == KILLING_SPREE) {
+        # the picture goes to wide screen, and the words are typed
+        base   = ORANGE;
+        shades = 8;
+        edge   = 223;
+        val bar: i32 = least(least(t * 3, 26), left * 3);
+        video.shade(d, screen, 0, 0, video.SCREENWIDTH, bar, 28);
+        video.shade(d, screen, 0, VIEW - bar, video.SCREENWIDTH, bar, 28);
+        fill(screen, 0, bar, video.SCREENWIDTH, 1, 215);
+        fill(screen, 0, VIEW - bar - 1, video.SCREENWIDTH, 1, 215);
+        count = t / 2 + 1;
+        # the cursor it is typed with
+        if (count < 14 && (t & 2) == 0) {
+            val typed: i32 = video.text_width_of(d, text, count) * scale;
+            fill(screen, 160 - video.text_width(d, text) * scale / 2 + typed + 2, y, 6, 14, 211);
+        }
+    }
+    or (a.line == DOMINATING) {
+        # the lights go down, and the words drop from above and land hard
+        base   = WHITE;
+        shades = 12;
+        edge   = 0;
+        scale  = 3;
+        through(d, screen, least(least(t * 2, 16), left * 2));
+        if (t < 8) {
+            y = y - (8 - t) * (8 - t);
+        }
+        or (t < 14) {
+            # the landing: a bounce, and the view jolted
+            val jolt: i32 = (14 - t) / 2;
+            y = y - jolt;
+            slide(screen, 0, VIEW, noise(t) % 7 - 3);
+            fill(screen, 0, y + 28 + jolt, video.SCREENWIDTH, 2, 4);
+        }
+        or {
+            fill(screen, 60, y + 28, least((t - 14) * 20, 200), 2, 176);
+        }
+    }
+    or (a.line == UNSTOPPABLE) {
+        # everything streams past, and the words come through at speed and
+        # never quite stop
+        base   = ORANGE;
+        shades = 8;
+        edge   = 223;
+        scale  = 3;
+        var k: i32 = 0;
+        for (k < 26) {
+            val rate: i32 = 14 + noise(k * 3) % 22;
+            val streak: i32 = 24 + noise(k * 11) % 50;
+            val x:    i32 = (noise(k * 5) + left * rate) % 440 - 80;
+            val row:  i32 = noise(k) % (VIEW - 4);
+            if (left > 12 || (k & 1) == 0) {
+                fill(screen, x, row, streak, 1, 209 + noise(k * 17) % 6);
+                fill(screen, x, row, streak / 4, 1, 4);
+            }
+            k = k + 1;
+        }
+        if (t < 8) {
+            dx = (8 - t) * (8 - t) * 5;
+        }
+        or {
+            dx = 0 - (t - 8) / 3;
+        }
+        if (left < 8) { dx = dx - (8 - left) * (8 - left) * 5; }
+    }
+    or (a.line == GODLIKE) {
+        # the world as the invulnerable see it, light rising from the floor,
+        # and the words in gold with a glow round them
+        base   = GOLD;
+        shades = 8;
+        edge   = 166;
+        scale  = 4;
+        if (t < 18 || (t < 28 && (t & 1) == 0)) { through(d, screen, 32); }
+        var k: i32 = 0;
+        for (k < 70) {
+            val rise: i32 = 2 + noise(k * 3) % 5;
+            val row:  i32 = VIEW - (t * rise + noise(k * 7)) % VIEW;
+            if (left > 12 || (k & 1) == 0) { fill(screen, noise(k) % 318, row, 2, 2 + rise, 160 + noise(k * 5) % 5); }
+            k = k + 1;
+        }
+        # a halo: beams of light fanning from behind the words
+        var beam: i32 = 0;
+        for (beam < 9) {
+            val reach: i32 = least(least(t * 6, 46 + noise(beam + t / 4) % 14), left * 6);
+            val lean:  i32 = (beam - 4) * 34;
+            var r:     i32 = 0;
+            for (r < reach) {
+                fill(screen, 159 + lean * (r + 30) / 76, y + 14 - r, 2, 1, 160 + r / 8);
+                r = r + 2;
+            }
+            beam = beam + 1;
+        }
+        # and the words flare white with the light
+        if (t < 60 && (t % 12) < 3) { shades = 3; }
+    }
+    or {
+        # rampage, the top of everything: the view shakes, the screen throbs
+        # red, fire stands along the top and bottom, and the words beat
+        scale = 4;
+        val hard: i32 = most(1, 7 * (60 - least(t, 60)) / 60);
+        slide(screen, 0, VIEW, noise(t * 3) % (hard * 2 + 1) - hard);
+        val grown: i32 = least(least(t * 6, 34), left * 3);
+        var x:     i32 = 0;
+        for (x < video.SCREENWIDTH) {
+            # a flame two pixels wide: tall where its neighbours are tall
+            val col:  i32 = x / 2;
+            val tall: i32 = (noise(col * 17 + t * 131) % 24 + noise(col / 4 * 5 + t / 2 * 71) % 24) * grown / 34 + grown / 4;
+            var h:    i32 = 0;
+            for (h < tall) {
+                # yellow at the root, orange above, red at the tip
+                var colour: i32 = 176 + (h * 3 - tall) * 12 / (tall * 2 + 1);
+                if (h * 3 < tall) {
+                    colour = 161 + h * 9 / (tall + 1);
+                }
+                or (h * 3 < tall * 2) {
+                    colour = 210 + (h * 3 - tall) * 10 / (tall + 1);
+                }
+                screen[(VIEW - 1 - h) * video.SCREENWIDTH + x] = colour::u8;
+                if (h * 2 < tall) { screen[h * video.SCREENWIDTH + x] = colour::u8; }
+                h = h + 1;
+            }
+            x = x + 1;
+        }
+        y = 40;
+        if (t < 56) {
+            # on the beat they swell, and burn yellow
+            if ((t % 8) < 3) {
+                scale  = 5;
+                y      = 36;
+                base   = GOLD;
+                shades = 8;
+                edge   = 176;
+            }
+            dx = noise(t * 9) % 5 - 2;
+            y  = y + noise(t * 9 + 1) % 5 - 2;
+        }
+    }
+
+    # the words go as they came, flickering out
+    if (left > 8 || (t & 1) == 0) { centred(d, screen, dx, y, text, scale, base, shades, edge, count); }
+    # and whose they are, beneath
+    if (name != nil && name[0] != 0 && t >= 6 && left > 8) {
+        val w: i32 = video.text_width(d, name);
+        video.write_text(d, screen, 160 - w / 2, y + scale * 8 + 8, name, -1);
+    }
+}
+
+# -------------------------------------------------------------------- tests
+
+test step__two_ladders_and_first_blood {
+    var a: Announcer;
+    reset(?a);
+    var ingame: [4]bool = [4]bool{1, 1, 1, 0};
+    var kills:  [4]i32  = [4]i32{0, 0, 0, 0};
+    var deaths: [4]i32  = [4]i32{0, 0, 0, 0};
+
+    # nothing happens, nothing is said
+    if (step(?a, ?ingame[0], ?kills[0], ?deaths[0]) != -1) { ret 1; }
+    # the first kill of all
+    kills[0]  = 1;
+    deaths[1] = 1;
+    if (step(?a, ?ingame[0], ?kills[0], ?deaths[0]) != FIRST_BLOOD) { ret 2; }
+    if (a.who != 0)                                                 { ret 3; }
+    # a second within three seconds would be a double kill, but first blood
+    # has only just begun and is the grander
+    kills[0]  = 2;
+    deaths[2] = 1;
+    if (step(?a, ?ingame[0], ?kills[0], ?deaths[0]) != -1) { ret 4; }
+    if (a.line != FIRST_BLOOD)                             { ret 5; }
+    # once it has had its time, a third is a multi kill
+    var k: i32 = 0;
+    for (k < 40) {
+        step(?a, ?ingame[0], ?kills[0], ?deaths[0]);
+        k = k + 1;
+    }
+    kills[0]  = 3;
+    deaths[1] = 2;
+    if (step(?a, ?ingame[0], ?kills[0], ?deaths[0]) != MULTI_KILL) { ret 6; }
+    # a kill long after starts the quick ladder again, and says nothing
+    k = 0;
+    for (k < 200) {
+        step(?a, ?ingame[0], ?kills[0], ?deaths[0]);
+        k = k + 1;
+    }
+    kills[0] = 4;
+    if (step(?a, ?ingame[0], ?kills[0], ?deaths[0]) != -1) { ret 7; }
+    if (a.line != -1)                                      { ret 8; }
+    # but it is the fourth without dying, and the fifth is a spree, which
+    # is grander than the double kill it also is
+    kills[0] = 5;
+    if (step(?a, ?ingame[0], ?kills[0], ?deaths[0]) != KILLING_SPREE) { ret 9; }
+    # dying ends it: five more are a spree again, not dominating
+    deaths[0] = 1;
+    step(?a, ?ingame[0], ?kills[0], ?deaths[0]);
+    if (a.spree[0] != 0) { ret 10; }
+    kills[0] = 10;
+    if (step(?a, ?ingame[0], ?kills[0], ?deaths[0]) != KILLING_SPREE) { ret 11; }
+    # dying, however often, earns nothing
+    if (a.spree[1] != 0 || a.kills[1] != 0) { ret 12; }
+    ret 0;
+}
+
+test step__the_spree_ladder_ends_in_rampage {
+    var a: Announcer;
+    reset(?a);
+    var ingame: [4]bool = [4]bool{1, 1, 0, 0};
+    var kills:  [4]i32  = [4]i32{0, 0, 0, 0};
+    var deaths: [4]i32  = [4]i32{0, 0, 0, 0};
+    var heard:  [10]i32;
+    var n:      i32 = 0;
+    for (n < 10) {
+        heard[n] = 0;
+        n        = n + 1;
+    }
+    # player two kills player one thirty times, ten seconds apart
+    n = 0;
+    for (n < 30) {
+        kills[1]  = kills[1] + 1;
+        deaths[0] = deaths[0] + 1;
+        var k: i32 = 0;
+        for (k < 350) {
+            val line: i32 = step(?a, ?ingame[0], ?kills[0], ?deaths[0]);
+            if (line >= 0) {
+                if (a.who != 1) { ret 1; }
+                heard[line] = heard[line] + 1;
+            }
+            k = k + 1;
+        }
+        n = n + 1;
+    }
+    if (heard[FIRST_BLOOD] != 1 || heard[KILLING_SPREE] != 1 || heard[DOMINATING] != 1) { ret 2; }
+    if (heard[UNSTOPPABLE] != 1 || heard[GODLIKE] != 1)                                 { ret 3; }
+    # at twenty-five, and again at thirty
+    if (heard[RAMPAGE] != 2)                                                            { ret 4; }
+    if (heard[DOUBLE_KILL] != 0 || a.said != 7)                                         { ret 5; }
+    # a new level: the counts fall, and everything starts again
+    kills[1]  = 0;
+    deaths[0] = 0;
+    step(?a, ?ingame[0], ?kills[0], ?deaths[0]);
+    if (a.spree[1] != 0 || a.blood) { ret 6; }
+    ret 0;
+}
+
+test step__quick_kills_climb_to_monster {
+    var a: Announcer;
+    reset(?a);
+    a.blood = 1;
+    var ingame: [4]bool = [4]bool{1, 1, 1, 1};
+    var kills:  [4]i32  = [4]i32{0, 0, 0, 0};
+    var deaths: [4]i32  = [4]i32{0, 0, 0, 0};
+    # the fifth is also the fifth without dying, and a spree is the grander
+    val want:   [6]i32  = [6]i32{-1, DOUBLE_KILL, MULTI_KILL, ULTRA_KILL, KILLING_SPREE, MONSTER_KILL};
+    var n:      i32     = 0;
+    for (n < 6) {
+        kills[3] = kills[3] + 1;
+        if (step(?a, ?ingame[0], ?kills[0], ?deaths[0]) != want[n]) { ret 1 + n; }
+        # two seconds between them
+        var k: i32 = 0;
+        for (k < 70) {
+            step(?a, ?ingame[0], ?kills[0], ?deaths[0]);
+            k = k + 1;
+        }
+        n = n + 1;
+    }
+    ret 0;
+}

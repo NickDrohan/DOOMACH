@@ -17,6 +17,14 @@
 #                     empty seats (default 120; 0 for never)
 #   RELAY_SHY_ONE_IN  one game in this many that bots join has the shy bot
 #                     among them (default 10; 0 for never, 1 for always)
+#   RELAY_TRAIN_FILE  where to keep what players who have said they may be
+#                     learned from send: how they played, for the leagues'
+#                     apprentices. Written when it has changed, every
+#                     RELAY_TRAIN_SECONDS (60); read back at the start.
+#                     Without it nothing sent is kept.
+#   RELAY_COOP_FILE   the co-op bot league, likewise, whose bots are seated
+#                     in co-op games; without it they are the other league's
+#   RELAY_COOP_WATCH_FILE  the co-op league's match to watch
 #   RELAY_WATCH_FILE  the bot league's match to watch, as the arena leaves
 #                     it; read every five seconds and handed to games that
 #                     ask (default none)
@@ -216,24 +224,65 @@ fun tell(r: *core.Relay) {
     r.nevents = 0;
 }
 
-# read the league, if there is one, for the core to seat its bots
-fun read_league(bots: *core.Bots, path: str) {
+# read a league, if there is one, for the core to seat its bots
+# ---
+# into: room for 200000 bytes
+# ret:  how many were read
+fun read_league(into: *u8, path: str) i32 {
     val opened: res[fs.File, io_error.Error] = fs.open(path);
-    if (sel opened.err) { ret; }
+    if (sel opened.err) { ret 0; }
     var file: fs.File = opened.ok;
     var have: i32 = 0;
     for (have < 200000) {
-        val got: res[usize, io_error.Error] = fs.read(file, ?bots.league[have], (200000 - have)::usize);
+        val got: res[usize, io_error.Error] = fs.read(file, ?into[have], (200000 - have)::usize);
         if (sel got.err) { brk; }
         if (got.ok == 0) { brk; }
         have = have + got.ok::i32;
     }
     fs.close(?file);
-    bots.leaguelen = have;
+    ret have;
+}
+
+# read the samples kept from before, if there are any
+fun read_train(t: *core.Train, path: str) {
+    val opened: res[fs.File, io_error.Error] = fs.open(path);
+    if (sel opened.err) { ret; }
+    var file: fs.File = opened.ok;
+    val room: i32 = 16 + core.TRAINCAP * 40;
+    var have: i32 = 0;
+    for (have < room) {
+        val got: res[usize, io_error.Error] = fs.read(file, ?t.head[have], (room - have)::usize);
+        if (sel got.err) { brk; }
+        if (got.ok == 0) { brk; }
+        have = have + got.ok::i32;
+    }
+    fs.close(?file);
+    core.train_loaded(t, have);
+}
+
+# write the samples: under another name, then renamed over the old file, so
+# that the arena never reads half of one
+fun write_train(t: *core.Train, path: str) {
+    val len: i32 = core.train_head(t);
+    var temp: [600]u8;
+    var k:    i32 = 0;
+    for (path[k] != 0 && k < 590) {
+        temp[k] = path[k];
+        k       = k + 1;
+    }
+    temp[k]     = '.';
+    temp[k + 1] = 'n';
+    temp[k + 2] = 'e';
+    temp[k + 3] = 'w';
+    temp[k + 4] = 0;
+    val wrote: err[fs.FsError] = fs.write_bytes(?temp[0], ?t.head[0], len::usize, 0o644);
+    if (sel wrote.err) { ret; }
+    val moved: err[io_error.Error] = fs.rename(?temp[0], path);
+    if (sel moved.ok) { t.dirty = 0; }
 }
 
 # read the arena's match file, if there is one, for the core to hand out
-fun read_watch(r: *core.Relay, path: str) {
+fun read_watch(r: *core.Relay, path: str, coop: bool) {
     val opened: res[fs.File, io_error.Error] = fs.open(path);
     if (sel opened.err) { ret; }
     var file: fs.File = opened.ok;
@@ -246,7 +295,7 @@ fun read_watch(r: *core.Relay, path: str) {
         have = have + got.ok::i32;
     }
     fs.close(?file);
-    core.set_watch(r, ?data[0], have);
+    core.set_watch(r, ?data[0], have, coop);
 }
 
 fun report(r: *core.Relay) {
@@ -282,6 +331,17 @@ fun main(argc: i64, argv: **u8) i64 {
     if (shyenv != nil) { shyin = number(shyenv, 10); }
     var watchbuf:  [512]u8;
     val watchfile: str = setting("RELAY_WATCH_FILE", ?watchbuf[0], 512);
+    var coopbuf:     [512]u8;
+    val coopfile:    str = setting("RELAY_COOP_FILE", ?coopbuf[0], 512);
+    var trainbuf:    [512]u8;
+    val trainfile:   str = setting("RELAY_TRAIN_FILE", ?trainbuf[0], 512);
+    var trainevery:  i64 = 60;
+    var trainsecbuf: [32]u8;
+    val trainsec:    str = setting("RELAY_TRAIN_SECONDS", ?trainsecbuf[0], 32);
+    if (trainsec != nil) { trainevery = number(trainsec, 60); }
+    var lasttrain:   i64 = 0;
+    var cowatchbuf:  [512]u8;
+    val cowatchfile: str = setting("RELAY_COOP_WATCH_FILE", ?cowatchbuf[0], 512);
 
     var m: Impair;
     var i: i64 = 1;
@@ -347,6 +407,14 @@ fun main(argc: i64, argv: **u8) i64 {
     if (sel made.ok) {
         val room: res[*core.Bots, allocator.Error] = allocator.zallocate[core.Bots](?a, 1);
         if (sel room.ok) { r.bots = room.ok; }
+        if (trainfile != nil) {
+            val pool: res[*core.Train, allocator.Error] = allocator.zallocate[core.Train](?a, 1);
+            if (sel pool.ok) {
+                r.train = pool.ok;
+                read_train(r.train, trainfile);
+                print.printlnf("relay: {} samples of people's play kept for the bots", r.train.count);
+            }
+        }
     }
 
     print.printlnf("relay: listening on {}:{}, at most {} rooms", bindhost, port, maxrooms);
@@ -381,12 +449,18 @@ fun main(argc: i64, argv: **u8) i64 {
             lasttick = now;
         }
 
-        if (leaguefile != nil && r.bots != nil && now - lastleague >= 60000) {
-            read_league(r.bots, leaguefile);
+        if (r.bots != nil && now - lastleague >= 60000) {
+            if (leaguefile != nil) { r.bots.leaguelen = read_league(?r.bots.league[0], leaguefile); }
+            if (coopfile != nil)   { r.bots.cooplen = read_league(?r.bots.coop[0], coopfile); }
             lastleague = now;
         }
-        if (watchfile != nil && now - lastread >= 5000) {
-            read_watch(?r, watchfile);
+        if (r.train != nil && r.train.dirty && now - lasttrain >= trainevery * 1000) {
+            write_train(r.train, trainfile);
+            lasttrain = now;
+        }
+        if (now - lastread >= 5000) {
+            if (watchfile != nil)   { read_watch(?r, watchfile, 0); }
+            if (cowatchfile != nil) { read_watch(?r, cowatchfile, 1); }
             lastread = now;
         }
         release(?sock, ?m, now);

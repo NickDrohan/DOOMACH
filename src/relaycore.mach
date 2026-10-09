@@ -92,7 +92,27 @@ pub rec Seated {
 pub rec Bots {
     league:    [200000]u8;
     leaguelen: i32;
+    # the co-op league, whose bots are seated in co-op games; without it
+    # they are the deathmatch league's
+    coop:    [200000]u8;
+    cooplen: i32;
     seated:    [1024]Seated;
+}
+
+# How people played, for the leagues' apprentices to learn from: the last
+# TRAINCAP samples sent by players who said they may be, each with its mode
+# and map before it. It is laid out as the file the process keeps it in: a
+# head of sixteen bytes (see train_head), then the samples. Too big for a
+# stack: the process allocates it, and without it samples are dropped.
+pub val TRAINCAP: i32 = 100000;
+pub rec Train {
+    # how many samples have ever come; the next goes at count mod TRAINCAP
+    count: i64;
+    # something has come since the file was last written
+    dirty: bool;
+    # the file: its head, and the samples straight after
+    head:  [16]u8;
+    data:  [4000000]u8;
 }
 
 # a datagram to send
@@ -143,13 +163,18 @@ pub rec Relay {
     # waits before bots take its empty seats, in milliseconds, 0 for never
     bots:     *Bots;
     fillwait: i64;
+    # what people have sent for the bots to learn from, if the process keeps it
+    train: *Train;
     # one game in this many that bots join has the shy bot among them; 0
     # for never
     shyin:    i32;
 
-    # the league match the arena last left to be watched, if any
-    watch:    [4096]u8;
-    watchlen: i32;
+    # the league match the arena last left to be watched, if any; and the
+    # co-op league's
+    watch:      [4096]u8;
+    watchlen:   i32;
+    cowatch:    [4096]u8;
+    cowatchlen: i32;
 
     # the time of the datagram or tick being handled
     now: i64;
@@ -357,6 +382,17 @@ fun fill(r: *Relay, room: *Room, now: i64) {
 
     val index: i32 = room_index(r, room);
     var drawn: [4]i32 = [4]i32{-1, -1, -1, -1};
+    # which league: a co-op game's bots are the co-op league's, if there is one
+    var league:    *u8 = nil;
+    var leaguelen: i32 = 0;
+    if (r.bots != nil) {
+        league    = ?r.bots.league[0];
+        leaguelen = r.bots.leaguelen;
+        if (!room.deathmatch && lf.valid(?r.bots.coop[0], r.bots.cooplen)) {
+            league    = ?r.bots.coop[0];
+            leaguelen = r.bots.cooplen;
+        }
+    }
     # now and then, one of them is the shy bot, which is in no league and
     # joins only games with people in them
     var shy: bool = r.shyin > 0 && r.bots != nil && (r.random() % r.shyin::u64) == 0;
@@ -378,7 +414,7 @@ fun fill(r: *Relay, room: *Room, now: i64) {
                     k         = k + 1;
                 }
             }
-            or (lf.valid(?r.bots.league[0], r.bots.leaguelen)) {
+            or (lf.valid(league, leaguelen)) {
                 # a member not already drawn for this room
                 var who: i32 = 0;
                 for {
@@ -387,14 +423,17 @@ fun fill(r: *Relay, room: *Room, now: i64) {
                 }
                 drawn[i] = who;
                 val at: i32 = lf.HEAD + who * lf.MEMBER_BYTES;
-                if (p.get32(?r.bots.league[0], at + lf.AT_KIND) != lf.KIND_SCRIPT::u32) {
+                if (p.get32(league, at + lf.AT_KIND) != lf.KIND_SCRIPT::u32) {
                     b.kind = lf.SEAT_NET;
-                    if (p.get32(?r.bots.league[0], at + lf.AT_STYLE) == lf.STYLE_BRAWLER::u32) { b.kind = b.kind | lf.TRAIT_FISTS; }
+                    if (p.get32(league, at + lf.AT_STYLE) == lf.STYLE_BRAWLER::u32) { b.kind = b.kind | lf.TRAIT_FISTS; }
                 }
                 for (k < lf.NET) {
-                    b.net[k] = r.bots.league[at + lf.AT_NET + k]:~i8;
+                    b.net[k] = league[at + lf.AT_NET + k]:~i8;
                     k        = k + 1;
                 }
+                # and its quirk goes with it; its feelings about the league's
+                # other bots do not, into a game with people in it
+                b.kind = b.kind | (lf.quirk_of(who) << lf.QUIRK_SHIFT);
                 lf.name_of(who, ?b.name[0]);
             }
             or {
@@ -684,17 +723,27 @@ fun list(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
 }
 
 # the process read the arena's match file: keep it to hand out
-pub fun set_watch(r: *Relay, data: *u8, len: i32) {
-    if (len != p.WATCHFILE) {
-        r.watchlen = 0;
-        ret;
-    }
+# ---
+# coop: it is the co-op league's
+pub fun set_watch(r: *Relay, data: *u8, len: i32, coop: bool) {
+    var keep: i32 = len;
+    if (len != p.WATCHFILE) { keep = 0; }
     var k: i32 = 0;
-    for (k < len) {
-        r.watch[k] = data[k];
-        k          = k + 1;
+    for (k < keep) {
+        if (coop) {
+            r.cowatch[k] = data[k];
+        }
+        or {
+            r.watch[k] = data[k];
+        }
+        k = k + 1;
     }
-    r.watchlen = len;
+    if (coop) {
+        r.cowatchlen = keep;
+    }
+    or {
+        r.watchlen = keep;
+    }
 }
 
 # one piece of the match to watch, to a request as long as the answer
@@ -706,27 +755,34 @@ fun watch(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     if (!rate_ok(r, from.ip, now)) { ret; }
     val piece: i32 = d[p.HEADER + 1]::i32;
     val start: i32 = piece * p.WATCHPIECE;
+    # which league's match: the byte after the piece, 1 for co-op's
+    var file:    *u8 = ?r.watch[0];
+    var filelen: i32 = r.watchlen;
+    if (d[p.HEADER + 2] == 1) {
+        file    = ?r.cowatch[0];
+        filelen = r.cowatchlen;
+    }
     val o: *Out = queue(r, from);
     if (o == nil) { ret; }
     val at: i32 = p.header(?o.data[0], p.MATCH, 0, 0, 0);
-    p.put16(?o.data[0], at, r.watchlen::u32);
+    p.put16(?o.data[0], at, filelen::u32);
     o.data[at + 2] = piece::u8;
     o.data[at + 3] = 0;
     # the match's number, by which a game tells pieces of one match from
     # pieces of the next
     var k: i32 = 0;
     for (k < 4) {
-        o.data[at + 4 + k] = r.watch[12 + k];
+        o.data[at + 4 + k] = file[12 + k];
         k                  = k + 1;
     }
     var count: i32 = 0;
-    if (start < r.watchlen) {
-        count = r.watchlen - start;
+    if (start < filelen) {
+        count = filelen - start;
         if (count > p.WATCHPIECE) { count = p.WATCHPIECE; }
     }
     k = 0;
     for (k < count) {
-        o.data[at + 8 + k] = r.watch[start + k];
+        o.data[at + 8 + k] = file[start + k];
         k                  = k + 1;
     }
     o.len = at + 8 + count;
@@ -832,6 +888,69 @@ pub fun handle(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     or (kind == p.BOTASK) {
         if (room.started && len >= p.BOTSIZE) { bot_is(r, room, slot, d[p.HEADER]::i32); }
     }
+    or (kind == p.TRAIN) {
+        if (room.started) { train(r, room, d, len); }
+    }
+}
+
+# a player's samples: kept if they are what they say, from a game of the
+# kind they say
+fun train(r: *Relay, room: *Room, d: *u8, len: i32) {
+    val at: i32 = p.HEADER;
+    if (r.train == nil || len < at + 5 || d[at] != p.VERSION) { ret; }
+    val mode:  i32 = d[at + 1]::i32;
+    val map:   i32 = d[at + 2]::i32;
+    val count: i32 = d[at + 4]::i32;
+    var want:  i32 = 1;
+    if (room.deathmatch) { want = 2; }
+    if (mode != want || map < 1 || map > 9 || count < 1 || count > p.TRAINMOST || len < at + 5 + count * p.TRAINSAMPLE) {
+        r.dropped = r.dropped + 1;
+        ret;
+    }
+    val t: *Train = r.train;
+    var i: i32    = 0;
+    for (i < count) {
+        val to: i32 = (t.count % TRAINCAP::i64)::i32 * p.TRAINRECORD;
+        t.data[to]     = mode::u8;
+        t.data[to + 1] = map::u8;
+        var k: i32 = 0;
+        for (k < p.TRAINSAMPLE) {
+            t.data[to + 2 + k] = d[at + 5 + i * p.TRAINSAMPLE + k];
+            k                  = k + 1;
+        }
+        t.count = t.count + 1;
+        i       = i + 1;
+    }
+    t.dirty = 1;
+}
+
+# make the head of the samples' file, and say how long the file is: the
+# magic, the size of a record, how many records follow, and how many have
+# ever come
+pub fun train_head(t: *Train) i32 {
+    var n: i64 = t.count;
+    if (n > TRAINCAP::i64) { n = TRAINCAP::i64; }
+    t.head[0] = 'M';
+    t.head[1] = 'D';
+    t.head[2] = 'T';
+    t.head[3] = '1';
+    p.put32(?t.head[0], 4, p.TRAINRECORD::u32);
+    p.put32(?t.head[0], 8, n::u32);
+    p.put32(?t.head[0], 12, (t.count & 0x7fffffff)::u32);
+    ret 16 + n::i32 * p.TRAINRECORD;
+}
+
+# take up a file of samples read back: so many bytes at the head
+pub fun train_loaded(t: *Train, len: i32) {
+    t.count = 0;
+    t.dirty = 0;
+    if (len < 16 || t.head[0] != 'M' || t.head[1] != 'D' || t.head[2] != 'T' || t.head[3] != '1') { ret; }
+    if (p.get32(?t.head[0], 4) != p.TRAINRECORD::u32) { ret; }
+    val n: i32 = p.get32(?t.head[0], 8):~i32;
+    if (n < 0 || n > TRAINCAP || len < 16 + n * p.TRAINRECORD) { ret; }
+    # the ring goes on from where it was only if it was not yet full; a
+    # full one starts overwriting from its beginning, which is as good
+    t.count = n::i64;
 }
 
 # the timers: drop silent players, close rooms nobody filled
@@ -1145,6 +1264,56 @@ test relay__a_host_can_start_at_once_with_bots {
     r.nout = 0;
     handle(?r, ?buf[0], request(?buf[0], p.FILL, 0, 0, token), ?host, 5100);
     if (!r.rooms[0].started || r.rooms[0].botmask != 14) { ret 2; }
+    ret 0;
+}
+
+test relay__keeps_what_players_send_to_train_bots {
+    var r: Relay;
+    fresh(?r);
+    # room for the head and four samples is all this needs
+    var room: [512]u8;
+    r.train = (?room[0]):~*Train;
+    var buf:  [1100]u8;
+    var host: Addr = Addr{ip: 1, port: 1};
+    handle(?r, ?buf[0], create_req(?buf[0], 2, 5, 1), ?host, 0);
+    val token: u64 = p.get64(?r.out[0].data[0], 8);
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 0, 0, token), ?host, 100);
+
+    var at: i32 = request(?buf[0], p.TRAIN, 0, 0, token);
+    buf[at]     = p.VERSION;
+    buf[at + 1] = 1;
+    buf[at + 2] = 3;
+    buf[at + 3] = 4;
+    buf[at + 4] = 2;
+    var k: i32 = 0;
+    for (k < 2 * p.TRAINSAMPLE) {
+        buf[at + 5 + k] = (k + 1)::u8;
+        k               = k + 1;
+    }
+    val len: i32 = at + 5 + 2 * p.TRAINSAMPLE;
+    # before the game has started: not kept
+    handle(?r, ?buf[0], len, ?host, 200);
+    if (r.train.count != 0) { ret 1; }
+    var ask: [64]u8;
+    handle(?r, ?ask[0], request(?ask[0], p.FILL, 0, 0, token), ?host, 300);
+    if (!r.rooms[0].started) { ret 2; }
+    handle(?r, ?buf[0], len, ?host, 400);
+    if (r.train.count != 2 || !r.train.dirty) { ret 3; }
+    # each with its mode and map before it
+    if (r.train.data[0] != 1 || r.train.data[1] != 3 || r.train.data[2] != 1) { ret 4; }
+    if (r.train.data[40] != 1 || r.train.data[42] != 39)                      { ret 5; }
+    # saying it is a deathmatch's, from a co-op room: not kept
+    buf[at + 1] = 2;
+    handle(?r, ?buf[0], len, ?host, 500);
+    if (r.train.count != 2) { ret 6; }
+    # cut short: not kept
+    buf[at + 1] = 1;
+    handle(?r, ?buf[0], len - 1, ?host, 600);
+    if (r.train.count != 2) { ret 7; }
+    # the file is its head and two records, and reads back as two
+    if (train_head(r.train) != 16 + 80) { ret 8; }
+    train_loaded(r.train, 16 + 80);
+    if (r.train.count != 2) { ret 9; }
     ret 0;
 }
 

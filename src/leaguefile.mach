@@ -31,6 +31,14 @@ pub val SEAT_NET:    i32 = 2;
 pub val TRAIT_FISTS: i32 = 0x100;
 pub val TRAIT_SHY:   i32 = 0x200;
 
+# A member's quirk, by its place in the league (bot.mach, QUIRK_*): none,
+# cautious, reckless, loyal or grudge-bearing, a fifth of the league each,
+# spread so that every style has some of each.
+pub val QUIRK_SHIFT: i32 = 10;
+pub fun quirk_of(i: i32) i32 {
+    ret (i * 3 + i / 20) % 5;
+}
+
 # a member's kind: one that learns, the hand-written bot, or noise
 pub val KIND_LEARNS: i32 = 0;
 pub val KIND_SCRIPT: i32 = 1;

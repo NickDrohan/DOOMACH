@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Doom in Mach: the bot league</title>
-<meta name="description" content="A hundred neural-network bots playing Doom deathmatches around the clock, each learning by its own lights.">
+<title>Doom in Mach: the bot leagues</title>
+<meta name="description" content="Two leagues of a hundred neural-network bots each, playing Doom around the clock: one at deathmatch, one as co-op teams on Nightmare.">
 <style>
   :root {
     --bg: #f6f3ee; --fg: #1d1a17; --muted: #5d564e; --rule: #ddd5ca; --panel: #ffffff;
@@ -32,7 +32,8 @@
   table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
   th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--rule); }
   th { font-size: 0.78rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
-  th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3) { text-align: left; }
+  th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4),
+  th:nth-child(11), td:nth-child(11), th:nth-child(12), td:nth-child(12) { text-align: left; }
   tr:last-child td { border-bottom: 0; }
   td.rank { color: var(--muted); }
   .style { font-size: 0.85rem; color: var(--muted); }
@@ -41,19 +42,33 @@
   .key { color: var(--muted); font-size: 0.9rem; margin-top: 18px; max-width: 70ch; }
   .key b { color: var(--fg); font-weight: 600; }
   #error { color: var(--bad); }
+  .tabs { display: flex; gap: 8px; margin: 0 0 18px; }
+  .tabs button { font: inherit; padding: 7px 14px; border-radius: 999px; border: 1px solid var(--rule); background: var(--panel); color: var(--fg); cursor: pointer; }
+  .tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 </style>
 </head>
 <body>
 <main>
   <p><a href="./">&larr; Doom in Mach</a></p>
-  <h1>The bot league</h1>
-  <p class="lede">A hundred bots, each a 942-byte neural network, playing two-minute deathmatches against each
-  other around the clock. They all began as the same network. Each learns by its own lights, so they have
-  not stayed the same.</p>
+  <h1>The bot leagues</h1>
+  <div class="tabs" role="group" aria-label="Which league">
+    <button type="button" id="tab-dm" aria-pressed="true">Deathmatch</button>
+    <button type="button" id="tab-coop" aria-pressed="false">Co-op on Nightmare</button>
+  </div>
+  <p class="lede" id="lede-dm">A hundred bots, each a 942-byte neural network, playing two-minute deathmatches
+  against each other around the clock. They all began as the same network. Each learns by its own lights, so
+  they have not stayed the same.</p>
+  <p class="lede" id="lede-coop" hidden>A hundred other bots, with networks of their own, playing as teams of four
+  against the first episode on Nightmare: fast monsters that come back. They play a level through, not race it:
+  into every secret they can find a way into, fighting until five minutes are up, and only then out by the
+  exit. A match is a level, for eight minutes or until the team is out of it. Each is rated against its own
+  team-mates by what it killed, the secrets it was first into, how far it got, the keys it found and how
+  seldom it died.</p>
 
   <p class="lede"><b>To watch a match:</b> in <a href="./">the game</a>, press Esc, choose <em>Play online</em>,
-  then <em>Watch the bot league</em>. The last match plays again on your machine at normal speed; keys 1 to 4
-  choose whose eyes you see through.</p>
+  then <em>Watch the co-op bots</em> or <em>Watch the deathmatch bots</em>. The last match plays again on your
+  machine at normal speed; keys 1 to 4 choose whose eyes you see through.</p>
 
   <div class="now" id="now" hidden>
     <h2>Last match <span id="lastmap"></span></h2>
@@ -64,8 +79,8 @@
 
   <div class="scroll">
     <table>
-      <thead><tr><th>#</th><th>Bot</th><th>Style</th><th>Rating</th><th>Games</th><th>Frags</th><th>Deaths</th><th>F/D</th><th>Gen</th></tr></thead>
-      <tbody id="rows"><tr><td colspan="9" style="text-align:center;color:var(--muted)">Loading&hellip;</td></tr></tbody>
+      <thead><tr><th>#</th><th>Bot</th><th>Style</th><th>Quirk</th><th>Rating</th><th>Games</th><th id="h-frags">Frags</th><th>Deaths</th><th id="h-ratio">F/D</th><th>Gen</th><th>Likes</th><th>Dislikes</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="12" style="text-align:center;color:var(--muted)">Loading&hellip;</td></tr></tbody>
     </table>
   </div>
 
@@ -73,10 +88,25 @@
     <p><b>Rating</b> is the same for every bot: who outscored whom, match by match. <b>Gen</b> counts the mutations a
     bot has kept. A bot plays six games as it is and six as a mutated copy of itself, and keeps the copy only if
     it earned more of what that bot's <b>style</b> wants.</p>
-    <p>Fraggers, Berserkers and Snipers want frags, in different ways. Survivors want not to die. Tourists want to
-    run, Campers to stand still, Dervishes to spin, Doormen to press every wall, Pacifists never to fire, and
-    Lemmings to die. They get better at what they want, which is not always winning.
-    <i>The Teacher</i> is the hand-written bot they all first imitated, and <i>Static</i> is a network of noise;
+    <p id="key-dm">Fraggers, Berserkers and Snipers want frags, in different ways. Survivors want not to die.
+    Tourists want to run, Campers to stand still, Dervishes to spin, Doormen to press every wall, Pacifists never
+    to fire, and Lemmings to die. Brawlers fight with their fists alone. They get better at what they want, which
+    is not always winning.</p>
+    <p id="key-coop" hidden>Crusaders want everything a team needs: kills, the way to the exit, the keys, the level
+    finished, and not to die. Slayers and Marksmen want kills, Explorers the secrets and the way out, Survivors
+    not to die, Pacifists to get there without firing. Brawlers do it all with their fists. Campers, Dervishes,
+    Doormen and Lemmings want what they want in the other league, and are as much help as you would think.</p>
+    <p>Every bot has a <b>quirk</b>. The Cautious back away from a fight when they are hurt; the Reckless charge,
+    and take the short way through the slime, since dying only puts them back at the start; the Loyal stay by
+    the bot they like best; Grudge-bearers feel everything three times over. And every bot has <b>feelings</b>
+    about every other, all starting at 50. After each match a bot likes one of the three it played with a
+    point more and one a point less: whoever hurt it most goes down; in co-op whoever did most for the team
+    goes up. In a deathmatch a bot goes for those it dislikes first and will not fight a real friend. The
+    table shows whom each likes best and least, and how much.</p>
+    <p><i>Apprentices</i> learn from people instead of from their own matches: players who say yes when the game
+    asks send how they move and fight, and each apprentice keeps nudging itself toward doing what those players
+    did. <span id="taught"></span></p>
+    <p><i>The Teacher</i> is the hand-written bot they all first imitated, and <i>Static</i> is a network of noise;
     neither learns.</p>
   </div>
 </main>
@@ -102,12 +132,15 @@
       cell(tr, i + 1, "rank");
       cell(tr, b.name);
       cell(tr, b.style, "style");
+      cell(tr, b.quirk || "", "style");
       cell(tr, b.rating, "rating");
       cell(tr, b.games);
       cell(tr, b.frags);
       cell(tr, b.deaths);
       cell(tr, b.deaths ? (b.frags / b.deaths).toFixed(2) : (b.frags ? "∞" : "–"));
       cell(tr, b.generation);
+      cell(tr, b.friend ? b.friend + " " + b.likes : "", "style");
+      cell(tr, b.enemy ? b.enemy + " " + b.dislikes : "", "style");
       rows.appendChild(tr);
     });
     var players = document.getElementById("players");
@@ -115,24 +148,48 @@
     board.last.players.slice().sort(function (a, b) { return b.frags - a.frags; }).forEach(function (p) {
       var span = document.createElement("span");
       var b = document.createElement("b");
-      b.textContent = p.frags;
+      b.textContent = coop ? p.frags + " kills, " + p.progress + "% of the way" : p.frags;
       span.appendChild(document.createTextNode(p.name + " "));
       span.appendChild(b);
       players.appendChild(span);
     });
-    document.getElementById("lastmap").textContent = "on " + board.last.map;
+    document.getElementById("lastmap").textContent = "on " + board.last.map +
+      (coop ? (board.last.finished ? ": finished, " : ": not finished, ") + board.last.secrets + " of " +
+        board.last.of + " secrets" : "");
     document.getElementById("meta").textContent =
-      board.matches.toLocaleString() + " matches played · standings updated " +
+      board.matches.toLocaleString() + " matches played · " +
+      (coop ? board.finished.toLocaleString() + " levels finished · " : "") + "standings updated " +
       ago(Date.now() / 1000 - board.updated);
+    document.getElementById("taught").textContent = board.taught
+      ? "They have " + board.taught.toLocaleString() + " moments of people's play to learn from in this league."
+      : "Nobody has sent any play for this league yet, so its apprentices are as they began.";
     document.getElementById("now").hidden = false;
   }
-  function load() {
-    fetch("league/board.json", { cache: "no-store" })
-      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-      .then(show)
-      .catch(function () { document.getElementById("error").hidden = false; });
+  var coop = location.hash === "#coop";
+  function choose(which) {
+    coop = which;
+    document.getElementById("tab-dm").setAttribute("aria-pressed", String(!coop));
+    document.getElementById("tab-coop").setAttribute("aria-pressed", String(coop));
+    document.getElementById("lede-dm").hidden = coop;
+    document.getElementById("lede-coop").hidden = !coop;
+    document.getElementById("key-dm").hidden = coop;
+    document.getElementById("key-coop").hidden = !coop;
+    document.getElementById("h-frags").textContent = coop ? "Kills" : "Frags";
+    document.getElementById("h-ratio").textContent = coop ? "K/D" : "F/D";
+    document.getElementById("now").hidden = true;
+    history.replaceState(null, "", coop ? "#coop" : "#deathmatch");
+    load();
   }
-  load();
+  function load() {
+    var asked = coop;
+    fetch(coop ? "league/coop.json" : "league/board.json", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (board) { if (asked === coop) show(board); })
+      .catch(function () { if (asked === coop) document.getElementById("error").hidden = false; });
+  }
+  document.getElementById("tab-dm").addEventListener("click", function () { choose(false); });
+  document.getElementById("tab-coop").addEventListener("click", function () { choose(true); });
+  choose(coop);
   setInterval(load, 30000);
 </script>
 </body>

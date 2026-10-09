@@ -67,10 +67,55 @@ To leave, Esc, "Options", "End Game".
 Co-op runs every player's game in lockstep, so a slow connection makes
 everyone wait for it. It plays best within a country.
 
+THE CO-OP BOTS
+--------------
+
+There are two bot leagues: one plays deathmatch, the other plays co-op as
+teams of four on Nightmare. The co-op bots play a level through: every
+secret they can find a way into, a fight until five minutes are up, and
+only then the exit. In a game with you in it they do none of that: they
+follow you, through whatever you open, and leave the exit to you. They
+leave you the health, armour and ammunition lying near you, and they shoot
+first at whatever is coming for you. The Play online
+menu has both to watch, "Watch the co-op bots" and "Watch the deathmatch
+bots"; "Game:" chooses which league's bots fill the empty seats in a game
+you host.
+
+A TEAM-MATE'S EYES
+------------------
+
+In co-op the bottom right corner of the screen shows what a team-mate
+sees. F12 moves it to the next team-mate, and after the last one turns it
+off. The number keys are your weapons, as always.
+
+When you are watching the bots: 1 to 4 choose whose eyes fill the screen,
+F12 works the corner, and L goes to the other league's match (co-op or
+deathmatch).
+
+TEACHING THE BOTS
+-----------------
+
+The first time you open "Play online" the game asks whether the bots may
+learn from you. Yes: while you play online it sends the bot leagues what
+a bot in your place would have sensed and what you did, nine times a
+second. No name, nothing from your computer. Five "apprentice" bots in
+each league learn from it. No: nothing is sent. Options, "Bots learn
+from my play", changes it; the answer is kept in doom.cfg beside the
+game.
+
+THE ANNOUNCER
+-------------
+
+In a deathmatch a voice calls the feats, and the screen marks them. Kills
+within three seconds of each other: DOUBLE KILL, MULTI KILL, ULTRA KILL,
+MONSTER KILL. Kills without dying, every five: KILLING SPREE, DOMINATING,
+UNSTOPPABLE, GODLIKE, and from twenty-five on, RAMPAGE. The first kill of
+a level is FIRST BLOOD. It calls them for everyone, bots too.
+
 UPDATING
 --------
 
-Esc, "Play online", "Update the game" fetches the newest version, puts it
+Esc, "Options", "Update the game" fetches the newest version, puts it
 in place of this one and starts it. Players need the same version to play
 together, so if a game turns you away for having a different one, both of
 you do this.
@@ -80,7 +125,7 @@ THE BOT LEAGUE
 
 A hundred neural-network bots play deathmatches against each other on the
 server, day and night, each learning in its own way. To watch one: Esc,
-"Play online", "Watch the bot league". Keys 1 to 4 choose whose eyes you
+"Play online", then "Watch the co-op bots" or "Watch the deathmatch bots". Keys 1 to 4 choose whose eyes you
 see through. The standings are at https://mach-doom-relay.fly.dev/league.html
 
 LICENCE AND SOURCE

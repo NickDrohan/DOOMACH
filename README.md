@@ -137,9 +137,63 @@ each datagram to the player it names. It runs on Fly.io beside the download page
 [hedge](https://github.com/briar-systems/hedge), a web server written in Mach, serves; the
 protocol and how to deploy both are in [RELAY.md](RELAY.md).
 
+## Two bot leagues
+
+The league of a hundred bots that plays deathmatch has a twin that plays co-op, on Nightmare,
+with nets of its own; see [BOTS.md](BOTS.md). Both are on the [league page](https://mach-doom-relay.fly.dev/league.html),
+both can be watched from the game, and each seats its bots in people's games of its kind.
+
+## A second view
+
+In co-op, and when watching the bots, the corner of the view shows another player's eyes: a
+second renderer draws their whole view and every third pixel of it is put in the bottom right
+(`front.mach`, `draw_inset`). F12, the original's spy key, moves it on. Not in a deathmatch
+someone is playing, where it would be looking through walls.
+
+## Bots that learn from people
+
+The game asks once whether the bots may learn from how you play online. For a player who says
+yes it sends what a bot in their place would have sensed and what they did, nine times a
+second; five apprentice bots in each league learn from the last hundred thousand such moments.
+See "Learning from people" in [BOTS.md](BOTS.md).
+
+## The announcer
+
+Deathmatch has an announcer, as the arena shooters that came after Doom did (`announce.mach`).
+It watches the frag counts and nothing else, and takes nothing from the game's random table, so
+a game with it stays in step with one without. Two ladders are kept for every player, bots
+included:
+
+| Kills, each within three seconds of the last | | Kills without dying | |
+|---|---|---|---|
+| 2 | Double kill | 5 | Killing spree |
+| 3 | Multi kill | 10 | Dominating |
+| 4 | Ultra kill | 15 | Unstoppable |
+| 5 and on | Monster kill | 20 | Godlike |
+| | | 25, and every five after | Rampage |
+
+The first kill of a level is first blood. When one kill earns two lines the grander is said,
+and a line that has just begun is not cut short by a lesser one.
+
+Each line has a screen effect of its own, drawn over the view from nothing but the line and
+its age: blood running down the screen, words meeting from both sides, the picture torn
+sideways, the lights going down, the world seen as the invulnerable see it, and for rampage a
+shaking view between two walls of fire. `doom script <wad> <prefix> map:1 40 say:6 12 shot`
+puts line 6 up and writes the screen; the gates pin all ten.
+
+The voice is synthetic. `harness/genvoice.py` has [eSpeak NG](https://github.com/espeak-ng/espeak-ng),
+a formant synthesizer, speak the ten lines, then slows the speech (which lowers it), makes its
+chest and throat resonances ring, drives it into a little distortion and puts it in a hall.
+How hard it rings and how big the hall is go by the line's rank: a double kill is nearly dry,
+godlike and first blood ring for two seconds, and rampage most of all. The result is
+`src/voice.mach`, 228,096 unsigned 8-bit samples at 11025 Hz compiled into the program, so an
+update brings the voice with it and no file needs to be found. The mixer gives the announcer
+a channel of its own, which no effect can take and no level change stops. Nothing of Epic's
+or anyone's recordings is in it; eSpeak NG is used to make the samples and is not shipped.
+
 ## Updating itself
 
-"Update the game" on the Play online menu (or `doom update`) asks the site for the hash of the
+"Update the game" on the Options menu (or `doom update`) asks the site for the hash of the
 newest `doom.exe`; if it is not this program's own, it fetches the program over https with
 Windows' own downloader, checks it against the hash, renames the running program aside (a
 running program cannot be written over, but it can be renamed), puts the new one in its place

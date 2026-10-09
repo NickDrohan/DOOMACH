@@ -60,6 +60,9 @@ rec Channel {
 }
 
 var channels: [8]Channel;
+# one more, for the announcer: no place, never stolen, not stopped when the
+# level changes
+var voice: Channel;
 var archive:  *wad.Wad;
 var serial:   i32;
 
@@ -69,6 +72,25 @@ var sfxvolume: i32;
 # set the volume of effects started from now on
 pub fun set_volume(v: i32) {
     sfxvolume = v;
+}
+
+# say something over everything: samples as the effects are, unsigned 8-bit
+# at the mixer's rate, which must stay where they are while they play. It
+# replaces whatever was being said.
+pub fun announce(data: *u8, len: i32) {
+    voice.sfx      = 0;
+    voice.data     = data;
+    voice.len      = len:~u32;
+    voice.pos      = 0;
+    voice.step     = 65536;
+    voice.leftvol  = sfxvolume * 8;
+    voice.rightvol = sfxvolume * 8;
+    voice.sfx      = 1;
+}
+
+# whether the announcer is speaking
+pub fun announcing() bool {
+    ret voice.sfx != 0;
 }
 
 # S_StopChannel
@@ -327,6 +349,15 @@ pub fun mix(out: *i16, frames: i32) {
             if ((c.pos >> 16) >= c.len) { c.sfx = 0; }
         }
 
+        # the announcer, over everything and from both sides
+        if (voice.sfx != 0) {
+            val said: i32 = voice.data[voice.pos >> 16]::i32 - 128;
+            dl        = dl + (voice.leftvol * said * 256) / 127;
+            dr        = dr + (voice.rightvol * said * 256) / 127;
+            voice.pos = voice.pos + voice.step;
+            if ((voice.pos >> 16) >= voice.len) { voice.sfx = 0; }
+        }
+
         # clamp to range. left hardware channel. has been char instead of
         # short.
         if (dl > 0x7fff) {
@@ -384,6 +415,29 @@ test set_channel_volume__centre_and_sides {
     # silence stays silent
     set_channel_volume(?c, 0, 128);
     if (c.leftvol != 0 || c.rightvol != 0) { ret 4; }
+    ret 0;
+}
+
+test announce__is_heard_from_both_sides_and_ends {
+    var samples: [4]u8 = [4]u8{255, 1, 128, 255};
+    stop_all();
+    sfxvolume = 15;
+    announce(?samples[0], 3);
+    if (!announcing()) { ret 1; }
+    var out: [12]i16;
+    mix(?out[0], 6);
+    # the same on the left and the right, up and then down, and loud
+    if (out[0] != out[1] || out[0] < 30000) { ret 2; }
+    if (out[2] != out[3] || out[2] > -30000) { ret 3; }
+    # three samples and no more
+    if (announcing())               { ret 4; }
+    if (out[6] != 0 || out[8] != 0) { ret 5; }
+    # stopping the level's noises does not stop the announcer
+    announce(?samples[0], 3);
+    stop_all();
+    if (!announcing()) { ret 6; }
+    mix(?out[0], 6);
+    sfxvolume = 8;
     ret 0;
 }
 

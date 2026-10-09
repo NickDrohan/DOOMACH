@@ -33,6 +33,15 @@ pub val LIST:   u8 = 11;
 pub val WATCH:  u8 = 13;
 pub val FILL:   u8 = 15;
 pub val BOTASK: u8 = 16;
+# how a player played, for the bot leagues' apprentices to learn from: sent
+# only by a player who has said it may be. After the header: this protocol's
+# version, 1 for co-op or 2 for a deathmatch, the map, the skill, how many
+# samples, and the samples, TRAINSAMPLE bytes each, at most TRAINMOST.
+pub val TRAIN:       u8  = 18;
+pub val TRAINSAMPLE: i32 = 38;
+pub val TRAINMOST:   i32 = 24;
+# as the relay keeps one: its mode and map, then the sample
+pub val TRAINRECORD: i32 = 40;
 
 # relay to game
 pub val WELCOME: u8 = 3;

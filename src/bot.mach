@@ -31,6 +31,7 @@ use doom.fixed.Fixed;
 use doom.info;
 use doom.level;
 use doom.maputl;
+use doom.render;
 use t: doom.tables;
 use doom.world;
 
@@ -49,6 +50,34 @@ pub val KIND_NET:    i32 = 2;
 # whenever they turn to look.
 pub val TRAIT_FISTS: i32 = 0x100;
 pub val TRAIT_SHY:   i32 = 0x200;
+
+# A bot's kind carries two more things, in the bits above its traits, so
+# that they go wherever a bot is described: a quirk, and how it feels about
+# each of the other three players in its game.
+#
+# A quirk is a turn of character, three bits from bit 10:
+pub val QUIRK_SHIFT:    i32 = 10;
+pub val QUIRK_NONE:     i32 = 0;
+# keeps out of the way of dying: hurt, it backs off from a fight
+pub val QUIRK_CAUTIOUS: i32 = 1;
+# dying is a way of getting on: hurt, it charges; slime is a short cut
+pub val QUIRK_RECKLESS: i32 = 2;
+# stays with its friend
+pub val QUIRK_LOYAL:    i32 = 3;
+# feels everything three times as strongly (the league's business: here it
+# changes nothing)
+pub val QUIRK_GRUDGE:   i32 = 4;
+#
+# A feeling is 0 (enemy) to 100 (friend), 50 for nothing either way: six
+# bits for each of the other players, lowest seat first, from bit 13. Each
+# holds the feeling halved, plus one; nothing there at all means 50, so that
+# a kind that says nothing of feelings is a bot with none.
+pub val FEEL_SHIFT: i32 = 13;
+
+# the bits for a feeling of 0 to 100 toward the nth other player (0 to 2)
+pub fun feel_bits(nth: i32, feeling: i32) i32 {
+    ret (clamp(feeling, 0, 100) / 2 + 1) << (FEEL_SHIFT + nth * 6);
+}
 
 # the senses, by index
 pub val F_RAYS:      i32 = 0;
@@ -103,6 +132,9 @@ pub rec Bot {
     kind:   i32;
     fists:  bool;
     shy:    bool;
+    # its quirk (QUIRK_*), and its feelings as its kind carried them
+    quirk:  i32;
+    feels:  i32;
     net:    [942]i8;
     seed:   u32;
 
@@ -127,6 +159,49 @@ pub rec Bot {
     # within reach ahead to use
     usewait: i32;
     usable:  bool;
+
+    # how far from the exit it began the level, and the nearest it has been
+    goalserial: i32;
+    goalstart:  i32;
+    goalbest:   i32;
+    # it follows nobody and plays the level: the secret it is making for or
+    # -1, since when, the secrets it has given up on (a bit each), and the
+    # keys it had when it gave up on them
+    alone:     bool;
+    # there is a person in its co-op game, whom it follows: the level is
+    # theirs to end
+    led:       bool;
+    want:      i32;
+    wantsince: i32;
+    gaveup:    u32;
+    gavekeys:  i32;
+    # the nearest it has been to the secret it is making for
+    wantbest: i32;
+    # the key it has set out for, by where it lies, and until when it keeps
+    # to that one rather than change its mind with every step
+    keyx:     Fixed;
+    keyy:     Fixed;
+    keyuntil: i32;
+    # working what is in the way, at each depth of solving: the line in the
+    # way, which of the lines that work it is being tried, and since when
+    actblock: [3]i32;
+    acttry:   [3]i32;
+    actsince: [3]i32;
+    # what is within reach ahead to use is the switch that ends the level
+    useexit: bool;
+    # its way was found only by going through what hurts or what there is
+    # no way back out of: it has chosen to wade, and is not held back
+    wades: bool;
+    # for whoever is watching it think: what it is after (1 a secret, 2 a
+    # monster, 3 the exit, 4 a key), the place it is going for that, and how
+    # many things it must work first to get there
+    after:  i32;
+    afterx: Fixed;
+    aftery: Fixed;
+    works:  i32;
+    # and the lines its last search went round
+    bans:  [6]i32;
+    nbans: i32;
 
     # what it has done, for whoever scores it
     shots:  i32;
@@ -196,9 +271,51 @@ fun ray(g: *Game, mo: *Mobj, turn: i32) i32 {
 
 # ---------------------------------------------------------------- the senses
 
+# how a bot in a seat feels about the player in another: 0 to 100
+fun feeling(b: *Bot, seat: i32, other: i32) i32 {
+    var nth: i32 = other;
+    if (other > seat) { nth = other - 1; }
+    val bits: i32 = (b.feels >> (nth * 6)) & 63;
+    if (bits == 0 || other == seat) { ret 50; }
+    ret (bits - 1) * 2;
+}
+
+# how a bot regards another player: as it feels, but a person in co-op is
+# always a friend, whatever any bot has come to feel about anyone
+fun regard(g: *Game, b: *Bot, seat: i32, other: i32) i32 {
+    if (g.deathmatch == 0 && !g.isbot[other]) { ret 100; }
+    ret feeling(b, seat, other);
+}
+
+# whether a monster is after a person: its target is one
+fun hunts_a_person(g: *Game, mo: *Mobj) bool {
+    if (mo.target == nil) { ret 0; }
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (g.playeringame[i] && !g.isbot[i] && g.players[i].mo == mo.target) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# whether a place is within 512 units of a living person
+fun by_a_person(g: *Game, x: Fixed, y: Fixed) bool {
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        val o: *Mobj = g.players[i].mo;
+        if (g.playeringame[i] && !g.isbot[i] && o != nil && o.health > 0 && distance(o, x, y) < 512) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 # the nearest living thing a bot should fight that it can see: the other
-# players in a deathmatch, the monsters otherwise
-fun find_enemy(g: *Game, me: *Mobj) *Mobj {
+# players in a deathmatch, the monsters otherwise. In a deathmatch near is
+# as it feels: an enemy seems half as far off as it is, a friend half as far
+# again, so a bot goes for those it has a grudge against and leaves its
+# friends for last; and a real friend it will not fight at all, unless the
+# friend has just shot it.
+fun find_enemy(g: *Game, me: *Mobj, b: *Bot, seat: i32) *Mobj {
     var best:     *Mobj = nil;
     var bestdist: i32   = 0x7fffffff;
 
@@ -207,7 +324,12 @@ fun find_enemy(g: *Game, me: *Mobj) *Mobj {
         for (i < defs.MAXPLAYERS) {
             val o: *Mobj = g.players[i].mo;
             if (g.playeringame[i] && o != nil && o != me && o.health > 0) {
-                val d: i32 = distance(me, o.x, o.y);
+                val felt: i32 = regard(g, b, seat, i);
+                if (felt >= 85 && !(g.players[seat].damagecount > 0 && g.players[seat].attacker == o)) {
+                    i = i + 1;
+                    cnt;
+                }
+                val d: i32 = distance(me, o.x, o.y) * (50 + felt) / 100;
                 if (d < bestdist && maputl.check_sight(g, me, o)) {
                     best     = o;
                     bestdist = d;
@@ -219,7 +341,11 @@ fun find_enemy(g: *Game, me: *Mobj) *Mobj {
     }
 
     # monsters: the four nearest within reach, then the nearest of those in
-    # sight, so that sight is tested four times at most
+    # sight, so that sight is tested four times at most. With a person in
+    # the game near is as it matters to them: a monster that is after a
+    # person counts as a quarter as far off as it is, and one that is merely
+    # near a person as half, so that a bot shoots what threatens its people
+    # before what threatens itself.
     var near:  [4]*Mobj;
     var dists: [4]i32 = [4]i32{0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
     var th: *defs.Thinker = g.thinkercap.next;
@@ -230,6 +356,12 @@ fun find_enemy(g: *Game, me: *Mobj) *Mobj {
                 var d: i32   = distance(me, mo.x, mo.y);
                 var m: *Mobj = mo;
                 if (d < 1536) {
+                    if (hunts_a_person(g, mo)) {
+                        d = d / 4;
+                    }
+                    or (by_a_person(g, mo.x, mo.y)) {
+                        d = d / 2;
+                    }
                     # insert into the four, nearest first
                     var k: i32 = 0;
                     for (k < 4) {
@@ -256,8 +388,38 @@ fun find_enemy(g: *Game, me: *Mobj) *Mobj {
     ret nil;
 }
 
-# the nearest thing to pick up within reach that it can see
-fun find_item(g: *Game, me: *Mobj) *Mobj {
+# whether a player walking onto a thing would pick it up: not health when
+# whole, armour when armoured, ammunition when full, a key already had, or,
+# where weapons stay for the others (co-op), a weapon already owned. A bot
+# that made for such a thing stood on it and went nowhere.
+fun takes(g: *Game, p: *Player, mo: *Mobj) bool {
+    val sprite: i32 = mo.sprite;
+    # nor what it is leaving for a person nearby
+    if (world.left_for_people(g, mo, world.player_number(g, p))) { ret 0; }
+    if (sprite == info.SPR_STIM || sprite == info.SPR_MEDI) { ret p.health < 100; }
+    if (sprite == info.SPR_ARM1)                            { ret p.armorpoints < 100; }
+    if (sprite == info.SPR_ARM2)                            { ret p.armorpoints < 200; }
+    if (sprite == info.SPR_CLIP || sprite == info.SPR_AMMO) { ret p.ammo[defs.AM_CLIP] < p.maxammo[defs.AM_CLIP]; }
+    if (sprite == info.SPR_SHEL || sprite == info.SPR_SBOX) { ret p.ammo[defs.AM_SHELL] < p.maxammo[defs.AM_SHELL]; }
+    if (sprite == info.SPR_ROCK || sprite == info.SPR_BROK) { ret p.ammo[defs.AM_MISL] < p.maxammo[defs.AM_MISL]; }
+    if (sprite == info.SPR_BKEY)                            { ret !p.cards[defs.IT_BLUECARD]; }
+    if (sprite == info.SPR_YKEY)                            { ret !p.cards[defs.IT_YELLOWCARD]; }
+    if (sprite == info.SPR_RKEY)                            { ret !p.cards[defs.IT_REDCARD]; }
+    if (g.netgame && g.deathmatch != 2) {
+        if (sprite == info.SPR_SHOT) { ret !p.weaponowned[defs.WP_SHOTGUN]; }
+        if (sprite == info.SPR_MGUN) { ret !p.weaponowned[defs.WP_CHAINGUN]; }
+        if (sprite == info.SPR_LAUN) { ret !p.weaponowned[defs.WP_MISSILE]; }
+        if (sprite == info.SPR_CSAW) { ret !p.weaponowned[defs.WP_CHAINSAW]; }
+        if (sprite == info.SPR_PLAS) { ret !p.weaponowned[defs.WP_PLASMA]; }
+        if (sprite == info.SPR_BFUG) { ret !p.weaponowned[defs.WP_BFG]; }
+    }
+    ret 1;
+}
+
+# the nearest thing to pick up within reach that it would take, can see and
+# can walk to
+fun find_item(g: *Game, p: *Player) *Mobj {
+    val me: *Mobj = p.mo;
     var best:     *Mobj = nil;
     var bestdist: i32   = 768;
     var th: *defs.Thinker = g.thinkercap.next;
@@ -266,7 +428,7 @@ fun find_item(g: *Game, me: *Mobj) *Mobj {
             val mo: *Mobj = th:~*Mobj;
             if ((mo.flags & defs.MF_SPECIAL) != 0) {
                 val d: i32 = distance(me, mo.x, mo.y);
-                if (d < bestdist) {
+                if (d < bestdist && takes(g, p, mo)) {
                     best     = mo;
                     bestdist = d;
                 }
@@ -275,6 +437,10 @@ fun find_item(g: *Game, me: *Mobj) *Mobj {
         th = th.next;
     }
     if (best != nil && !maputl.check_sight(g, me, best)) { ret nil; }
+    # and can walk straight to: something seen through a window or up on a
+    # ledge is not there for the taking, and a bot that made for it stood
+    # and stared
+    if (best != nil && !can_walk(g, me.x, me.y, best.x, best.y)) { ret nil; }
     ret best;
 }
 
@@ -295,15 +461,107 @@ val MAXCELLS: i32 = 65536;
 # far one
 var walkx: Fixed;
 var walky: Fixed;
+# The searches' working room, a number a cell. Here and not on the stack: a
+# search is called from deep inside a tic, and four such arrays are most of
+# a megabyte. Nothing here is kept from one search to the next.
+var fieldqueue: [65536]u16;
+var floodqueue: [65536]u16;
+var reachqueue: [65536]u16;
+var wayqueue:   [65536]u16;
+var waystep:    [65536]u8;
+
+# the keys whoever is walking has, a bit a colour; and the keys the doors
+# the walk went through needed
+var walkhave: i32;
+var walkkey:  i32;
+# a strict test asks whether the walk can be made as the level stands this
+# tic, doors shut and lifts wherever they are; and notes the line that
+# stopped it
+var walkstrict: bool;
+var walkblock:  i32;
+# and a walk tested the easy way notes the line it took on trust
+var walktrust: i32;
+
+# lines a bot solving its way has found shut with nothing to open them from
+# where it would come: its search goes round them
+var banned:  [16]i32;
+var nbanned: i32;
+# the search is only going round what is shut, not to what opens it
+var detour: bool;
+# the search keeps out of harm: it will not step into a cell whose floor
+# hurts, nor into one there is no way from to the level's exit
+var careful: bool;
+
+# a cell's floor hurts whoever stands on it: marked in the cell's navout byte
+val HURTS: i32 = 0x10;
+
+# a floor that hurts: the slime, acid and lava kinds of sector
+fun floor_hurts(special: i32) bool {
+    ret special == 4 || special == 5 || special == 7 || special == 16;
+}
+
+# whether a cell is one to keep out of: its floor hurts, or it is a pit, a
+# place the level's exit cannot be walked to from
+fun harmful(g: *Game, cell: i32) bool {
+    if ((g.navout[cell]::i32 & HURTS) != 0) { ret 1; }
+    ret g.navpits && g.navexit[cell] == 0 && g.navgrid[cell] != 0;
+}
+
+val KEY_BLUE:   i32 = 1;
+val KEY_YELLOW: i32 = 2;
+val KEY_RED:    i32 = 4;
+# not a key: leave to cross a line that ends the level when walked over,
+# which a bot playing the level has only when it is time to go
+val KEY_EXIT: i32 = 8;
+val KEY_ALL:  i32 = 15;
+
+# A team of bots plays a level through: they are not out of it before five
+# minutes are up, and not before they have been in every secret they can
+# find a way into.
+pub val LEAVE: i32 = 5 * 60 * 35;
+# how long a bot makes for one secret without getting any nearer it before
+# giving it up for another
+val SECRET_PATIENCE: i32 = 45 * 35;
+
+# the key a line's door needs, as its bit, or 0
+fun key_of(special: i32) i32 {
+    if (special == 26 || special == 32 || special == 99 || special == 133)  { ret KEY_BLUE; }
+    if (special == 27 || special == 34 || special == 136 || special == 137) { ret KEY_YELLOW; }
+    if (special == 28 || special == 33 || special == 134 || special == 135) { ret KEY_RED; }
+    ret 0;
+}
+
+# the keys a player has, a bit a colour: a card or a skull will do
+fun keys_of(p: *Player) i32 {
+    var have: i32 = 0;
+    if (p.cards[defs.IT_BLUECARD] || p.cards[defs.IT_BLUESKULL])     { have = have | KEY_BLUE; }
+    if (p.cards[defs.IT_YELLOWCARD] || p.cards[defs.IT_YELLOWSKULL]) { have = have | KEY_YELLOW; }
+    if (p.cards[defs.IT_REDCARD] || p.cards[defs.IT_REDSKULL])       { have = have | KEY_RED; }
+    ret have | KEY_EXIT;
+}
 
 fun walk_stops(g: *Game, in: *defs.Intercept) bool {
     if (!in.isaline) { ret 1; }
     val line: *level.Line = ?g.lv.lines[in.line];
+    walkblock = in.line;
     if (line.sidenum[1] == level.NONE || (line.flags::i32 & defs.ML_BLOCKING) != 0) { ret 0; }
-    if (line.special != 0) { ret 1; }
-    # a sector that a switch or trigger moves (a lift, a far door, a rising
-    # floor) is taken to be where it needs to be when the time comes
-    if (g.navmoves[line.frontsector] != 0 || g.navmoves[line.backsector] != 0) { ret 1; }
+    # a locked door stops whoever has not its key, and a line that ends the
+    # level whoever is not yet leaving
+    var key: i32 = key_of(line.special::i32);
+    if (line.special == 52 || line.special == 124) { key = KEY_EXIT; }
+    if (key != 0) {
+        if ((walkhave & key) == 0) { ret 0; }
+        walkkey = walkkey | key;
+    }
+    if (!walkstrict) {
+        # a line that does something is taken to open, and a sector that a
+        # switch or trigger moves (a lift, a far door, a rising floor) to be
+        # where it needs to be when the time comes
+        if (line.special != 0 || (g.navmoves != nil && (g.navmoves[line.frontsector] != 0 || g.navmoves[line.backsector] != 0))) {
+            walktrust = in.line;
+            ret 1;
+        }
+    }
     maputl.line_opening(g, in.line);
     if (g.openrange < TALL) { ret 0; }
     # the floor on the far side against the floor on the near one
@@ -313,13 +571,27 @@ fun walk_stops(g: *Game, in: *defs.Intercept) bool {
         far  = line.backsector;
         near = line.frontsector;
     }
-    ret g.lv.sectors[far].floorheight - g.lv.sectors[near].floorheight <= STEP;
+    if (g.lv.sectors[far].floorheight - g.lv.sectors[near].floorheight > STEP) { ret 0; }
+    walkblock = -1;
+    ret 1;
 }
 
 fun can_walk(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed) bool {
-    walkx = x2;
-    walky = y2;
+    walkx     = x2;
+    walky     = y2;
+    walkkey   = 0;
+    walktrust = -1;
     ret maputl.path_traverse(g, x1, y1, x2, y2, defs.PT_ADDLINES, walk_stops);
+}
+
+# whether the walk can be made as the level stands; if not, walkblock is the
+# line in the way
+fun walks_now(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed) bool {
+    walkstrict = 1;
+    walkblock  = -1;
+    val ok: bool = can_walk(g, x1, y1, x2, y2);
+    walkstrict = 0;
+    ret ok;
 }
 
 fun cell_x(g: *Game, cx: i32) Fixed {
@@ -330,15 +602,78 @@ fun cell_y(g: *Game, cy: i32) Fixed {
     ret g.lv.bmaporgy + ((cy * CELL + CELL / 2) << 16);
 }
 
+fun way_index(way: i32) i32 {
+    if (way == NORTH) { ret 1; }
+    if (way == WEST)  { ret 2; }
+    if (way == SOUTH) { ret 3; }
+    ret 0;
+}
+
+# note the key the way just walked out of a cell needs, and the line it
+# took on trust
+fun lock_way(g: *Game, cell: i32, way: i32) {
+    if (walktrust >= 0) { g.navline[cell * 4 + way_index(way)] = (walktrust + 1)::u16; }
+    if ((walkkey & KEY_EXIT) != 0) {
+        g.navout[cell] = g.navout[cell] | way::u8;
+        g.navlocks     = g.navlocks | KEY_EXIT;
+    }
+    if ((walkkey & 7) == 0) { ret; }
+    var index: i32 = 1;
+    if ((walkkey & KEY_YELLOW) != 0) { index = 2; }
+    if ((walkkey & KEY_RED) != 0)    { index = 3; }
+    var shift: i32 = 0;
+    if (way == NORTH) { shift = 2; }
+    if (way == WEST)  { shift = 4; }
+    if (way == SOUTH) { shift = 6; }
+    g.navkey[cell] = g.navkey[cell] | (index << shift)::u8;
+    g.navlocks     = g.navlocks | (walkkey & 7);
+}
+
+# whether a player with these keys can walk out of a cell this way
+fun way_open(g: *Game, cell: i32, way: i32, have: i32) bool {
+    if ((g.navgrid[cell]::i32 & way) == 0) { ret 0; }
+    if ((g.navout[cell]::i32 & way) != 0 && (have & KEY_EXIT) == 0) { ret 0; }
+    if (nbanned > 0) {
+        val line: i32 = g.navline[cell * 4 + way_index(way)]::i32 - 1;
+        var k:    i32 = 0;
+        for (k < nbanned) {
+            if (banned[k] == line) { ret 0; }
+            k = k + 1;
+        }
+    }
+    var shift: i32 = 0;
+    if (way == NORTH) { shift = 2; }
+    if (way == WEST)  { shift = 4; }
+    if (way == SOUTH) { shift = 6; }
+    val index: i32 = (g.navkey[cell]::i32 >> shift) & 3;
+    ret index == 0 || (have & (1 << (index - 1))) != 0;
+}
+
 fun build_grid(g: *Game) {
-    g.navserial = g.levelserial;
-    g.navw      = g.lv.bmapwidth * (128 / CELL);
-    g.navh      = g.lv.bmapheight * (128 / CELL);
-    g.navgrid   = nil;
+    val had: i32 = walkhave;
+    walkhave = KEY_ALL;
+    nbanned  = 0;
+    build_grid_with_every_key(g);
+    walkhave = had;
+}
+
+fun build_grid_with_every_key(g: *Game) {
+    g.navserial   = g.levelserial;
+    g.navw        = g.lv.bmapwidth * (128 / CELL);
+    g.navh        = g.lv.bmapheight * (128 / CELL);
+    g.navgrid     = nil;
+    g.navexit     = nil;
+    g.navexitline = -1;
+    g.navlocks    = 0;
+    g.navsecrets  = 0;
+    g.navpits     = 0;
     if (g.navw * g.navh > MAXCELLS) { ret; }
     g.navgrid  = defs.alloc(g, (g.navw * g.navh)::usize):~*u8;
+    g.navkey   = defs.alloc(g, (g.navw * g.navh)::usize):~*u8;
+    g.navout   = defs.alloc(g, (g.navw * g.navh)::usize):~*u8;
+    g.navline  = defs.alloc(g, (g.navw * g.navh * 8)::usize):~*u16;
     g.navmoves = defs.alloc(g, (g.lv.numsectors + 1)::usize):~*u8;
-    if (g.navgrid == nil || g.navmoves == nil) {
+    if (g.navgrid == nil || g.navmoves == nil || g.navkey == nil || g.navout == nil || g.navline == nil) {
         g.navgrid = nil;
         ret;
     }
@@ -365,27 +700,237 @@ fun build_grid(g: *Game) {
             val y:  Fixed = cell_y(g, cy);
             if (cx + 1 < g.navw) {
                 val ex: Fixed = cell_x(g, cx + 1);
-                if (can_walk(g, x, y, ex, y)) { g.navgrid[at] = g.navgrid[at] | EAST::u8; }
-                if (can_walk(g, ex, y, x, y)) { g.navgrid[at + 1] = g.navgrid[at + 1] | WEST::u8; }
+                if (can_walk(g, x, y, ex, y)) {
+                    g.navgrid[at] = g.navgrid[at] | EAST::u8;
+                    lock_way(g, at, EAST);
+                }
+                if (can_walk(g, ex, y, x, y)) {
+                    g.navgrid[at + 1] = g.navgrid[at + 1] | WEST::u8;
+                    lock_way(g, at + 1, WEST);
+                }
             }
             if (cy + 1 < g.navh) {
                 val ny: Fixed = cell_y(g, cy + 1);
-                if (can_walk(g, x, y, x, ny)) { g.navgrid[at] = g.navgrid[at] | NORTH::u8; }
-                if (can_walk(g, x, ny, x, y)) { g.navgrid[at + g.navw] = g.navgrid[at + g.navw] | SOUTH::u8; }
+                if (can_walk(g, x, y, x, ny)) {
+                    g.navgrid[at] = g.navgrid[at] | NORTH::u8;
+                    lock_way(g, at, NORTH);
+                }
+                if (can_walk(g, x, ny, x, y)) {
+                    g.navgrid[at + g.navw] = g.navgrid[at + g.navw] | SOUTH::u8;
+                    lock_way(g, at + g.navw, SOUTH);
+                }
             }
             cx = cx + 1;
         }
         cy = cy + 1;
+    }
+    # the cells whose floor hurts
+    var c: i32 = 0;
+    for (c < g.navw * g.navh) {
+        if (g.navgrid[c] != 0 && floor_hurts(g.lv.sectors[sector_at(g, cell_x(g, c % g.navw), cell_y(g, c / g.navw))].special::i32)) {
+            g.navout[c] = g.navout[c] | HURTS::u8;
+        }
+        c = c + 1;
+    }
+    find_exit(g);
+    find_secrets(g);
+}
+
+# the sector a place is in
+fun sector_at(g: *Game, x: Fixed, y: Fixed) i32 {
+    ret g.lv.subsectors[render.point_in_subsector(g.lv, x, y)].sector;
+}
+
+# The level's secrets, for bots that play co-op: every sector marked secret,
+# and a place to stand in each. The place is the point of a sixteen-unit
+# lattice inside the sector that is nearest the middle of all such points,
+# which for a sector of any shape is well inside it.
+fun find_secrets(g: *Game) {
+    var sc: i32 = 0;
+    for (sc < g.lv.numsectors && g.navsecrets < 32) {
+        if (g.lv.sectors[sc].special != 9) {
+            sc = sc + 1;
+            cnt;
+        }
+        # the box its lines lie in
+        var x0: i32 = 0x7fffffff;
+        var y0: i32 = 0x7fffffff;
+        var x1: i32 = 0 - 0x7fffffff;
+        var y1: i32 = 0 - 0x7fffffff;
+        var l:  i32 = 0;
+        for (l < g.lv.numlines) {
+            val line: *level.Line = ?g.lv.lines[l];
+            if (line.frontsector == sc || line.backsector == sc) {
+                var k: i32 = 0;
+                for (k < 2) {
+                    var v: level.Vertex = g.lv.vertexes[line.v1];
+                    if (k == 1) { v = g.lv.vertexes[line.v2]; }
+                    if ((v.x >> 16) < x0) { x0 = v.x >> 16; }
+                    if ((v.x >> 16) > x1) { x1 = v.x >> 16; }
+                    if ((v.y >> 16) < y0) { y0 = v.y >> 16; }
+                    if ((v.y >> 16) > y1) { y1 = v.y >> 16; }
+                    k = k + 1;
+                }
+            }
+            l = l + 1;
+        }
+        # twice over the lattice: the middle of its points, then the point
+        # nearest that
+        var sumx:  i64 = 0;
+        var sumy:  i64 = 0;
+        var count: i64 = 0;
+        var bestx: i32 = 0;
+        var besty: i32 = 0;
+        var best:  i32 = 0x7fffffff;
+        var pass:  i32 = 0;
+        for (pass < 2 && x1 >= x0) {
+            var y: i32 = y0 + 8;
+            for (y < y1) {
+                var x: i32 = x0 + 8;
+                for (x < x1) {
+                    if (sector_at(g, x << 16, y << 16) == sc) {
+                        if (pass == 0) {
+                            sumx  = sumx + x::i64;
+                            sumy  = sumy + y::i64;
+                            count = count + 1;
+                        }
+                        or {
+                            var dx: i32 = x - (sumx / count)::i32;
+                            var dy: i32 = y - (sumy / count)::i32;
+                            if (dx < 0) { dx = -dx; }
+                            if (dy < 0) { dy = -dy; }
+                            if (dx + dy < best) {
+                                best  = dx + dy;
+                                bestx = x;
+                                besty = y;
+                            }
+                        }
+                    }
+                    x = x + 16;
+                }
+                y = y + 16;
+            }
+            if (count == 0) { brk; }
+            pass = pass + 1;
+        }
+        if (count > 0) {
+            g.navsecretx[g.navsecrets] = bestx << 16;
+            g.navsecrety[g.navsecrets] = besty << 16;
+            g.navsecret[g.navsecrets]  = sc;
+            g.navsecrets               = g.navsecrets + 1;
+        }
+        sc = sc + 1;
+    }
+}
+
+# The level's exit, for bots that play co-op: the first line that ends the
+# level the ordinary way, a switch (11) or a line to walk over (52). The
+# place to make for is a little in front of a switch; for a line to walk
+# over there are two, one either side, and a bot makes for the far one.
+fun find_exit(g: *Game) {
+    var l: i32 = 0;
+    for (l < g.lv.numlines) {
+        val line: *level.Line = ?g.lv.lines[l];
+        if (line.special == 11 || line.special == 52) {
+            val v1: level.Vertex = g.lv.vertexes[line.v1];
+            val v2: level.Vertex = g.lv.vertexes[line.v2];
+            val mx: Fixed = v1.x / 2 + v2.x / 2;
+            val my: Fixed = v1.y / 2 + v2.y / 2;
+            # twenty units off the line, to its front, which is its right
+            var len: i32 = maputl.aprox_distance(line.dx, line.dy) >> 16;
+            if (len < 1) { len = 1; }
+            val nx: Fixed = (line.dy / len) * 20;
+            val ny: Fixed = 0 - (line.dx / len) * 20;
+            g.navexitline = l;
+            g.navax       = mx + nx;
+            g.navay       = my + ny;
+            g.navbx       = g.navax;
+            g.navby       = g.navay;
+            if (line.special == 52) {
+                g.navbx = mx - nx;
+                g.navby = my - ny;
+            }
+            brk;
+        }
+        l = l + 1;
+    }
+    if (g.navexitline < 0) { ret; }
+    g.navexit = defs.alloc(g, (g.navw * g.navh * 2)::usize):~*u16;
+    if (g.navexit != nil) {
+        exit_field(g, KEY_ALL, g.navexit);
+        # the count tells pits from the rest only if it reaches where the
+        # players come in; on a level whose exit the grid cannot find a
+        # walk to, everywhere would be a pit
+        val start: i32 = cell_of(g, g.playerstarts[0].x::i32 << 16, g.playerstarts[0].y::i32 << 16);
+        g.navpits = start >= 0 && g.navexit[start] != 0;
+    }
+}
+
+# how many cells every cell is from the exit, for a player with these keys:
+# 1 beside it, more farther off, 0 where there is no way
+fun exit_field(g: *Game, have: i32, dist: *u16) {
+    val cells: i32 = g.navw * g.navh;
+    var i:     i32 = 0;
+    for (i < cells) {
+        dist[i] = 0;
+        i       = i + 1;
+    }
+    val queue: *u16 = ?fieldqueue[0];
+    var tail:  i32 = 0;
+    var side:  i32 = 0;
+    for (side < 2) {
+        var x: Fixed = g.navax;
+        var y: Fixed = g.navay;
+        if (side == 1) {
+            x = g.navbx;
+            y = g.navby;
+        }
+        var dy: i32 = -1;
+        for (dy <= 1) {
+            var dx: i32 = -1;
+            for (dx <= 1) {
+                val near: i32 = cell_of(g, x + ((dx * CELL) << 16), y + ((dy * CELL) << 16));
+                if (near >= 0 && dist[near] == 0 && can_walk(g, cell_x(g, near % g.navw), cell_y(g, near / g.navw), x, y)) {
+                    dist[near]  = 1;
+                    queue[tail] = near::u16;
+                    tail        = tail + 1;
+                }
+                dx = dx + 1;
+            }
+            dy = dy + 1;
+        }
+        side = side + 1;
+    }
+    var head: i32 = 0;
+    for (head < tail) {
+        val to: i32 = queue[head]::i32;
+        head = head + 1;
+        val tx: i32 = to % g.navw;
+        var k:  i32 = 0;
+        for (k < 4) {
+            var next: i32 = -1;
+            var way:  i32 = 0;
+            if (k == 0 && tx > 0)               { next = to - 1;      way = EAST; }
+            if (k == 1 && tx + 1 < g.navw)      { next = to + 1;      way = WEST; }
+            if (k == 2 && to >= g.navw)         { next = to - g.navw; way = NORTH; }
+            if (k == 3 && to + g.navw < cells)  { next = to + g.navw; way = SOUTH; }
+            k = k + 1;
+            if (next < 0 || dist[next] != 0 || !way_open(g, next, way, have)) { cnt; }
+            dist[next]  = dist[to] + 1;
+            queue[tail] = next::u16;
+            tail        = tail + 1;
+        }
     }
 }
 
 # for looking at the grid: mark every cell that can be walked to from a
 # place (1), leaving the rest 0; ret how many
 pub fun grid_flood(g: *Game, x: Fixed, y: Fixed, marks: *u8, back: bool) i32 {
+    walkhave = KEY_ALL;
     if (g.navserial != g.levelserial) { build_grid(g); }
     if (g.navgrid == nil) { ret 0; }
     val cells: i32 = g.navw * g.navh;
-    var queue: [65536]u16;
+    val queue: *u16 = ?floodqueue[0];
     var tail:  i32 = 0;
     var dy:    i32 = -1;
     for (dy <= 1) {
@@ -433,6 +978,53 @@ pub fun grid_flood(g: *Game, x: Fixed, y: Fixed, marks: *u8, back: bool) i32 {
     ret tail;
 }
 
+# for looking at the grid: whether a walk is found from one place to another
+# with every key, going round up to two lines (-1 for none); and how many
+# cells were walked to
+pub fun reaches(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed, round1: i32, round2: i32, marks: *u8, have: i32) i32 {
+    walkhave = KEY_ALL;
+    if (g.navserial != g.levelserial) { build_grid(g); }
+    if (g.navgrid == nil) { ret -1; }
+    nbanned   = 2;
+    banned[0] = round1;
+    banned[1] = round2;
+    val cells: i32 = g.navw * g.navh;
+    val queue: *u16 = ?reachqueue[0];
+    var tail:  i32 = 0;
+    val first: i32 = cell_of(g, x1, y1);
+    if (first < 0) { ret -1; }
+    marks[first] = 1;
+    queue[0]     = first::u16;
+    tail         = 1;
+    var head: i32 = 0;
+    for (head < tail) {
+        val at: i32 = queue[head]::i32;
+        head = head + 1;
+        var k: i32 = 0;
+        for (k < 4) {
+            var next: i32 = at - g.navw;
+            var way:  i32 = SOUTH;
+            if (k == 0) { next = at + 1;      way = EAST; }
+            if (k == 1) { next = at - 1;      way = WEST; }
+            if (k == 2) { next = at + g.navw; way = NORTH; }
+            k = k + 1;
+            if (next < 0 || next >= cells || marks[next] != 0 || !way_open(g, at, way, have)) { cnt; }
+            marks[next] = 1;
+            queue[tail] = next::u16;
+            tail        = tail + 1;
+        }
+    }
+    nbanned = 0;
+    val goal: i32 = cell_of(g, x2, y2);
+    if (goal >= 0 && marks[goal] != 0) { ret tail; }
+    ret 0 - tail;
+}
+
+# for looking at the grid: the cell a place is in, or -1
+pub fun cell_at(g: *Game, x: Fixed, y: Fixed) i32 {
+    ret cell_of(g, x, y);
+}
+
 # the cell a place is in, or -1 off the grid
 fun cell_of(g: *Game, x: Fixed, y: Fixed) i32 {
     val cx: i32 = ((x - g.lv.bmaporgx) >> 16) / CELL;
@@ -449,17 +1041,22 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     val me: *Mobj = g.players[playernum].mo;
     if (((g.leveltime + playernum) & 15) != 0 && b.haveway) { ret clamp(bearing(me, b.wayx, b.wayy), -127, 127); }
     b.haveway = 0;
+    val have: i32 = keys_of(?g.players[playernum]);
+    walkhave = have;
 
     # whom to make for: in a deathmatch the nearest opponent; in co-op the
     # nearest person, to follow, or failing a person the nearest bot
     var target:   *Mobj = nil;
     var bestdist: i32   = 0x7fffffff;
     var person:   bool  = 0;
+    # whether there is a person in the game at all, alive or not
+    var anyone:   bool  = 0;
     # a bot that follows people: any bot in co-op, a shy one in any game
     val follows:  bool  = g.deathmatch == 0 || b.shy;
     var i:        i32   = 0;
     for (i < defs.MAXPLAYERS) {
         val o: *Mobj = g.players[i].mo;
+        if (i != playernum && g.playeringame[i] && !g.isbot[i]) { anyone = 1; }
         if (i != playernum && g.playeringame[i] && o != nil && o.health > 0) {
             val dist:   i32  = distance(me, o.x, o.y);
             val better: bool = follows && !g.isbot[i] && !person;
@@ -471,22 +1068,496 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
         }
         i = i + 1;
     }
-    if (target == nil) { ret 0; }
+    # co-op with no person in it: the level is the thing, and the bots play
+    # it through. With a person in it the level is theirs: the bots follow,
+    # and while the person is dead they wait rather than go on without them.
+    b.alone = g.deathmatch == 0 && !b.shy && !anyone;
+    b.led   = g.deathmatch == 0 && !b.shy && anyone;
+    if (b.alone) { ret goal_bearing(g, playernum, b, have); }
+    if (target == nil || (b.led && !person)) { ret 0; }
     # in co-op, near enough: stay about rather than stand on their toes
     if (follows && !b.shy && bestdist < 128) { ret 0; }
+    if (!b.led) { ret way_to(g, me, b, target.x, target.y, have); }
 
+    # Following a person through the level: wherever they have got to, by
+    # the walk as the level stands now, working what is in the way as a bot
+    # playing alone would (the lift they rode has gone back up; the door
+    # they opened has shut). Never across a line that ends the level. If the
+    # bot's own keys allow no sure walk, then by the walk a player with
+    # every key has: the person got there, and a door they unlocked may
+    # still be open, and the key they used lies somewhere on the way.
+    val mine: i32 = have & (KEY_ALL ^ KEY_EXIT);
+    walkhave = mine;
+    var to: i32 = solve_to(g, me, b, target.x, target.y, target.x, target.y, mine);
+    if (!b.haveway || unsure) {
+        walkhave = KEY_ALL ^ KEY_EXIT;
+        to       = solve_to(g, me, b, target.x, target.y, target.x, target.y, KEY_ALL ^ KEY_EXIT);
+    }
+    ret to;
+}
+
+# Lines that do their work when walked over rather than when used, by their
+# special: the W1 and WR kinds of the original's table.
+fun walked_over(special: i32) bool {
+    if (special >= 72 && special <= 98 && special != 78 && special != 85) { ret 1; }
+    if (special >= 2 && special <= 6)                                     { ret 1; }
+    if (special == 8 || special == 10 || special == 12 || special == 13)  { ret 1; }
+    if (special == 16 || special == 17 || special == 19 || special == 22) { ret 1; }
+    if (special == 25 || special == 30 || (special >= 35 && special <= 40)) { ret 1; }
+    if (special == 44 || (special >= 52 && special <= 54))                { ret 1; }
+    if (special >= 56 && special <= 59)                                   { ret 1; }
+    if (special == 104 || (special >= 105 && special <= 110))             { ret 1; }
+    if (special == 119 || special == 120 || special == 121)               { ret 1; }
+    if (special == 124 || special == 125 || special == 126)               { ret 1; }
+    if (special == 128 || special == 129 || special == 130 || special == 141) { ret 1; }
+    ret 0;
+}
+
+# what solving a walk found: the place to go to work whatever is in the
+# way, and the place to face there (the same place, for a line to walk over)
+# the place to face on arriving where solve_to is going, for way_to to hand
+# back when it sends the search another way to the same place
+var keepfx: Fixed;
+var keepfy: Fixed;
+# solve_to found no walk it could vouch for, and fell back on trust
+var unsure: bool;
+var solving:    bool;
+var solvedepth: i32;
+var solved:     bool;
+var solvex:  Fixed;
+var solvey:  Fixed;
+var facex:   Fixed;
+var facey:   Fixed;
+
+# A line stops the walk as the level stands. If a sector it borders is one
+# that a switch or a trigger elsewhere moves (a door worked from across the
+# room, a lift, a floor that rises to make a bridge), find the nearest line
+# that still works it, and say where to go: in front of a switch, facing it,
+# or across a line that works when walked over. Not if the line in the way
+# works it itself: then walking at it and pressing use is all there is to do.
+fun activator(g: *Game, me: *Mobj, b: *Bot, blocked: i32) bool {
+    val wall: *level.Line = ?g.lv.lines[blocked];
+    if (wall.sidenum[1] == level.NONE) { ret 0; }
+    # the lines that work either sector, nearest the line in the way first.
+    # Nearest the line and not the bot, so that the choice does not change
+    # as the bot walks.
+    val wx: Fixed = g.lv.vertexes[wall.v1].x / 2 + g.lv.vertexes[wall.v2].x / 2;
+    val wy: Fixed = g.lv.vertexes[wall.v1].y / 2 + g.lv.vertexes[wall.v2].y / 2;
+    var found: [12]i32;
+    var dists: [12]i32;
+    var n:     i32 = 0;
+    var side:  i32 = 0;
+    for (side < 2) {
+        var sc: i32 = wall.frontsector;
+        if (side == 1) { sc = wall.backsector; }
+        side = side + 1;
+        val tag: i32 = g.lv.sectors[sc].tagnum::i32;
+        if (tag == 0 || (side == 2 && g.lv.sectors[wall.frontsector].tagnum::i32 == tag)) { cnt; }
+        var l: i32 = 0;
+        for (l < g.lv.numlines) {
+            val line: *level.Line = ?g.lv.lines[l];
+            if (line.tagnum::i32 == tag && line.special != 0) {
+                if (l == blocked) { ret 0; }
+                val mx: Fixed = g.lv.vertexes[line.v1].x / 2 + g.lv.vertexes[line.v2].x / 2;
+                val my: Fixed = g.lv.vertexes[line.v1].y / 2 + g.lv.vertexes[line.v2].y / 2;
+                var d:  i32   = maputl.aprox_distance(mx - wx, my - wy) >> 16;
+                var m:  i32   = l;
+                # into the list, nearest first; the twelfth and after dropped
+                var k: i32 = 0;
+                for (k < n) {
+                    if (d < dists[k]) {
+                        val td: i32 = dists[k];
+                        val tm: i32 = found[k];
+                        dists[k] = d;
+                        found[k] = m;
+                        d        = td;
+                        m        = tm;
+                    }
+                    k = k + 1;
+                }
+                if (n < 12) {
+                    dists[n] = d;
+                    found[n] = m;
+                    n        = n + 1;
+                }
+            }
+            l = l + 1;
+        }
+    }
+    if (n == 0) { ret 0; }
+    # one at a time, twenty seconds each, then the next
+    val depth: i32 = solvedepth;
+    if (b.actblock[depth] != blocked + 1) {
+        b.actblock[depth] = blocked + 1;
+        b.acttry[depth]   = 0;
+        b.actsince[depth] = g.leveltime;
+    }
+    if (g.leveltime - b.actsince[depth] > 20 * 35) {
+        b.acttry[depth]   = b.acttry[depth] + 1;
+        b.actsince[depth] = g.leveltime;
+    }
+    val best: i32 = found[b.acttry[depth] % n];
+    val line: *level.Line = ?g.lv.lines[best];
+    val mx:   Fixed = g.lv.vertexes[line.v1].x / 2 + g.lv.vertexes[line.v2].x / 2;
+    val my:   Fixed = g.lv.vertexes[line.v1].y / 2 + g.lv.vertexes[line.v2].y / 2;
+    var len:  i32   = maputl.aprox_distance(line.dx, line.dy) >> 16;
+    if (len < 1) { len = 1; }
+    # off the line, to its front, which is its right
+    val nx: Fixed = line.dy / len;
+    val ny: Fixed = 0 - line.dx / len;
+    if (walked_over(line.special::i32)) {
+        # across it: the side the bot is not on
+        var sign: i32 = 1;
+        if (maputl.point_on_line_side(g, me.x, me.y, best) == 0) { sign = -1; }
+        solvex = mx + nx * 24 * sign;
+        solvey = my + ny * 24 * sign;
+        facex  = solvex;
+        facey  = solvey;
+    }
+    or {
+        solvex = mx + nx * 20;
+        solvey = my + ny * 20;
+        facex  = mx;
+        facey  = my;
+    }
+    ret 1;
+}
+
+# The way to a place for a bot that plays the level: as way_to, but if the
+# walk there is stopped, as the level stands, by something a switch or a
+# trigger works, the way leads to that instead, and if the walk to that is
+# stopped likewise, to what works that, three deep.
+# ---
+# fx: a place to turn to face on arriving, or the place itself
+# fy: likewise
+fun solve_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, fx_in: Fixed, fy_in: Fixed, have: i32) i32 {
+    # First keeping out of harm: no step into slime or into a pit. Only if
+    # there is no walk to vouch for that way does it wade.
+    # (A reckless bot does not look for the careful way at all: the short
+    # way through the slime is the way, and if it kills it, it comes back.)
+    careful = b.quirk != QUIRK_RECKLESS;
+    var to: i32 = solve_pass(g, me, b, tox, toy, fx_in, fy_in, have);
+    careful = 0;
+    b.wades = 0;
+    if (!b.haveway || unsure) {
+        to      = solve_pass(g, me, b, tox, toy, fx_in, fy_in, have);
+        b.wades = 1;
+    }
+    ret to;
+}
+
+fun solve_pass(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, fx_in: Fixed, fy_in: Fixed, have: i32) i32 {
+    var x:     Fixed = tox;
+    var y:     Fixed = toy;
+    var fx:    Fixed = fx_in;
+    var fy:    Fixed = fy_in;
+    var to:    i32   = 0;
+    var depth: i32   = 0;
+    var works: i32   = 0;
+    unsure  = 0;
+    # whatever an earlier search found is not this one's
+    b.haveway = 0;
+
+    # First a walk that can be made as the level stands, going round
+    # whatever is shut: a way that is open now is better than a switch that
+    # may open another.
+    nbanned = 0;
+    detour  = 1;
+    solved  = 1;
+    for (solved && depth < 17) {
+        solving = 1;
+        solved  = 0;
+        keepfx  = fx;
+        keepfy  = fy;
+        to      = way_to(g, me, b, x, y, have);
+        solving = 0;
+        depth   = depth + 1;
+    }
+    detour = 0;
+    val open: bool = b.haveway && !solved;
+
+    # Failing that, what works the first thing in the way, and what works
+    # whatever is in the way of that.
+    if (!open) {
+        nbanned   = 0;
+        depth     = 0;
+        b.haveway = 0;
+        for (depth < 17) {
+            solving    = 1;
+            solvedepth = works;
+            solved     = 0;
+            keepfx     = fx;
+            keepfy     = fy;
+            to         = way_to(g, me, b, x, y, have);
+            solving    = 0;
+            if (!solved) { brk; }
+            if ((solvex != x || solvey != y) && works < 2) { works = works + 1; }
+            x     = solvex;
+            y     = solvey;
+            fx    = facex;
+            fy    = facey;
+            depth = depth + 1;
+        }
+    }
+    b.nbans = nbanned;
+    if (b.nbans > 6) { b.nbans = 6; }
+    var q: i32 = 0;
+    for (q < 6) {
+        b.bans[q] = banned[q];
+        q         = q + 1;
+    }
+    nbanned = 0;
+    if (!b.haveway || solved) {
+        # no way to what works it, and no way round: the walk itself, on
+        # trust, which is not a walk to vouch for
+        b.haveway = 0;
+        unsure    = 1;
+        x         = tox;
+        y         = toy;
+        fx        = fx_in;
+        fy        = fy_in;
+        to        = way_to(g, me, b, x, y, have);
+    }
+    b.afterx = x;
+    b.aftery = y;
+    b.works  = depth;
+    if (works > depth) { b.works = works; }
+    # arrived: turn to the switch
+    if (b.haveway && b.wayx == x && b.wayy == y && (fx != x || fy != y)) {
+        b.wayx = fx;
+        b.wayy = fy;
+        to     = clamp(bearing(me, fx, fy), -127, 127);
+    }
+    ret to;
+}
+
+# the way for a co-op bot that follows nobody, which plays the level: to
+# each secret nobody has been in; then, until five minutes are up, to the
+# nearest monster; then to the exit, or to a key the way there needs; 0 if
+# there is nowhere to go
+fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
+    val me: *Mobj = g.players[playernum].mo;
+    if (g.navserial != g.levelserial) { build_grid(g); }
+    if (g.navgrid == nil) { ret 0; }
+    if (b.goalserial != g.levelserial) {
+        b.goalserial = g.levelserial;
+        b.goalstart  = 0;
+        b.goalbest   = 0;
+        b.want       = -1;
+        b.gaveup     = 0;
+        b.gavekeys   = had;
+        b.keyuntil   = 0;
+    }
+    # until it is time to leave, the lines that end the level are walls
+    var have: i32 = had;
+    if (g.leveltime < LEAVE) { have = have & (KEY_ALL ^ KEY_EXIT); }
+    walkhave = have;
+
+    # how far it has come toward the exit, for whoever scores it: by the
+    # map's count for a player with every key, so that standing at a locked
+    # door is as far as the door
+    if (g.navexit != nil) {
+        var near: i32 = 0;
+        var dy:   i32 = -1;
+        for (dy <= 1) {
+            var dx: i32 = -1;
+            for (dx <= 1) {
+                val by: i32 = cell_of(g, me.x + ((dx * CELL) << 16), me.y + ((dy * CELL) << 16));
+                if (by >= 0 && g.navexit[by] != 0 && (near == 0 || g.navexit[by]::i32 < near)) { near = g.navexit[by]::i32; }
+                dx = dx + 1;
+            }
+            dy = dy + 1;
+        }
+        if (near != 0) {
+            if (b.goalstart == 0)                     { b.goalstart = near; }
+            if (b.goalbest == 0 || near < b.goalbest) { b.goalbest = near; }
+        }
+    }
+
+    # First, the secrets: the ones nobody has been in yet and this bot has
+    # not given up on, each bot starting from a different one so that the
+    # team spreads out. A secret it cannot find a way into, or has made for
+    # for too long without getting there, it gives up, until it finds a key,
+    # which may open the way.
+    if (b.gavekeys != had || (g.leveltime + playernum * 16) % (60 * 35) < 16) {
+        # or a minute has gone by: a door may have been opened since
+        b.gavekeys = had;
+        b.gaveup   = 0;
+    }
+    var tries: i32 = 0;
+    for (tries < 4 && g.navsecrets > 0) {
+        tries = tries + 1;
+        var pick: i32 = -1;
+        if (b.want >= 0 && g.lv.sectors[g.navsecret[b.want]].special == 9 && (b.gaveup & (1 << b.want:~u32)) == 0) { pick = b.want; }
+        var k: i32 = 0;
+        for (k < g.navsecrets && pick < 0) {
+            val at: i32 = (k + playernum * 5) % g.navsecrets;
+            if (g.lv.sectors[g.navsecret[at]].special == 9 && (b.gaveup & (1 << at:~u32)) == 0) { pick = at; }
+            k = k + 1;
+        }
+        if (pick < 0) { brk; }
+        val away: i32 = distance(me, g.navsecretx[pick], g.navsecrety[pick]);
+        if (pick != b.want || away + 48 < b.wantbest) {
+            # a new one, or nearer than it has yet been: the clock starts again
+            b.want      = pick;
+            b.wantsince = g.leveltime;
+            b.wantbest  = away;
+        }
+        if (g.leveltime - b.wantsince <= SECRET_PATIENCE) {
+            b.after = 1;
+            val to: i32 = solve_to(g, me, b, g.navsecretx[pick], g.navsecrety[pick], g.navsecretx[pick], g.navsecrety[pick], have);
+            if (b.haveway && !unsure) { ret to; }
+        }
+        b.gaveup = b.gaveup | (1 << pick:~u32);
+    }
+
+    # A loyal bot, with no secret to make for, stays with the bot it likes
+    # best, if it likes one and has strayed from it
+    if (b.quirk == QUIRK_LOYAL) {
+        var friend: *Mobj = nil;
+        var liked:  i32   = 59;
+        var i:      i32   = 0;
+        for (i < defs.MAXPLAYERS) {
+            val o: *Mobj = g.players[i].mo;
+            if (i != playernum && g.playeringame[i] && o != nil && o.health > 0 && regard(g, b, playernum, i) > liked) {
+                liked  = regard(g, b, playernum, i);
+                friend = o;
+            }
+            i = i + 1;
+        }
+        if (friend != nil && distance(me, friend.x, friend.y) > 320) {
+            b.after = 5;
+            val to: i32 = solve_to(g, me, b, friend.x, friend.y, friend.x, friend.y, have);
+            if (b.haveway) { ret to; }
+        }
+    }
+
+    # Then, until it is time to leave, the monsters: the nearest one alive
+    if (g.leveltime < LEAVE) {
+        var prey:     *Mobj = nil;
+        var bestdist: i32   = 0x7fffffff;
+        var th: *defs.Thinker = g.thinkercap.next;
+        for (th != ?g.thinkercap) {
+            if (th.kind == defs.TH_MOBJ) {
+                val mo: *Mobj = th:~*Mobj;
+                if ((mo.flags & defs.MF_COUNTKILL) != 0 && mo.health > 0) {
+                    val dist: i32 = distance(me, mo.x, mo.y);
+                    if (dist < bestdist) {
+                        prey     = mo;
+                        bestdist = dist;
+                    }
+                }
+            }
+            th = th.next;
+        }
+        if (prey != nil) {
+            b.after = 2;
+            val to: i32 = solve_to(g, me, b, prey.x, prey.y, prey.x, prey.y, have);
+            if (b.haveway) { ret to; }
+        }
+    }
+
+    # Then the exit: in front of its switch and facing it, or across its line
+    if (g.navexitline < 0) { ret 0; }
+    var x:  Fixed = g.navax;
+    var y:  Fixed = g.navay;
+    var fx: Fixed = x;
+    var fy: Fixed = y;
+    if (g.navax == g.navbx && g.navay == g.navby) {
+        val line: *level.Line = ?g.lv.lines[g.navexitline];
+        fx = g.lv.vertexes[line.v1].x / 2 + g.lv.vertexes[line.v2].x / 2;
+        fy = g.lv.vertexes[line.v1].y / 2 + g.lv.vertexes[line.v2].y / 2;
+    }
+    or (maputl.point_on_line_side(g, me.x, me.y, g.navexitline) == maputl.point_on_line_side(g, x, y, g.navexitline)) {
+        x  = g.navbx;
+        y  = g.navby;
+        fx = x;
+        fy = y;
+    }
+    b.after = 3;
+    val out: i32 = solve_to(g, me, b, x, y, fx, fy, have);
+
+    if (b.haveway && !unsure) { ret out; }
+
+    # no sure way to the exit with these keys: a key not yet had, the
+    # nearest there is a sure walk to
+    var keys:  [6]*Mobj;
+    var dists: [6]i32;
+    var n:     i32 = 0;
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            var mo:  *Mobj = th:~*Mobj;
+            var bit: i32   = 0;
+            if (mo.kind == info.MT_MISC4 || mo.kind == info.MT_MISC7) { bit = KEY_BLUE; }
+            if (mo.kind == info.MT_MISC6 || mo.kind == info.MT_MISC8) { bit = KEY_YELLOW; }
+            if (mo.kind == info.MT_MISC5 || mo.kind == info.MT_MISC9) { bit = KEY_RED; }
+            if (bit != 0 && (have & bit) == 0) {
+                var dist: i32 = distance(me, mo.x, mo.y);
+                var k:    i32 = 0;
+                for (k < n) {
+                    if (dist < dists[k]) {
+                        val td: i32   = dists[k];
+                        val tm: *Mobj = keys[k];
+                        dists[k] = dist;
+                        keys[k]  = mo;
+                        dist     = td;
+                        mo       = tm;
+                    }
+                    k = k + 1;
+                }
+                if (n < 6) {
+                    dists[n] = dist;
+                    keys[n]  = mo;
+                    n        = n + 1;
+                }
+            }
+        }
+        th = th.next;
+    }
+    b.after = 4;
+    # the one it set out for first, while it is still there and the time
+    # it gave itself is not up
+    var k: i32 = 0;
+    for (k < n && g.leveltime < b.keyuntil) {
+        if (keys[k].x == b.keyx && keys[k].y == b.keyy) {
+            val to: i32 = solve_to(g, me, b, b.keyx, b.keyy, b.keyx, b.keyy, have);
+            if (b.haveway && !unsure) { ret to; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < n) {
+        val to: i32 = solve_to(g, me, b, keys[k].x, keys[k].y, keys[k].x, keys[k].y, have);
+        if (b.haveway && !unsure) {
+            b.keyx     = keys[k].x;
+            b.keyy     = keys[k].y;
+            b.keyuntil = g.leveltime + 45 * 35;
+            ret to;
+        }
+        k = k + 1;
+    }
+    # none: the exit anyway, on trust
+    b.after = 3;
+    ret solve_to(g, me, b, x, y, fx, fy, have);
+}
+
+# the bearing of a place a few cells along the shortest walk to a place,
+# for a player with these keys; 0 if there is no way
+fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 {
+    var i: i32 = 0;
     if (g.navserial != g.levelserial) { build_grid(g); }
     if (g.navgrid == nil) { ret 0; }
     val mine: i32 = cell_of(g, me.x, me.y);
-    val goal: i32 = cell_of(g, target.x, target.y);
+    val goal: i32 = cell_of(g, tox, toy);
     if (mine < 0 || goal < 0) { ret 0; }
 
     # A thing is rarely at the middle of its cell, and the middle may be in
     # a wall. So the search starts from every cell around the opponent whose
     # middle can walk to it, and ends at the first cell around the bot that
     # the bot can walk to the middle of.
-    var step:  [65536]u8;
-    var queue: [65536]u16;
+    val step:  *u8  = ?waystep[0];
+    val queue: *u16 = ?wayqueue[0];
     val cells: i32 = g.navw * g.navh;
     i = 0;
     for (i < cells) {
@@ -500,8 +1571,8 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     for (dy <= 1) {
         var dx: i32 = -1;
         for (dx <= 1) {
-            val near: i32 = cell_of(g, target.x + ((dx * CELL) << 16), target.y + ((dy * CELL) << 16));
-            if (near >= 0 && step[near] == 0 && can_walk(g, cell_x(g, near % g.navw), cell_y(g, near / g.navw), target.x, target.y)) {
+            val near: i32 = cell_of(g, tox + ((dx * CELL) << 16), toy + ((dy * CELL) << 16));
+            if (near >= 0 && step[near] == 0 && can_walk(g, cell_x(g, near % g.navw), cell_y(g, near / g.navw), tox, toy)) {
                 step[near]  = 16;
                 queue[tail] = near::u16;
                 tail        = tail + 1;
@@ -539,7 +1610,10 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
             if (k == 2 && to >= g.navw)         { next = to - g.navw; way = NORTH; }
             if (k == 3 && to + g.navw < cells)  { next = to + g.navw; way = SOUTH; }
             k = k + 1;
-            if (next < 0 || step[next] != 0 || (g.navgrid[next]::i32 & way) == 0) { cnt; }
+            if (next < 0 || step[next] != 0 || !way_open(g, next, way, have)) { cnt; }
+            # keeping out of harm: no step from a safe cell into a harmful
+            # one. Out of one, or along inside one, is another matter.
+            if (careful && (g.navout[to]::i32 & HURTS) != 0 && (g.navout[next]::i32 & HURTS) == 0) { cnt; }
             step[next]  = way::u8;
             queue[tail] = next::u16;
             tail        = tail + 1;
@@ -551,6 +1625,51 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
         }
     }
     if (from < 0) { ret 0; }
+
+    # asked to solve it: along the whole walk, the first step that cannot be
+    # taken as the level stands and that something elsewhere works
+    if (solving) {
+        var c: i32 = from;
+        var n: i32 = 0;
+        for (n < 4000 && step[c] != 16) {
+            var next: i32 = c - g.navw;
+            if (step[c] == EAST::u8)  { next = c + 1; }
+            if (step[c] == WEST::u8)  { next = c - 1; }
+            if (step[c] == NORTH::u8) { next = c + g.navw; }
+            val cx: Fixed = cell_x(g, c % g.navw);
+            val cy: Fixed = cell_y(g, c / g.navw);
+            if (!walks_now(g, cx, cy, cell_x(g, next % g.navw), cell_y(g, next / g.navw)) && walkblock >= 0) {
+                val shut: i32 = walkblock;
+                # a line that works when used is opened by walking at it and
+                # pressing use; and a door's far face, come at from inside
+                # the door, is open by then
+                val own: bool = g.lv.lines[shut].special != 0 && !walked_over(g.lv.lines[shut].special::i32);
+                if (!own && nbanned >= 16) {
+                    # more shut lines than it can keep count of: no walk
+                    # it can vouch for
+                    solved = 1;
+                    ret 0;
+                }
+                if (!own) {
+                    # something elsewhere works it: go there, and not this
+                    # way; nothing does, or the search is for a way round:
+                    # another way to the same place
+                    solved = 1;
+                    if (detour || !activator(g, me, b, shut)) {
+                        solvex = tox;
+                        solvey = toy;
+                        facex  = keepfx;
+                        facey  = keepfy;
+                    }
+                    banned[nbanned] = shut;
+                    nbanned         = nbanned + 1;
+                    ret 0;
+                }
+            }
+            c = next;
+            n = n + 1;
+        }
+    }
 
     # along the way: the farthest of the next six cells the bot can walk
     # straight to, so that it cuts corners no more than the walls allow
@@ -573,9 +1692,9 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
         b.wayy = y;
     }
     # at the end of the walk, the opponent itself
-    if (step[at] == 16 && can_walk(g, me.x, me.y, target.x, target.y)) {
-        b.wayx = target.x;
-        b.wayy = target.y;
+    if (step[at] == 16 && can_walk(g, me.x, me.y, tox, toy)) {
+        b.wayx = tox;
+        b.wayy = toy;
     }
     ret clamp(bearing(me, b.wayx, b.wayy), -127, 127);
 }
@@ -602,6 +1721,10 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
     val p:  *Player = ?g.players[playernum];
     val me: *Mobj   = p.mo;
     var f:  *i32    = ?b.feat[0];
+    # the walk grid, before anything asks whether a walk can be made: a bot
+    # beside the person it follows has no way to look for, and once looked
+    # for nothing else that would have built it
+    if (g.navserial != g.levelserial) { build_grid(g); }
 
     var i: i32 = 0;
     for (i < RAYS) {
@@ -611,11 +1734,14 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
         if (f[F_RAYS + i] < 0) { f[F_RAYS + i] = 0; }
         # straight ahead: is what stops the way something to use, a door or
         # a switch or a lift, and within an arm's reach?
-        if (i == 0) { b.usable = far <= USE_REACH && rayline >= 0 && g.lv.lines[rayline].special != 0; }
+        if (i == 0) {
+            b.usable  = far <= USE_REACH && rayline >= 0 && g.lv.lines[rayline].special != 0;
+            b.useexit = b.usable && (g.lv.lines[rayline].special == 11 || g.lv.lines[rayline].special == 51);
+        }
         i = i + 1;
     }
 
-    val enemy: *Mobj = find_enemy(g, me);
+    val enemy: *Mobj = find_enemy(g, me, b, playernum);
     f[F_SEEN]    = 0;
     f[F_BEARING] = 0;
     f[F_CLOSE]   = 0;
@@ -654,7 +1780,7 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
         f[F_HURTBEAR] = clamp(bearing(me, p.attacker.x, p.attacker.y), -127, 127);
     }
 
-    val item: *Mobj = find_item(g, me);
+    val item: *Mobj = find_item(g, p);
     f[F_ITEM]      = 0;
     f[F_ITEMBEAR]  = 0;
     f[F_ITEMCLOSE] = 0;
@@ -894,6 +2020,7 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
 
     # look and decide every fourth tic, each player on its own tic
     val looking: bool = ((g.leveltime + playernum) & 3) == 0;
+    walkhave = keys_of(p);
     if (looking) {
         sense(g, playernum, b);
         if (b.shy) {
@@ -923,6 +2050,13 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         away = 1;
     }
 
+    # Hurt, with an enemy in sight, a quirk shows: the cautious back away
+    # from the fight, still firing; the reckless run straight in.
+    if (p.health < 35 && b.feat[F_SEEN] > 0 && !b.shy) {
+        if (b.quirk == QUIRK_CAUTIOUS) { forward = -127; }
+        if (b.quirk == QUIRK_RECKLESS) { forward = 127; }
+    }
+
     # Fists and the saw reach only as far as an arm. With nothing else in
     # hand and an enemy in sight: run straight at it, and swing only when it
     # is within reach and in front.
@@ -931,6 +2065,57 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         side    = 0;
         turn    = clamp(b.feat[F_BEARING] * 6, -127, 127);
         fire    = b.feat[F_CLOSE] >= MELEE_CLOSE && b.feat[F_BEARING] > -10 && b.feat[F_BEARING] < 10;
+    }
+
+    # In co-op, whatever decided: not into slime and not into a pit, unless
+    # the way it has chosen goes there or it is standing in one already.
+    # Sidestepping in a fight and backing off a wall walked bots into acid,
+    # where they stood and died.
+    if (g.deathmatch == 0 && !b.shy && !b.wades && b.quirk != QUIRK_RECKLESS && g.navgrid != nil && g.navserial == g.levelserial) {
+        val here: i32 = cell_of(g, p.mo.x, p.mo.y);
+        if (here >= 0 && !harmful(g, here)) {
+            val fine: u32 = p.mo.angle >> t.ANGLETOFINESHIFT;
+            val cosa: Fixed = t.FINESINE[fine + 2048];
+            val sina: Fixed = t.FINESINE[fine];
+            # walking its way it is already kept out of harm by the way; this
+            # is for the rest: fighting, roaming, backing off when stuck
+            val free: bool = b.feat[F_SEEN] > 0 || !b.haveway || forward < 0;
+            if (forward != 0 && free) {
+                var reach: i32 = 56;
+                if (forward < 0) { reach = -56; }
+                val ahead: i32 = cell_of(g, p.mo.x + cosa * reach, p.mo.y + sina * reach);
+                if (ahead >= 0 && harmful(g, ahead)) { forward = 0; }
+            }
+            if (side != 0) {
+                # sideways is to the right when positive
+                var reach: i32 = 56;
+                if (side < 0) { reach = -56; }
+                val beside: i32 = cell_of(g, p.mo.x + sina * reach, p.mo.y - cosa * reach);
+                if (beside >= 0 && harmful(g, beside)) { side = 0; }
+            }
+        }
+    }
+
+    # In co-op, no shooting through a friend: fire is held while another
+    # player stands in the line of it, nearer than whatever is being shot at
+    # or not much farther. The nearer the friend, the wider they stand.
+    if (g.deathmatch == 0 && fire) {
+        var foe: i32 = 0x7fffffff;
+        if (b.feat[F_SEEN] > 0) { foe = (127 - b.feat[F_CLOSE]) * 16; }
+        var i: i32 = 0;
+        for (i < defs.MAXPLAYERS) {
+            val o: *Mobj = g.players[i].mo;
+            if (i != playernum && g.playeringame[i] && o != nil && o.health > 0) {
+                val dist: i32 = distance(p.mo, o.x, o.y);
+                var off:  i32 = bearing(p.mo, o.x, o.y);
+                if (off < 0) { off = -off; }
+                # (Not for a bot it has come to hate: over that one it takes
+                # no such care. People are never hated.)
+                val hated: bool = regard(g, b, playernum, i) < 15;
+                if (!hated && dist < foe + 256 && dist < 1536 && off <= 6 + 1400 / (dist + 1)) { fire = 0; }
+            }
+            i = i + 1;
+        }
     }
 
     # the decision, held until the next: full speed is 50 forward and 40
@@ -953,7 +2138,16 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     # door would, the door is opened, shut and opened again and never
     # passed.
     if (b.usewait > 0) { b.usewait = b.usewait - 1; }
-    if (b.out[O_USE] > 0 && looking && b.usewait == 0 && b.usable) {
+    # and a bot playing the level does not throw the switch that ends it
+    # before it is time, nor ever the one to the secret level
+    # A bot following a person never throws either: when the level ends is
+    # the person's to say.
+    var hold: bool = 0;
+    if (b.alone && b.useexit) {
+        hold = g.leveltime < LEAVE || g.lv.lines[rayline_of(g, p.mo)].special == 51;
+    }
+    if (b.led && b.useexit) { hold = 1; }
+    if (b.out[O_USE] > 0 && looking && b.usewait == 0 && b.usable && !hold) {
         buttons   = buttons | defs.BT_USE;
         b.uses    = b.uses + 1;
         b.usewait = USE_WAIT;
@@ -966,6 +2160,56 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         if (want != p.readyweapon) { buttons = buttons | defs.BT_CHANGE | (want << defs.BT_WEAPONSHIFT); }
     }
     cmd.buttons = buttons::u8;
+}
+
+# the line straight ahead of a thing, within reach, or line 0
+fun rayline_of(g: *Game, mo: *Mobj) i32 {
+    ray(g, mo, 0);
+    if (rayline < 0) { ret 0; }
+    ret rayline;
+}
+
+# What a person did, as a bot would have had to decide it: the senses a bot
+# in their place would have had, and their command put as a net's six
+# outputs. One sample is 38 signed bytes, 32 senses then 6 decisions, the
+# same as the hand-written bot's samples that the first net learned from.
+pub val SAMPLE: i32 = 38;
+
+# Watch a player who is not a bot, on the tics a bot would look. This reads
+# the world and writes only to the watcher and to `out`; every machine in a
+# game does it for every person, the same, so that it could not put them
+# out of step even if it did touch something.
+# ---
+# b:   a watcher kept for this player from tic to tic (start it as a bot,
+#      then it is never asked to think)
+# cmd: the command the player gave this tic
+# out: room for a sample
+# ret: whether this was a tic to look on, and a sample was written
+pub fun observe(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd, out: *u8) bool {
+    val p: *Player = ?g.players[playernum];
+    if (p.mo == nil || p.playerstate == defs.PST_DEAD) { ret 0; }
+    if (((g.leveltime + playernum) & 3) != 0)          { ret 0; }
+    walkhave = keys_of(p);
+    sense(g, playernum, b);
+    var i: i32 = 0;
+    for (i < INPUTS) {
+        out[i] = clamp(b.feat[i], -127, 127)::i8:~u8;
+        i      = i + 1;
+    }
+    # full speed is 50 forward and 40 sideways; a net's turn of 127 is 2540
+    out[INPUTS + O_FORWARD] = clamp(cmd.forwardmove::i32 * 127 / 50, -127, 127)::i8:~u8;
+    out[INPUTS + O_SIDE]    = clamp(cmd.sidemove::i32 * 127 / 40, -127, 127)::i8:~u8;
+    out[INPUTS + O_TURN]    = clamp(cmd.angleturn::i32 / 20, -127, 127)::i8:~u8;
+    var fire:   i32 = -64;
+    var use:    i32 = -64;
+    var change: i32 = -64;
+    if ((cmd.buttons::i32 & defs.BT_ATTACK) != 0) { fire = 64; }
+    if ((cmd.buttons::i32 & defs.BT_USE) != 0)    { use = 64; }
+    if ((cmd.buttons::i32 & defs.BT_CHANGE) != 0) { change = 64; }
+    out[INPUTS + O_FIRE]   = fire::i8:~u8;
+    out[INPUTS + O_USE]    = use::i8:~u8;
+    out[INPUTS + O_SWITCH] = change::i8:~u8;
+    ret 1;
 }
 
 # make a player a bot
@@ -981,8 +2225,11 @@ pub fun start(b: *Bot, kind: i32, net: *i8, seed: u32) {
     b.kind   = kind & 0xff;
     b.fists  = (kind & TRAIT_FISTS) != 0;
     b.shy    = (kind & TRAIT_SHY) != 0;
+    b.quirk  = (kind >> QUIRK_SHIFT) & 7;
+    b.feels  = (kind >> FEEL_SHIFT) & 0x3ffff;
     b.seed   = seed;
     b.since  = 127;
+    b.want   = -1;
     if (net != nil) {
         var i: i32 = 0;
         for (i < NETSIZE) {
@@ -993,6 +2240,24 @@ pub fun start(b: *Bot, kind: i32, net: *i8, seed: u32) {
 }
 
 # ------------------------------------------------------------------- tests
+
+test feeling__goes_with_the_kind_and_none_is_fifty {
+    var b: Bot;
+    # a kind that says nothing: no quirk, and fifty about everyone
+    start(?b, KIND_SCRIPT | TRAIT_FISTS, nil, 1);
+    if (b.quirk != QUIRK_NONE || !b.fists)                           { ret 1; }
+    if (feeling(?b, 2, 0) != 50 || feeling(?b, 2, 3) != 50)          { ret 2; }
+    # seat 2's feelings about seats 0, 1 and 3, and a quirk
+    val kind: i32 = KIND_NET | (QUIRK_LOYAL << QUIRK_SHIFT) | feel_bits(0, 0) | feel_bits(1, 100) | feel_bits(2, 37);
+    start(?b, kind, nil, 1);
+    if (b.kind != KIND_NET || b.quirk != QUIRK_LOYAL || b.fists)     { ret 3; }
+    if (feeling(?b, 2, 0) != 0 || feeling(?b, 2, 1) != 100)          { ret 4; }
+    # kept to the even number below
+    if (feeling(?b, 2, 3) != 36)                                     { ret 5; }
+    # and about itself, nothing
+    if (feeling(?b, 2, 2) != 50)                                     { ret 6; }
+    ret 0;
+}
 
 test script__faces_and_fires {
     var f:   [32]i32;

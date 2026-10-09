@@ -175,6 +175,88 @@ pub fun text_width(d: *rdata.Data, s: str) i32 {
     ret w;
 }
 
+# the width of the first so many characters of a line of text
+pub fun text_width_of(d: *rdata.Data, s: str, count: i32) i32 {
+    var w: i32 = 0;
+    var i: i32 = 0;
+    for (s[i] != 0 && s[i] != '\n' && i < count) {
+        val g: *u8 = glyph(d, s[i]::i32);
+        if (g == nil) {
+            w = w + 4;
+        }
+        or {
+            w = w + width(g);
+        }
+        i = i + 1;
+    }
+    ret w;
+}
+
+# a patch enlarged, every pixel of it a square, and recoloured: the small
+# font is drawn in the palette's reds, its letters' faces in the brighter
+# twelve from 176 and their edges in the darkest, 191. A face's red is
+# changed for the shade as far along another ramp, an edge's for one colour.
+# ---
+# scale:  how many screen pixels to a pixel of the patch
+# base:   the ramp's first and lightest colour
+# shades: how many colours the ramp has
+# edge:   the colour of the letters' edges
+fun draw_patch_big(screen: *u8, x_in: i32, y_in: i32, p: *u8, scale: i32, base: i32, shades: i32, edge: i32) {
+    if (p == nil) { ret; }
+    val w: i32 = le16(p, 0);
+    val x: i32 = x_in - le16(p, 4) * scale;
+    val y: i32 = y_in - le16(p, 6) * scale;
+
+    var col: i32 = 0;
+    for (col < w) {
+        var at: i32 = le32(p, 8 + col * 4);
+        for (p[at] != 0xff) {
+            val top:    i32 = p[at]::i32;
+            val length: i32 = p[at + 1]::i32;
+            var k:      i32 = 0;
+            for (k < length) {
+                var shade: i32 = p[at + 3 + k]::i32 - 176;
+                if (shade < 0) { shade = 0; }
+                var colour: u8 = edge::u8;
+                if (shade < 12) { colour = (base + shade * shades / 12)::u8; }
+                var dy:     i32 = 0;
+                for (dy < scale) {
+                    val sy: i32 = y + (top + k) * scale + dy;
+                    var dx: i32 = 0;
+                    for (dx < scale) {
+                        val sx: i32 = x + col * scale + dx;
+                        if (sx >= 0 && sx < SCREENWIDTH && sy >= 0 && sy < SCREENHEIGHT) { screen[sy * SCREENWIDTH + sx] = colour; }
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+                k = k + 1;
+            }
+            at = at + length + 4;
+        }
+        col = col + 1;
+    }
+}
+
+# a line of the small font, enlarged and recoloured as draw_patch_big does;
+# what does not fit on the screen is cut off
+# ---
+# count: how many characters to write, or -1 for all of them
+pub fun write_big(d: *rdata.Data, screen: *u8, x: i32, y: i32, s: str, count: i32, scale: i32, base: i32, shades: i32, edge: i32) {
+    var cx: i32 = x;
+    var i:  i32 = 0;
+    for (s[i] != 0 && s[i] != '\n' && (count < 0 || i < count)) {
+        val g: *u8 = glyph(d, s[i]::i32);
+        i = i + 1;
+        if (g == nil) {
+            cx = cx + 4 * scale;
+            cnt;
+        }
+        draw_patch_big(screen, cx, y, g, scale, base, shades, edge);
+        cx = cx + width(g) * scale;
+    }
+}
+
 # M_WriteText: write a string in the small font; newlines start a new line
 # back at x
 # ---

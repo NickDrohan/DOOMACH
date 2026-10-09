@@ -13,6 +13,7 @@
 use std.types.bool.bool;
 use std.types.string.str;
 
+use doom.announce;
 use doom.defs;
 use rp: doom.relayproto;
 use doom.game;
@@ -23,6 +24,7 @@ use doom.render;
 use doom.sound;
 use doom.st;
 use doom.video;
+use doom.voice;
 
 # what the screen is showing
 pub val MODE_PAGE:   i32 = 0;
@@ -48,8 +50,9 @@ val COOP_MODE:   i32 = 3;
 val COOP_PUBLIC: i32 = 4;
 val COOP_FIND:   i32 = 5;
 val COOP_CODE:   i32 = 6;
-val COOP_WATCH:  i32 = 7;
-val COOP_UPDATE: i32 = 8;
+# both bot leagues, each by name
+val COOP_WATCH:   i32 = 7;
+val COOP_WATCHDM: i32 = 8;
 
 # what the list of open games is waiting on
 pub val LIST_ASKING:  i32 = 0;
@@ -73,6 +76,12 @@ val ASK_NONE:      i32 = 0;
 val ASK_QUIT:      i32 = 1;
 val ASK_NIGHTMARE: i32 = 2;
 val ASK_ENDGAME:   i32 = 3;
+val ASK_TRAIN:     i32 = 4;
+
+# whether the bots may learn from how this player plays online
+pub val TRAIN_UNASKED: i32 = 0;
+pub val TRAIN_YES:     i32 = 1;
+pub val TRAIN_NO:      i32 = 2;
 
 # keys, as Windows numbers them
 pub val KEY_ENTER:     i32 = 0x0d;
@@ -83,6 +92,7 @@ pub val KEY_LEFT:      i32 = 0x25;
 pub val KEY_UP:        i32 = 0x26;
 pub val KEY_RIGHT:     i32 = 0x27;
 pub val KEY_DOWN:      i32 = 0x28;
+pub val KEY_F12:       i32 = 0x7b;
 
 val LINEHEIGHT: i32 = 16;
 val SKULLXOFF:  i32 = -32;
@@ -183,10 +193,28 @@ pub rec Front {
     # watching a league match: the four bots' names, shown with their frags
     watching: bool;
     watched:  [96]u8;
+    # which league is watched, or was asked for: the co-op league, where the
+    # numbers beside the names are monsters killed
+    watchcoop: bool;
+    # the deathmatch announcer
+    ann: announce.Announcer;
     # a network game is being played; the menu cannot start another game
     netgame:     bool;
     # six hex digits naming this program and WAD, for players to compare
     build:       [7]u8;
+
+    # whether the bots may learn from how this player plays online (TRAIN_*):
+    # asked once, on the way to playing online, and changed under options.
+    # trainsaid moves when the answer changes, for the game loop to keep it.
+    train:     i32;
+    trainsaid: i32;
+
+    # A second view, small, in the corner: another player's eyes beside the
+    # player's own, in co-op and when watching the bots. inset is the
+    # renderer it is drawn with, which whoever runs the window provides (nil
+    # and there is none); spy is whose eyes, or -1 for nobody's.
+    inset: *render.Renderer;
+    spy:   i32;
 
     # the player chose to quit
     quit: bool;
@@ -241,11 +269,13 @@ pub fun init(f: *Front) {
     f.showmessages       = 1;
     f.itemon[MENU_SKILL] = 2;
     f.seed               = 1;
+    f.spy                = -1;
     start_title(f);
 }
 
 # D_StartTitle
 fun start_title(f: *Front) {
+    announce.reset(?f.ann);
     f.watching = 0;
     f.scores   = 0;
     f.demosequence = -1;
@@ -292,6 +322,9 @@ pub fun start_watching(f: *Front, s: *game.Session, names: *u8) {
         k            = k + 1;
     }
     f.watching   = 1;
+    f.spy        = -1;
+    spy_next(f, s);
+    announce.reset(?f.ann);
     f.netgame    = 0;
     f.menuactive = 0;
     f.message    = nil;
@@ -309,6 +342,7 @@ pub fun to_title(f: *Front) {
 # start a game on a map, as the menu does on the first one
 pub fun start_game(f: *Front, s: *game.Session, skill: i32, map: i32) {
     f.menuactive = 0;
+    announce.reset(?f.ann);
     if (game.new_game(s, skill, 1, map)) {
         f.mode = MODE_LEVEL;
         level_song(f, s);
@@ -332,7 +366,7 @@ fun items_in(menu: i32) i32 {
     if (menu == MENU_COOP)    { ret 9; }
     if (menu == MENU_EPISODE) { ret 3; }
     if (menu == MENU_SKILL)   { ret 5; }
-    if (menu == MENU_OPTIONS) { ret 3; }
+    if (menu == MENU_OPTIONS) { ret 5; }
     if (menu == MENU_SOUND)   { ret 4; }
     ret 1;
 }
@@ -396,6 +430,12 @@ fun choose(f: *Front, s: *game.Session) {
         }
         or (item == 1) {
             f.menu = MENU_COOP;
+            # the first time: may the bots learn from you?
+            if (f.train == TRAIN_UNASKED) {
+                start_message(f, "help train the bots?\n\nif you say yes, how you move and\nfight in online games is sent to\nthe bot leagues, for bots to learn\nfrom. no names, nothing else.\nyou can change it under options.\n\npress y or n.", 1, ASK_TRAIN);
+                # on a panel of its own: it is a thing to read
+                f.panel = 1;
+            }
         }
         or (item == 2) {
             f.menu = MENU_OPTIONS;
@@ -444,13 +484,10 @@ fun choose(f: *Front, s: *game.Session) {
             f.itemon[MENU_LIST] = 0;
             f.menu              = MENU_LIST;
         }
-        or (item == COOP_WATCH) {
+        or (item == COOP_WATCH || item == COOP_WATCHDM) {
             f.menuactive = 0;
+            f.watchcoop  = item == COOP_WATCH;
             f.netrequest = NET_WATCH;
-        }
-        or (item == COOP_UPDATE) {
-            f.menuactive = 0;
-            f.netrequest = NET_UPDATE;
         }
         or {
             f.codelen = 0;
@@ -503,8 +540,23 @@ fun choose(f: *Front, s: *game.Session) {
         or (item == 1) {
             f.showmessages = !f.showmessages;
         }
-        or {
+        or (item == 2) {
             f.menu = MENU_SOUND;
+        }
+        or (item == 3) {
+            # may the bots learn from how you play online
+            if (f.train == TRAIN_YES) {
+                f.train = TRAIN_NO;
+            }
+            or {
+                f.train = TRAIN_YES;
+            }
+            f.trainsaid = f.trainsaid + 1;
+        }
+        or {
+            # fetch the newest version of the program and start it
+            f.menuactive = 0;
+            f.netrequest = NET_UPDATE;
         }
     }
     or (f.menu == MENU_READ1) {
@@ -557,6 +609,13 @@ fun answer(f: *Front, s: *game.Session, yes: bool) {
     val ask: i32 = f.ask;
     f.message = nil;
     f.ask     = ASK_NONE;
+    if (ask == ASK_TRAIN) {
+        # either answer is an answer, and is kept
+        f.train = TRAIN_NO;
+        if (yes) { f.train = TRAIN_YES; }
+        f.trainsaid = f.trainsaid + 1;
+        ret;
+    }
     if (!yes) { ret; }
 
     if (ask == ASK_QUIT) {
@@ -704,8 +763,8 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         }
         video.write_text(d, screen, x, y + LINEHEIGHT * 5 + 4, "FIND AN OPEN GAME", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT * 6 + 4, "JOIN WITH A ROOM CODE", -1);
-        video.write_text(d, screen, x, y + LINEHEIGHT * 7 + 4, "WATCH THE BOT LEAGUE", -1);
-        video.write_text(d, screen, x, y + LINEHEIGHT * 8 + 4, "UPDATE THE GAME", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 7 + 4, "WATCH THE CO-OP BOTS", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 8 + 4, "WATCH THE DEATHMATCH BOTS", -1);
         var line: [20]u8 = [20]u8{'T', 'H', 'I', 'S', ' ', 'C', 'O', 'P', 'Y', ':', ' ', ' ', 0, 0, 0, 0, 0, 0, 0, 0};
         var k:    i32    = 0;
         for (k < 6 && f.build[k] != 0) {
@@ -798,6 +857,13 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         or {
             video.draw_patch(screen, x + 120, y + LINEHEIGHT, video.patch(d, "M_MSGOFF"));
         }
+        if (f.train == TRAIN_YES) {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 3 + 4, "BOTS LEARN FROM MY PLAY: YES", -1);
+        }
+        or {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 3 + 4, "BOTS LEARN FROM MY PLAY: NO", -1);
+        }
+        video.write_text(d, screen, x, y + LINEHEIGHT * 4 + 4, "UPDATE THE GAME", -1);
     }
     or (f.menu == MENU_SOUND) {
         x = 80;
@@ -1222,6 +1288,24 @@ fun finale_draw(f: *Front, s: *game.Session, screen: *u8) {
 # s:     the game
 # bar:   the status bar
 # input: what the player is holding down
+fun say(line: i32) {
+    sound.announce(?voice.SAMPLES[voice.START[line]], voice.LENGTH[line]);
+}
+
+# the announcer's tic, after the game's: a line that begins is also said
+fun announcer(f: *Front, s: *game.Session) {
+    val line: i32 = announce.tick(?f.ann, ?s.g);
+    if (line >= 0) { say(line); }
+}
+
+# put one of the announcer's lines up as if a player had earned it: for
+# tests, and for looking at
+pub fun announce_now(f: *Front, line: i32, who: i32) {
+    if (line < 0 || line >= announce.LINES) { ret; }
+    announce.show(?f.ann, line, who & 3);
+    say(line);
+}
+
 pub fun ticker(f: *Front, s: *game.Session, bar: *st.State, input: *game.Input) {
     # the menu's skull blinks
     f.skulltics = f.skulltics - 1;
@@ -1245,6 +1329,7 @@ pub fun ticker(f: *Front, s: *game.Session, bar: *st.State, input: *game.Input) 
         if (f.menuactive && !s.g.netgame) { ret; }
         game.ticker(s, input);
         st.ticker(?s.g, bar);
+        announcer(f, s);
         if (s.broken) { start_title(f); }
         if (s.completed) {
             if (s.wi.finale) {
@@ -1273,6 +1358,12 @@ pub fun ticker(f: *Front, s: *game.Session, bar: *st.State, input: *game.Input) 
 pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i32, map: i32, deathmatch: bool, names: *u8) bool {
     f.menuactive = 0;
     f.scores     = 0;
+    # a game to play, not one to watch: the number keys are weapons again.
+    # (Left set from watching the bots, they changed whose eyes the player
+    # saw through, in the middle of their own game.)
+    f.watching = 0;
+    f.spy      = -1;
+    announce.reset(?f.ann);
     if (deathmatch) {
         if (!game.deathmatch_game(s, players, me, skill, map, 1, 1)) { ret 0; }
         var k: i32 = 0;
@@ -1288,7 +1379,89 @@ pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i3
     f.netgame = 1;
     f.mode = MODE_LEVEL;
     level_song(f, s);
+    # in co-op the corner shows a team-mate from the start; not in a
+    # deathmatch, where it would be looking through the walls
+    if (!deathmatch) { spy_next(f, s); }
     ret 1;
+}
+
+# whether the corner may show another player's eyes: with a team, or
+# watching, and never in a deathmatch someone is playing
+pub fun may_spy(f: *Front, s: *game.Session) bool {
+    ret f.inset != nil && (f.watching || (s.g.netgame && s.g.deathmatch == 0));
+}
+
+# the corner's view moves on: to the next other player in the game, and
+# after the last of them to nobody
+pub fun spy_next(f: *Front, s: *game.Session) {
+    var at: i32 = f.spy + 1;
+    for (at < defs.MAXPLAYERS) {
+        if (s.g.playeringame[at] && at != s.g.consoleplayer) {
+            f.spy = at;
+            ret;
+        }
+        at = at + 1;
+    }
+    f.spy = -1;
+}
+
+# The second view: another player's eyes, drawn whole by a renderer of its
+# own and then put a third the size in the bottom right corner of the view,
+# framed, with whose eyes they are written over it.
+val INSET_W: i32 = 106;
+val INSET_H: i32 = 56;
+val INSET_X: i32 = 320 - 106 - 4;
+val INSET_Y: i32 = 168 - 56 - 4;
+
+fun draw_inset(f: *Front, s: *game.Session, screen: *u8) {
+    if (!may_spy(f, s) || f.spy < 0 || f.spy == s.g.consoleplayer || !s.g.playeringame[f.spy]) { ret; }
+    val them: *defs.Player = ?s.g.players[f.spy];
+    if (them.mo == nil) { ret; }
+    f.inset.lv = s.g.lv;
+    render.render_player_view(f.inset, ?s.g, them);
+    val from: *u8 = ?f.inset.screen[0];
+    var y:    i32 = 0;
+    for (y < INSET_H) {
+        var x: i32 = 0;
+        for (x < INSET_W) {
+            screen[(INSET_Y + y) * 320 + INSET_X + x] = from[(y * 3) * 320 + x * 3];
+            x                                         = x + 1;
+        }
+        y = y + 1;
+    }
+    # a frame, dark then light
+    var x: i32 = -1;
+    for (x <= INSET_W) {
+        screen[(INSET_Y - 1) * 320 + INSET_X + x]       = 0;
+        screen[(INSET_Y + INSET_H) * 320 + INSET_X + x] = 0;
+        x                                               = x + 1;
+    }
+    y = -1;
+    for (y <= INSET_H) {
+        screen[(INSET_Y + y) * 320 + INSET_X - 1]       = 0;
+        screen[(INSET_Y + y) * 320 + INSET_X + INSET_W] = 0;
+        y                                               = y + 1;
+    }
+    # whose: their name if the game has names, else their number
+    var label: [32]u8;
+    var at:    i32 = 0;
+    var k:     i32 = 0;
+    for (k < 23 && f.watched[f.spy * 24 + k] != 0 && (f.watching || f.scores)) {
+        label[at] = f.watched[f.spy * 24 + k];
+        at        = at + 1;
+        k         = k + 1;
+    }
+    if (at == 0) {
+        val word: str = "PLAYER ";
+        for (word[at] != 0) {
+            label[at] = word[at];
+            at        = at + 1;
+        }
+        label[at] = ('1' + f.spy)::u8;
+        at        = at + 1;
+    }
+    label[at] = 0;
+    video.write_text(s.d, screen, INSET_X + INSET_W - video.text_width(s.d, ?label[0]), INSET_Y - 10, ?label[0], -1);
 }
 
 # one tic of a network game: the same on every machine, because it depends
@@ -1309,6 +1482,7 @@ pub fun net_ticker(f: *Front, s: *game.Session, bar: *st.State, cmds: *defs.Ticc
     if (f.mode == MODE_LEVEL) {
         game.ticker_cmds(s, cmds);
         st.ticker(?s.g, bar);
+        announcer(f, s);
         if (s.completed) {
             if (s.wi.finale) {
                 start_finale(f);
@@ -1354,6 +1528,7 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
         if (player.mo != nil) {
             r.lv = s.g.lv;
             render.render_player_view(r, ?s.g, player);
+            if (f.mode == MODE_LEVEL) { draw_inset(f, s, screen); }
             st.draw(?s.g, bar, screen);
         }
     }
@@ -1366,6 +1541,9 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
     or (f.mode == MODE_FINALE) {
         finale_draw(f, s, screen);
     }
+
+    # the announcer's line, over the view and under everything else
+    if (f.mode == MODE_LEVEL && f.ann.line >= 0) { announce.draw(?f.ann, s.d, screen, ?f.watched[f.ann.who * 24]); }
 
     # watching the league: each bot's name and frags, the one whose eyes
     # these are marked
@@ -1397,6 +1575,7 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
                 k = k + 1;
             }
             frags = frags - s.g.players[i].frags[i];
+            if (f.watching && f.watchcoop) { frags = s.g.players[i].killcount; }
             line[at]     = ' ';
             line[at + 1] = ' ';
             at           = at + 2;
@@ -1404,6 +1583,10 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
                 line[at] = '-';
                 at       = at + 1;
                 frags    = -frags;
+            }
+            if (frags >= 100) {
+                line[at] = ('0' + frags / 100 % 10)::u8;
+                at       = at + 1;
             }
             if (frags >= 10) {
                 line[at] = ('0' + frags / 10 % 10)::u8;
@@ -1415,7 +1598,16 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
             row = row + 1;
             i   = i + 1;
         }
-        if (f.watching) { video.write_text(s.d, screen, 316 - video.text_width(s.d, "1-4: WHOSE EYES"), 54, "1-4: WHOSE EYES", -1); }
+        if (f.watching) {
+            video.write_text(s.d, screen, 316 - video.text_width(s.d, "1-4: WHOSE EYES"), 54, "1-4: WHOSE EYES", -1);
+            video.write_text(s.d, screen, 316 - video.text_width(s.d, "F12: SECOND VIEW"), 64, "F12: SECOND VIEW", -1);
+            if (f.watchcoop) {
+                video.write_text(s.d, screen, 316 - video.text_width(s.d, "L: DEATHMATCH BOTS"), 74, "L: DEATHMATCH BOTS", -1);
+            }
+            or {
+                video.write_text(s.d, screen, 316 - video.text_width(s.d, "L: CO-OP BOTS"), 74, "L: CO-OP BOTS", -1);
+            }
+        }
     }
 
     # a message replaces the menu while it is up, as in the original
@@ -1430,6 +1622,7 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
 
 # which of the 14 palettes the screen should be shown through
 pub fun palette(f: *Front, bar: *st.State) i32 {
-    if (f.mode == MODE_DEMO || f.mode == MODE_LEVEL) { ret bar.palette; }
+    if (f.mode == MODE_LEVEL && bar.palette == 0 && f.ann.line >= 0) { ret announce.palette(?f.ann); }
+    if (f.mode == MODE_DEMO || f.mode == MODE_LEVEL)                  { ret bar.palette; }
     ret 0;
 }

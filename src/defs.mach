@@ -433,6 +433,33 @@ pub rec Game {
     navw:      i32;
     navh:      i32;
     navserial: i32;
+    # a byte a cell: the key each of its four ways out needs, two bits a way
+    navkey:    *u8;
+    # which keys some way on the map needs, a bit a colour
+    navlocks:  i32;
+    # the level's exit: its line or -1, a place before it and (for an exit
+    # that is walked over) a place beyond it, and how many cells every cell
+    # is from it for a player with every key, 0 for no way
+    navexitline: i32;
+    navax:       Fixed;
+    navay:       Fixed;
+    navbx:       Fixed;
+    navby:       Fixed;
+    navexit:     *u16;
+    # that count reaches the players' start, so a cell it does not reach is
+    # a pit: a place with no way on
+    navpits: bool;
+    # a byte a cell: which of its ways out cross a line that ends the level
+    # when walked over
+    navout: *u8;
+    # four numbers a cell, one for each way out: the line that way crosses
+    # which was taken to open (a door, a lift's edge), plus one, or 0
+    navline: *u16;
+    # the level's secrets: a place to stand in each, and its sector
+    navsecrets: i32;
+    navsecretx: [32]Fixed;
+    navsecrety: [32]Fixed;
+    navsecret:  [32]i32;
     # the WAD holds only the first episode
     shareware: bool;
     # the flat that means "sky"

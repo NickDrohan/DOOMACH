@@ -82,6 +82,14 @@ pub rec Session {
 
     # the players the simulation plays itself; set after a game starts
     bots: [4]bot.Bot;
+
+    # in a network game, a watcher for each person: what a bot in their
+    # place would have sensed, beside what they did (bot.observe). sampled
+    # says this machine's own player was looked at this tic, and sample is
+    # what was seen.
+    watchers: [4]bot.Bot;
+    sampled:  bool;
+    sample:   [38]u8;
 }
 
 # what a finished level reports to the intermission (wbstartstruct_t)
@@ -259,8 +267,12 @@ fun clear_bots(s: *Session) {
     for (i < defs.MAXPLAYERS) {
         s.bots[i].active = 0;
         s.g.isbot[i]     = 0;
-        i                = i + 1;
+        # and the watchers begin again, the same on every machine
+        bot.start(?s.watchers[i], bot.KIND_SCRIPT, nil, (i + 1):~u32 * 2654435761);
+        s.watchers[i].active = 0;
+        i                    = i + 1;
     }
+    s.sampled = 0;
 }
 
 # G_InitNew: can be called by the startup code or the menu task
@@ -776,7 +788,8 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
     }
 
     # get commands
-    i = 0;
+    s.sampled = 0;
+    i         = 0;
     for (i < defs.MAXPLAYERS) {
         if (g.playeringame[i]) {
             val cmd: *Ticcmd = ?g.players[i].cmd;
@@ -791,6 +804,15 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
             }
             or {
                 @cmd = cmds[i];
+                # a person in a network game is watched, for bots to learn
+                # from if they have said they may
+                if (g.netgame && !g.isbot[i]) {
+                    var seen: [38]u8;
+                    if (bot.observe(g, i, ?s.watchers[i], cmd, ?seen[0]) && i == g.consoleplayer) {
+                        s.sample  = seen;
+                        s.sampled = 1;
+                    }
+                }
             }
         }
         i = i + 1;

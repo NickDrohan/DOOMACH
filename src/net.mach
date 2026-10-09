@@ -684,6 +684,27 @@ fun gather_relay(n: *Net) bool {
 }
 
 # a host asks the relay to start now, with bots in the seats nobody took
+# send how this machine's player has been playing to the relay, for the bot
+# leagues: only ever called for a player who has said it may be
+# ---
+# mode:    1 for co-op, 2 for a deathmatch
+# samples: count of them, rp.TRAINSAMPLE bytes each, at most rp.TRAINMOST
+pub fun send_training(n: *Net, mode: i32, map: i32, skill: i32, samples: *u8, count: i32) {
+    if (!n.relaymode || count < 1 || count > rp.TRAINMOST) { ret; }
+    val at: i32 = rp.header(?n.wrap[0], rp.TRAIN, n.me, 0, n.token);
+    n.wrap[at]     = rp.VERSION;
+    n.wrap[at + 1] = mode::u8;
+    n.wrap[at + 2] = map::u8;
+    n.wrap[at + 3] = skill::u8;
+    n.wrap[at + 4] = count::u8;
+    var k: i32 = 0;
+    for (k < count * rp.TRAINSAMPLE) {
+        n.wrap[at + 5 + k] = samples[k];
+        k                  = k + 1;
+    }
+    to_relay(n, at + 5 + count * rp.TRAINSAMPLE);
+}
+
 pub fun ask_fill(n: *Net) {
     n.wantfill = 1;
 }
@@ -832,12 +853,16 @@ pub rec Watch {
     done:  bool;
     # the relay answered, but has no match to give
     none:  bool;
+    # which league's match: 1 for the co-op league's
+    which: u8;
     asked: i64;
     asks:  i32;
     buf:   [1100]u8;
 }
 
-pub fun watch_open(w: *Watch, relay: *Peer) bool {
+pub fun watch_open(w: *Watch, relay: *Peer, coop: bool) bool {
+    w.which = 0;
+    if (coop) { w.which = 1; }
     val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(ip.endpoint(0, 0, 0, 0, 0), socket_api.async_flags());
     if (sel bound.err) { ret 0; }
     w.sock        = bound.ok;
@@ -882,6 +907,7 @@ pub fun watch_poll(w: *Watch, now: i64) {
                 val at: i32 = rp.header(?w.buf[0], rp.WATCH, 0, 0, 0);
                 w.buf[at]     = rp.VERSION;
                 w.buf[at + 1] = piece::u8;
+                w.buf[at + 2] = w.which;
                 udp.send_to(?w.sock, ?w.buf[0], rp.WATCHSIZE::usize, endpoint_of(?w.relay));
             }
             piece = piece + 1;
@@ -946,7 +972,7 @@ pub fun refusal(n: *Net) str {
     if (why == rp.NO_ROOM) { ret "there is no room with that code."; }
     if (why == rp.ROOM_FULL) { ret "that room is full."; }
     if (why == rp.STARTED) { ret "that game has already started."; }
-    if (why == rp.WAD_MISMATCH) { ret "the host has a different version of\nthe game or the WAD. everyone: play\nonline, update the game."; }
+    if (why == rp.WAD_MISMATCH) { ret "the host has a different version of\nthe game or the WAD. everyone:\noptions, update the game."; }
     if (why == rp.OLD_VERSION) { ret "the host has a different version of this game."; }
     if (why == rp.BUSY) { ret "the relay is busy; try again in a little while."; }
     ret "the game could not be joined.";
