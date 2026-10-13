@@ -207,6 +207,10 @@ pub rec Bot {
     shots:  i32;
     turned: i32;
     uses:   i32;
+    # how it last turned, and how often its turning has changed sides: what
+    # watching through its eyes is like
+    wasturn: i32;
+    swings:  i32;
 }
 
 fun clamp(v: i32, lo: i32, hi: i32) i32 {
@@ -2130,6 +2134,42 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
             }
             i = i + 1;
         }
+    }
+
+    # A steady hand, whatever decided. A decision is held four tics, and a
+    # turn of t held that long is t * 5 / 16 of the 256ths its bearings are
+    # counted in; the script asks for six times the bearing, which is
+    # nearly twice the turn that gets there, so a bot swung past what it
+    # was turning to, then back past it, and its view never stopped
+    # shaking. So: no more turn than reaches what it is turning to (an
+    # enemy in sight, else the way it is walking); none at all for a hair's
+    # breadth; and a turn that reverses the last is taken at half.
+    var toward: i32  = 0;
+    var aimed:  bool = 0;
+    if (b.feat[F_SEEN] > 0) {
+        toward = b.feat[F_BEARING];
+        aimed  = 1;
+    }
+    or (b.feat[F_WAY] > 0) {
+        toward = b.feat[F_PATH];
+        aimed  = 1;
+    }
+    # (Not while it is working itself free of something: then it turns as
+    # it must, and a hand held steady stays stuck. Nor with its fists up
+    # and someone to hit: at arm's length a mark moves faster than a steady
+    # hand follows, and brawlers held to it never landed a blow.)
+    val brawling: bool = (p.readyweapon == defs.WP_FIST || p.readyweapon == defs.WP_CHAINSAW) && b.feat[F_SEEN] > 0;
+    if (b.feat[F_STUCK] > 40 || forward < 0 || brawling) { aimed = 0; }
+    if (aimed) {
+        var reach: i32 = toward * 3;
+        if (toward > -3 && toward < 3) { reach = 0; }
+        if (reach >= 0 && turn > reach && turn > 0) { turn = reach; }
+        if (reach <= 0 && turn < reach && turn < 0) { turn = reach; }
+    }
+    if (!brawling && ((turn > 0 && b.wasturn < 0) || (turn < 0 && b.wasturn > 0))) { turn = turn / 2; }
+    if (looking) {
+        if ((turn > 0 && b.wasturn < 0) || (turn < 0 && b.wasturn > 0)) { b.swings = b.swings + 1; }
+        if (turn != 0) { b.wasturn = turn; }
     }
 
     # the decision, held until the next: full speed is 50 forward and 40

@@ -16,12 +16,13 @@ mkdir -p /data/league
 chown nobody:nobody /data/league
 as_nobody="setpriv --reuid=nobody --regid=nobody --clear-groups"
 
-# keep_arena <its standings> <its share of the processor> <minutes without
-# new standings that mean it has stalled> [coop]
+# keep_arena <the file it writes to say it is alive> <its share of the
+# processor> <minutes without that file written that mean it has stalled>
+# [coop]
 #
-# Ten minutes for both: an arena writes its standings after every match,
-# and one match, even eight minutes of Nightmare within a few hundredths of
-# a processor, takes less than that.
+# Ten minutes for both: an arena says it is alive after every match, and
+# the co-op league, whose match is a campaign of nine levels, after every
+# level.
 keep_arena() {
     local board="/data/league/$1"
     while true; do
@@ -29,7 +30,7 @@ keep_arena() {
         local arena=$!
         while kill -0 "$arena" 2>/dev/null; do
             sleep 60
-            # the standings are rewritten every minute while the league plays
+            # the file is written again every minute while the league plays
             if [ -n "$(find "$board" -mmin "+$3" 2>/dev/null)" ]; then
                 echo "start: the arena for $1 has stalled; starting it again" >&2
                 kill -9 "$arena" 2>/dev/null
@@ -63,8 +64,8 @@ begin_again() {
 begin_again epoch.dm "${LEAGUE_EPOCH:-1}" league.bin board.json watch.bin feel.bin
 begin_again epoch.coop "${COOP_EPOCH:-1}" coop.bin coop.json coopwatch.bin coopfeel.bin
 
-keep_arena board.json "${ARENA_DUTY:-2}" 10 &
-keep_arena coop.json "${COOP_DUTY:-4}" 10 coop &
+keep_arena league.beat "${ARENA_DUTY:-1}" 10 &
+keep_arena coop.beat "${COOP_DUTY:-5}" 10 coop &
 wait -n "$relay" "$hedge"
 echo "start: a server stopped; stopping the machine" >&2
 kill 0

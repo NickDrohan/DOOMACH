@@ -215,8 +215,17 @@ same imitation of the hand-written bot (`fixtures/bot0.net`) and go their own wa
 **The game.** Four bots are a team on a map of the first episode, on **Nightmare** and nothing
 easier: monsters twice as quick to attack, demons at twice the speed, fireballs at twice
 theirs, and everything killed gets up again. (Nightmare's fast demons and fireballs were not in
-this port until the league needed them: `world.mach`, `fast`.) A match is eight minutes or
-until the team is out of the level.
+this port until the league needed them: `world.mach`, `fast`.)
+
+**A match is a campaign.** Not a level but the episode: all nine levels in the order a player
+meets them (the secret level after the third), the same four from the first to the last,
+carrying forward what they hold as players do (`game.campaign_game`). A level is left when the
+team finishes it or when eight minutes of it have gone. Every campaign is every level, so no
+bot is ever rated on a lucky draw of maps, and a bot's score for a campaign is added to its
+running total, which the standings show as its points. A campaign is about fifty seconds of a
+desktop processor; within the twentieth of a shared one the co-op league has on the server
+(`COOP_DUTY`) it is seventeen minutes, and as long again for the replay with mutants, so the
+league plays some forty campaigns a day.
 
 **They play the level through; they do not race it.** A co-op bot with nobody to follow has
 three things to do, in order:
@@ -246,6 +255,17 @@ that never learned them is a danger to itself and to its team:
   stand. Four bots hit each other 17, 23 and 50 times a match on E1M1, E1M2 and E1M5 before;
   7, 7 and 5 now. What is left is mostly shots already in the air when a friend steps in.
 - *It leaves the exit to a person*, as below.
+
+**A steady hand.** A bot decides every fourth tic and holds what it decided. The script asks
+for a turn of six times the bearing to whatever it is turning to, which held four tics is
+nearly twice the turn that gets there: so a bot swung past its mark, then back past it, on six
+decisions in ten, and the view through its eyes never stopped shaking. Now, whatever decided,
+a turn is no more than reaches what the bot is turning to (an enemy in sight, else the way it
+is walking), nothing at all for a hair's breadth, and half when it reverses the last. A bot's
+turning changes sides about 80 times a minute where it was 300, and it fights and finds its
+way as well as it did. (Not while it is working itself free of something, when it turns as it
+must; nor with its fists up and someone to hit, since at arm's length a mark moves faster than
+a steady hand follows.)
 
 **A bot looks after its people.** In co-op, with a person in the game:
 
@@ -311,19 +331,23 @@ hand-written bots for two minutes on each of the seven maps, that took frags fro
 "Calm" is the same level with the monsters taken out (`coopmatch ... calm`), which shows the
 route-finding apart from the fighting.
 
-| Map | Calm: secrets, exit | Nightmare: secrets, exit |
-|---|---|---|
-| E1M1 | 3 of 3, out at 5:00 | 3 of 3, out at 5:32 |
-| E1M2 | 3 of 6, out at 5:28 | 1 of 6, not out |
-| E1M3 | 7 of 7, not out | 0 of 7, not out |
-| E1M4 | 2 of 3, out at 5:00 | 2 of 3, not out |
-| E1M5 | 9 of 9, out at 7:35 | 2 of 9, not out |
-| E1M6 | 4 of 4, out at 5:17 | 1 of 4, not out |
-| E1M7 | 1 of 4, out at 5:00 | 0 of 4, not out |
-| E1M9 | 1 of 2, not out | 1 of 2, not out |
+| Map | Calm: secrets, exit |
+|---|---|
+| E1M1 | 3 of 3, out at 5:00 |
+| E1M2 | 3 of 6, out at 5:01 |
+| E1M3 | 1 of 7, not out |
+| E1M4 | 2 of 3, out at 5:01 |
+| E1M5 | 9 of 9, out at 7:36 |
+| E1M6 | 4 of 4, not out |
+| E1M7 | 1 of 4, out at 5:06 |
+| E1M9 | 1 of 2, not out |
 
-So: one map done as asked on Nightmare; with the monsters out, three done as asked (E1M1,
-E1M5, E1M6) and three more finished short of a secret or three. What is left is of two kinds. Where calm falls
+On Nightmare the same four finish E1M1 with two or three of its secrets, and in a campaign
+(two, from the net the league begins as) a team finished one level of the nine and found ten
+of the episode's 39 secrets.
+
+So: with the monsters out, five maps of eight finished, two of them with every secret; on
+Nightmare, one. What is left is of two kinds. Where calm falls
 short, the route-finding does: a bot can circle a goal it believes in and cannot reach, with
 nothing yet to make it give it up (only secrets have that); the walk grid does not see
 E1M3's exit at all; and results have swung between builds (E1M3's secrets from seven to one
@@ -345,10 +369,13 @@ place. That is four trials a match. A match is still chaos, so some mutants are 
 what sorts those out is the rating, and inheritance: every fifth match, in one style, the
 lowest-rated learner takes the net of the highest-rated if they are sixty points apart.
 
-**What co-op pays for.** At first a co-op bot was rated mostly on kills (two a kill, five off
-a death), and the league did what it was paid to: after two thousand matches its top bots
-killed half as much again as at the start, died as often as ever, and finished no more levels.
-Now it is paid for what gets a team through a level, each thing once:
+**What co-op pays for.** Twice the league has done exactly what it was paid to and not what
+was wanted. Paid two a kill and five off a death, its top bots came to kill half as much again
+and finish no more levels. Paid fifteen off a death, it learned that the bot which never moves
+never dies: Survivors and Pacifists that stood where they began rose to the top with four
+kills a game, and levels finished fell from one in eleven to one in twenty-six. So now a death
+costs little, and nothing at all can be earned by standing still. A campaign's score, each
+thing once a level:
 
 | | Points |
 |---|---|
@@ -356,18 +383,19 @@ Now it is paid for what gets a team through a level, each thing once:
 | a locked door opened, to whoever was at it | 30 |
 | a switch thrown or a line crossed that works once, to whoever was at it | 8 |
 | a secret, to the first in | 25 |
-| each hundredth of the way to the exit | 1 |
-| the level finished (a style's reward; it does not tell team-mates apart, so not the rating) | 100 |
+| each hundredth of the way to a level's exit | 1 |
 | a kill | 1 |
-| a death | -15 |
+| a death | -3 |
+| a level finished, to each of the four (in the running total and a style's reward; it does not tell team-mates apart, so not in the rating) | 100 |
 
 A door opened forty times is a door opened once: only the first opening counts, and only
 lines that work once are counted at all, so there is nothing to farm. The route is still the
-hand-written route-finding's; what the net is paid for is staying alive along it.
+hand-written route-finding's; what the net is paid for is getting along it alive.
 
 The styles: Crusaders and Brawlers want all of that. Explorers want it without the kills.
-Survivors want not to die and the level finished. Slayers and Marksmen still want kills, and
-the rest still want what they want in the other league.
+Survivors want the way covered and the levels finished, at little cost in deaths; Pacifists
+the same without firing. Slayers and Marksmen still want kills, and the rest still want what
+they want in the other league.
 
 **What a deathmatch pays for.** Frags, and now accuracy. Most league deathmatches have no frag
 in them, which left the rating nothing to go on; shots that hit are far commoner than frags.

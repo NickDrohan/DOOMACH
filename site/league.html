@@ -33,7 +33,7 @@
   th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--rule); }
   th { font-size: 0.78rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
   th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4),
-  th:nth-child(11), td:nth-child(11), th:nth-child(12), td:nth-child(12) { text-align: left; }
+  th:nth-child(12), td:nth-child(12), th:nth-child(13), td:nth-child(13) { text-align: left; }
   tr:last-child td { border-bottom: 0; }
   td.rank { color: var(--muted); }
   .style { font-size: 0.85rem; color: var(--muted); }
@@ -62,9 +62,11 @@
   <p class="lede" id="lede-coop" hidden>A hundred other bots, with networks of their own, playing as teams of four
   against the first episode on Nightmare: fast monsters that come back. They play a level through, not race it:
   into every secret they can find a way into, fighting until five minutes are up, and only then out by the
-  exit. A match is a level, for eight minutes or until the team is out of it. Each is rated against its own
-  team-mates by what it killed, the secrets it was first into, how far it got, the keys it found and how
-  seldom it died.</p>
+  exit. A match is a <b>campaign</b>: all nine levels in order, the same four from first to last, carrying
+  their weapons forward, each level for eight minutes or until the team is out of it. A bot's score for the
+  campaign is what it did to get the team on (secrets, keys, locked doors, switches, the way it covered, a
+  little for a kill and a little off for a death) and nothing for standing still. It is rated against its
+  team-mates by that score, and <b>Points</b> is its running total over every campaign it has played.</p>
 
   <p class="lede"><b>To watch a match:</b> in <a href="./">the game</a>, press Esc, choose <em>Play online</em>,
   then <em>Watch the co-op bots</em> or <em>Watch the deathmatch bots</em>. The last match plays again on your
@@ -79,8 +81,8 @@
 
   <div class="scroll">
     <table>
-      <thead><tr><th>#</th><th>Bot</th><th>Style</th><th>Quirk</th><th>Rating</th><th>Games</th><th id="h-frags">Frags</th><th>Deaths</th><th id="h-ratio">F/D</th><th>Gen</th><th>Likes</th><th>Dislikes</th></tr></thead>
-      <tbody id="rows"><tr><td colspan="12" style="text-align:center;color:var(--muted)">Loading&hellip;</td></tr></tbody>
+      <thead><tr><th>#</th><th>Bot</th><th>Style</th><th>Quirk</th><th>Rating</th><th>Games</th><th id="h-frags">Frags</th><th>Deaths</th><th id="h-ratio">F/D</th><th id="h-points">Points</th><th>Gen</th><th>Likes</th><th>Dislikes</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="13" style="text-align:center;color:var(--muted)">Loading&hellip;</td></tr></tbody>
     </table>
   </div>
 
@@ -139,6 +141,7 @@
       cell(tr, b.frags);
       cell(tr, b.deaths);
       cell(tr, b.deaths ? (b.frags / b.deaths).toFixed(2) : (b.frags ? "∞" : "–"));
+      cell(tr, coop ? (b.points || 0).toLocaleString() : "");
       cell(tr, b.generation);
       cell(tr, b.friend ? b.friend + " " + b.likes : "", "style");
       cell(tr, b.enemy ? b.enemy + " " + b.dislikes : "", "style");
@@ -149,16 +152,16 @@
     board.last.players.slice().sort(function (a, b) { return b.frags - a.frags; }).forEach(function (p) {
       var span = document.createElement("span");
       var b = document.createElement("b");
-      b.textContent = coop ? p.frags + " kills, " + p.progress + "% of the way" : p.frags;
+      b.textContent = coop ? p.score + " points (" + p.frags + " kills, " + p.deaths + " deaths)" : p.frags;
       span.appendChild(document.createTextNode(p.name + " "));
       span.appendChild(b);
       players.appendChild(span);
     });
     document.getElementById("lastmap").textContent = "on " + board.last.map +
-      (coop ? (board.last.finished ? ": finished, " : ": not finished, ") + board.last.secrets + " of " +
+      (coop ? ": " + board.last.finished + " of 9 levels finished, " + board.last.secrets + " of " +
         board.last.of + " secrets" : "");
     document.getElementById("meta").textContent =
-      board.matches.toLocaleString() + " matches played · " +
+      board.matches.toLocaleString() + (coop ? " campaigns played · " : " matches played · ") +
       (coop ? board.finished.toLocaleString() + " levels finished · " : "") + "standings updated " +
       ago(Date.now() / 1000 - board.updated);
     document.getElementById("taught").textContent = board.taught
@@ -177,6 +180,7 @@
     document.getElementById("key-coop").hidden = !coop;
     document.getElementById("h-frags").textContent = coop ? "Kills" : "Frags";
     document.getElementById("h-ratio").textContent = coop ? "K/D" : "F/D";
+    document.getElementById("h-points").textContent = coop ? "Points" : "";
     document.getElementById("now").hidden = true;
     history.replaceState(null, "", coop ? "#coop" : "#deathmatch");
     load();

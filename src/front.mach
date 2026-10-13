@@ -1043,6 +1043,9 @@ fun wi_ticker(f: *Front, s: *game.Session, input: *game.Input) {
     or {
         f.usedown = 0;
     }
+    # nobody is at the keys when the bots are being watched: the tally is
+    # hurried along by itself, a stage every three seconds
+    if (f.watching && f.bcnt % 105 == 0) { f.acceleratestage = 1; }
 
     # WI_updateAnimatedBack
     var j: i32 = 0;

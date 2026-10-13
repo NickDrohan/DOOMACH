@@ -80,6 +80,14 @@ pub rec Session {
     completed: bool;
     wi:        Finished;
 
+    # A campaign: the whole episode in the order a player meets it, the
+    # secret level after the third, each level left when it is finished or
+    # when levelcap tics of it have gone, whichever is first. capped says
+    # the level just left was left for the clock.
+    campaign: bool;
+    levelcap: i32;
+    capped:   bool;
+
     # the players the simulation plays itself; set after a game starts
     bots: [4]bot.Bot;
 
@@ -265,6 +273,10 @@ pub fun set_bot(s: *Session, player: i32, kind: i32, net: *i8, seed: u32) {
 }
 
 fun clear_bots(s: *Session) {
+    # and whatever game this is, it is not a campaign until it says so
+    s.campaign = 0;
+    s.levelcap = 0;
+    s.capped   = 0;
     var i: i32 = 0;
     for (i < defs.MAXPLAYERS) {
         s.bots[i].active = 0;
@@ -369,6 +381,21 @@ pub fun coop_game(s: *Session, players: i32, me: i32, skill: i32, map: i32) bool
         i                 = i + 1;
     }
     ret init_new(s, skill, 1, map);
+}
+
+# start a campaign: a co-op game of the whole episode, from the first map,
+# each level played until it is finished or its time is up, and the secret
+# level in its place after the third whether or not anyone found the way
+# to it. The league's co-op teams play these; every machine watching one
+# calls this with the same numbers.
+# ---
+# cap: tics a level may take before the team is moved on
+pub fun campaign_game(s: *Session, players: i32, me: i32, skill: i32, cap: i32) bool {
+    if (!coop_game(s, players, me, skill, 1)) { ret 0; }
+    s.campaign = 1;
+    s.levelcap = cap;
+    s.capped   = 0;
+    ret 1;
 }
 
 # start a deathmatch: every machine in the game calls this with the same
@@ -560,7 +587,7 @@ fun completed(s: *Session) {
     # the level to go to: the secret exit leads to map 9, map 9 leads back
     # to the level after the one with the secret exit
     var next: i32 = g.gamemap + 1;
-    if (secret) {
+    if (secret || (s.campaign && g.gamemap == 3)) {
         next = 9;
     }
     or (g.gamemap == 9) {
@@ -605,6 +632,7 @@ fun completed(s: *Session) {
 # G_DoWorldDone: the intermission is over; on to the next map
 pub fun world_done(s: *Session) {
     s.completed = 0;
+    s.capped    = 0;
     s.g.gamemap = s.wi.next;
     load_level(s);
 }
@@ -776,6 +804,12 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
             }
         }
         i = i + 1;
+    }
+
+    # a campaign's level has had its time
+    if (s.campaign && s.levelcap > 0 && g.leveltime >= s.levelcap && g.exited == 0) {
+        g.exited = 1;
+        s.capped = 1;
     }
 
     # do things to change the game state
