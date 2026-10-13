@@ -18,7 +18,7 @@ platform layer and no C. On top of the port:
 - an in-game update, an observer mode, a deathmatch announcer, opt-in training from human play.
 
 Owner: Nick Drohan (`NickDrohan` on GitHub). Repo: <https://github.com/NickDrohan/DOOMACH>,
-branch `main`, last commit at handoff `cc4d44e`, last tag `v0.2.0` (one commit behind `main`).
+branch `main`, last code commit at handoff `cc4d44e`, last tag `v0.2.0` (one commit behind `main`).
 Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
 
 ## State at handoff
