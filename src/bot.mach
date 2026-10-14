@@ -182,6 +182,16 @@ pub rec Bot {
     keyx:     Fixed;
     keyy:     Fixed;
     keyuntil: i32;
+    # a goal that is no secret — a monster, a key, a friend — by where it
+    # lay, since when it has been after it, and the nearest it has been to
+    # it; and the place it has given up on, and until when
+    gox:      Fixed;
+    goy:      Fixed;
+    gosince:  i32;
+    gobest:   i32;
+    gavex:    Fixed;
+    gavey:    Fixed;
+    gavetill: i32;
     # working what is in the way, at each depth of solving: the line in the
     # way, which of the lines that work it is being tried, and since when
     actblock: [3]i32;
@@ -442,7 +452,7 @@ fun find_item(g: *Game, p: *Player) *Mobj {
             val mo: *Mobj = th:~*Mobj;
             if ((mo.flags & defs.MF_SPECIAL) != 0) {
                 val d: i32 = distance(me, mo.x, mo.y);
-                if (d < bestdist && takes(g, p, mo)) {
+                if (d < bestdist && takes(g, p, mo) && !lost(g, mo.x, mo.y)) {
                     best     = mo;
                     bestdist = d;
                 }
@@ -464,7 +474,7 @@ fun find_item(g: *Game, p: *Player) *Mobj {
 # which of its four neighbours a player could walk to from its middle: no
 # wall or blocking line between, room to stand, no step up of more than a
 # stride. A line that does something (a door, a lift) is taken to open.
-val CELL:  i32 = 32;
+pub val CELL:  i32 = 32;
 val EAST:  i32 = 1;
 val NORTH: i32 = 2;
 val WEST:  i32 = 4;
@@ -496,6 +506,12 @@ var walkblock:  i32;
 # and a walk tested the easy way notes the line it took on trust
 var walktrust: i32;
 
+# the tags of the sectors a level ends in (special 11): a teleport that
+# lands on one is crossed as a way out, the same as a line that ends the
+# level when walked over
+var navendtags: [8]i32;
+var nendtags:   i32;
+
 # lines a bot solving its way has found shut with nothing to open them from
 # where it would come: its search goes round them
 var banned:  [16]i32;
@@ -521,6 +537,14 @@ fun harmful(g: *Game, cell: i32) bool {
     ret g.navpits && g.navexit[cell] == 0 && g.navgrid[cell] != 0;
 }
 
+# whether a place stands in a cell the level's exit cannot be walked to
+# from: a goal there is bait, for whoever goes in is not coming back out.
+# (Only the pit half of harmful(): slime on the way back out is waded.)
+fun lost(g: *Game, x: Fixed, y: Fixed) bool {
+    val cell: i32 = cell_of(g, x, y);
+    ret cell >= 0 && g.navpits && g.navexit[cell] == 0 && g.navgrid[cell] != 0;
+}
+
 val KEY_BLUE:   i32 = 1;
 val KEY_YELLOW: i32 = 2;
 val KEY_RED:    i32 = 4;
@@ -536,6 +560,24 @@ pub val LEAVE: i32 = 5 * 60 * 35;
 # how long a bot makes for one secret without getting any nearer it before
 # giving it up for another
 val SECRET_PATIENCE: i32 = 45 * 35;
+# how long a bot keeps after a goal it has made no progress toward, and how
+# near a place the one it has given up on
+val GOAL_PATIENCE: i32 = 45 * 35;
+val GAVE_RADIUS:   i32 = 192;
+
+# whether a line teleports whoever crosses it onto the level's ending floor:
+# a teleport special whose tag names a sector of special 11, as E1M8's star
+# teleporter does once the bruisers are dead
+fun ends_level(g: *Game, line: *level.Line) bool {
+    val s: i32 = line.special::i32;
+    if (s != 39 && s != 97 && s != 125 && s != 126) { ret 0; }
+    var i: i32 = 0;
+    for (i < nendtags) {
+        if (navendtags[i] == line.tagnum::i32) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
 
 # the key a line's door needs, as its bit, or 0
 fun key_of(special: i32) i32 {
@@ -562,7 +604,7 @@ fun walk_stops(g: *Game, in: *defs.Intercept) bool {
     # a locked door stops whoever has not its key, and a line that ends the
     # level whoever is not yet leaving
     var key: i32 = key_of(line.special::i32);
-    if (line.special == 52 || line.special == 124) { key = KEY_EXIT; }
+    if (line.special == 52 || line.special == 124 || ends_level(g, line)) { key = KEY_EXIT; }
     if (key != 0) {
         if ((walkhave & key) == 0) { ret 0; }
         walkkey = walkkey | key;
@@ -608,11 +650,11 @@ fun walks_now(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed) bool {
     ret ok;
 }
 
-fun cell_x(g: *Game, cx: i32) Fixed {
+pub fun cell_x(g: *Game, cx: i32) Fixed {
     ret g.lv.bmaporgx + ((cx * CELL + CELL / 2) << 16);
 }
 
-fun cell_y(g: *Game, cy: i32) Fixed {
+pub fun cell_y(g: *Game, cy: i32) Fixed {
     ret g.lv.bmaporgy + ((cy * CELL + CELL / 2) << 16);
 }
 
@@ -663,6 +705,35 @@ fun way_open(g: *Game, cell: i32, way: i32, have: i32) bool {
     ret index == 0 || (have & (1 << (index - 1))) != 0;
 }
 
+# the steps a stair builder raises out of a tagged sector, flagged as moved
+# so the grid trusts the walks across them. the chain is the one movers'
+# build_stairs follows: each step takes the next sector behind a two-sided
+# line its predecessor faces out of, where that sector's floor wears the
+# first step's flat
+fun mark_stairs(g: *Game, start: i32) {
+    val texture: i32 = g.lv.sectors[start].floorflat;
+    var secnum:  i32 = start;
+    for {
+        var ok: bool = 0;
+        var i:  i32  = 0;
+        for (i < g.lv.sectors[secnum].linecount) {
+            val line: *level.Line = ?g.lv.lines[g.lv.sector_lines[g.lv.sectors[secnum].firstline + i]];
+            i = i + 1;
+            if ((line.flags::i32 & defs.ML_TWOSIDED) == 0) { cnt; }
+            if (line.frontsector != secnum)                { cnt; }
+            val next: i32 = line.backsector;
+            if (next == level.NONE)                      { cnt; }
+            if (g.lv.sectors[next].floorflat != texture) { cnt; }
+            if (g.navmoves[next] != 0)                   { cnt; }
+            g.navmoves[next] = 1;
+            secnum = next;
+            ok     = 1;
+            brk;
+        }
+        if (!ok) { brk; }
+    }
+}
+
 fun build_grid(g: *Game) {
     val had: i32 = walkhave;
     walkhave = KEY_ALL;
@@ -681,6 +752,7 @@ fun build_grid_with_every_key(g: *Game) {
     g.navlocks    = 0;
     g.navsecrets  = 0;
     g.navpits     = 0;
+    nendtags      = 0;
     if (g.navw * g.navh > MAXCELLS) { ret; }
     g.navgrid  = defs.alloc(g, (g.navw * g.navh)::usize):~*u8;
     g.navkey   = defs.alloc(g, (g.navw * g.navh)::usize):~*u8;
@@ -701,8 +773,34 @@ fun build_grid_with_every_key(g: *Game) {
                 if (g.lv.sectors[sc].tagnum == line.tagnum) { g.navmoves[sc] = 1; }
                 sc = sc + 1;
             }
+            # a stair builder's tag names only the first step; the rest of the
+            # flight is found at run time, so mark it the same way here
+            if (line.special == 7 || line.special == 8 || line.special == 100 || line.special == 127) {
+                sc = 0;
+                for (sc < g.lv.numsectors) {
+                    if (g.lv.sectors[sc].tagnum == line.tagnum) { mark_stairs(g, sc); }
+                    sc = sc + 1;
+                }
+            }
         }
         l = l + 1;
+    }
+    # and the walls a boss's death lowers (tag 666): no line works them, the
+    # level's last bruiser or the like dying does
+    var sc2: i32 = 0;
+    for (sc2 < g.lv.numsectors) {
+        if (g.lv.sectors[sc2].tagnum == 666) { g.navmoves[sc2] = 1; }
+        if (g.lv.sectors[sc2].special == 11 && g.lv.sectors[sc2].tagnum != 0 && nendtags < 8) {
+            var seen: i32 = 0;
+            for (seen < nendtags && navendtags[seen] != g.lv.sectors[sc2].tagnum::i32) {
+                seen = seen + 1;
+            }
+            if (seen == nendtags) {
+                navendtags[nendtags] = g.lv.sectors[sc2].tagnum::i32;
+                nendtags             = nendtags + 1;
+            }
+        }
+        sc2 = sc2 + 1;
     }
 
     var cy: i32 = 0;
@@ -842,31 +940,46 @@ fun find_secrets(g: *Game) {
 # place to make for is a little in front of a switch; for a line to walk
 # over there are two, one either side, and a bot makes for the far one.
 fun find_exit(g: *Game) {
-    var l: i32 = 0;
+    var l:      i32  = 0;
+    var across: bool = 0;
     for (l < g.lv.numlines) {
         val line: *level.Line = ?g.lv.lines[l];
         if (line.special == 11 || line.special == 52) {
-            val v1: level.Vertex = g.lv.vertexes[line.v1];
-            val v2: level.Vertex = g.lv.vertexes[line.v2];
-            val mx: Fixed = v1.x / 2 + v2.x / 2;
-            val my: Fixed = v1.y / 2 + v2.y / 2;
-            # twenty units off the line, to its front, which is its right
-            var len: i32 = maputl.aprox_distance(line.dx, line.dy) >> 16;
-            if (len < 1) { len = 1; }
-            val nx: Fixed = (line.dy / len) * 20;
-            val ny: Fixed = 0 - (line.dx / len) * 20;
-            g.navexitline = l;
-            g.navax       = mx + nx;
-            g.navay       = my + ny;
-            g.navbx       = g.navax;
-            g.navby       = g.navay;
-            if (line.special == 52) {
-                g.navbx = mx - nx;
-                g.navby = my - ny;
-            }
+            across = line.special == 52;
             brk;
         }
         l = l + 1;
+    }
+    # no switch and no line that ends the level where crossed: the level may
+    # end on a floor that hurts to death instead, reached by teleport
+    if (l == g.lv.numlines) {
+        l = 0;
+        for (l < g.lv.numlines) {
+            val line: *level.Line = ?g.lv.lines[l];
+            if (ends_level(g, line)) { across = 1; brk; }
+            l = l + 1;
+        }
+    }
+    if (l < g.lv.numlines) {
+        val line: *level.Line = ?g.lv.lines[l];
+        val v1: level.Vertex = g.lv.vertexes[line.v1];
+        val v2: level.Vertex = g.lv.vertexes[line.v2];
+        val mx: Fixed = v1.x / 2 + v2.x / 2;
+        val my: Fixed = v1.y / 2 + v2.y / 2;
+        # twenty units off the line, to its front, which is its right
+        var len: i32 = maputl.aprox_distance(line.dx, line.dy) >> 16;
+        if (len < 1) { len = 1; }
+        val nx: Fixed = (line.dy / len) * 20;
+        val ny: Fixed = 0 - (line.dx / len) * 20;
+        g.navexitline = l;
+        g.navax       = mx + nx;
+        g.navay       = my + ny;
+        g.navbx       = g.navax;
+        g.navby       = g.navay;
+        if (across) {
+            g.navbx = mx - nx;
+            g.navby = my - ny;
+        }
     }
     if (g.navexitline < 0) { ret; }
     g.navexit = defs.alloc(g, (g.navw * g.navh * 2)::usize):~*u16;
@@ -1037,6 +1150,23 @@ pub fun reaches(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed, round1: i3
 # for looking at the grid: the cell a place is in, or -1
 pub fun cell_at(g: *Game, x: Fixed, y: Fixed) i32 {
     ret cell_of(g, x, y);
+}
+
+# for navcheck's gap report: walk between two places the way grid-building
+# tests it, and again as the level stands this tic, saying what stopped each.
+# ret: the line that stopped the easy walk, or -1 when it goes (a special or
+# a moved sector taken on trust); strict gets whether the strict walk goes,
+# and strictline what stopped it
+pub fun probe_walk(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed, strict: *bool, strictline: *i32) i32 {
+    if (g.navserial != g.levelserial) { build_grid(g); }
+    walkhave = KEY_ALL;
+    nbanned  = 0;
+    val ok:     bool = can_walk(g, x1, y1, x2, y2);
+    val easy:   i32  = walkblock;
+    @strict     = walks_now(g, x1, y1, x2, y2);
+    @strictline = walkblock;
+    if (ok) { ret -1; }
+    ret easy;
 }
 
 # the cell a place is in, or -1 off the grid
@@ -1349,6 +1479,49 @@ fun solve_pass(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, fx_in: Fixe
     ret to;
 }
 
+# whether a goal that is no secret should be given up for now: it has had
+# GOAL_PATIENCE tics at it without coming a stride and a half nearer than
+# it has yet been. A goal that has wandered a quarter of a corridor is
+# counted a new one, its clock starting then
+fun stalling(g: *Game, b: *Bot, me: *Mobj, x: Fixed, y: Fixed) bool {
+    var dx: i32 = (x - b.gox) >> 16;
+    var dy: i32 = (y - b.goy) >> 16;
+    if (dx < 0) { dx = -dx; }
+    if (dy < 0) { dy = -dy; }
+    if (dx + dy > 256) {
+        b.gox     = x;
+        b.goy     = y;
+        b.gobest  = distance(me, x, y);
+        b.gosince = g.leveltime;
+        ret 0;
+    }
+    val away: i32 = distance(me, x, y);
+    if (away + 48 < b.gobest) {
+        b.gobest  = away;
+        b.gosince = g.leveltime;
+        ret 0;
+    }
+    ret g.leveltime - b.gosince > GOAL_PATIENCE;
+}
+
+# give up on the place a goal lay for a while: whatever is found there is
+# not tried again until then
+fun give_up(g: *Game, b: *Bot, x: Fixed, y: Fixed) {
+    b.gavex    = x;
+    b.gavey    = y;
+    b.gavetill = g.leveltime + 90 * 35;
+}
+
+# whether a place is the one the bot has given up on for now
+fun given_up(g: *Game, b: *Bot, x: Fixed, y: Fixed) bool {
+    if (g.leveltime >= b.gavetill) { ret 0; }
+    var dx: i32 = (x - b.gavex) >> 16;
+    var dy: i32 = (y - b.gavey) >> 16;
+    if (dx < 0) { dx = -dx; }
+    if (dy < 0) { dy = -dy; }
+    ret dx + dy <= GAVE_RADIUS;
+}
+
 # the way for a co-op bot that follows nobody, which plays the level: to
 # each secret nobody has been in; then, until five minutes are up, to the
 # nearest monster; then to the exit, or to a key the way there needs; 0 if
@@ -1363,6 +1536,7 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         b.goalbest   = 0;
         b.want       = -1;
         b.gaveup     = 0;
+        b.gavetill   = 0;
         b.gavekeys   = had;
         b.keyuntil   = 0;
     }
@@ -1401,16 +1575,17 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         # or a minute has gone by: a door may have been opened since
         b.gavekeys = had;
         b.gaveup   = 0;
+        b.gavetill = 0;
     }
     var tries: i32 = 0;
     for (tries < 4 && g.navsecrets > 0) {
         tries = tries + 1;
         var pick: i32 = -1;
-        if (b.want >= 0 && g.lv.sectors[g.navsecret[b.want]].special == 9 && (b.gaveup & (1 << b.want:~u32)) == 0) { pick = b.want; }
+        if (b.want >= 0 && g.lv.sectors[g.navsecret[b.want]].special == 9 && (b.gaveup & (1 << b.want:~u32)) == 0 && !lost(g, g.navsecretx[b.want], g.navsecrety[b.want])) { pick = b.want; }
         var k: i32 = 0;
         for (k < g.navsecrets && pick < 0) {
             val at: i32 = (k + playernum * 5) % g.navsecrets;
-            if (g.lv.sectors[g.navsecret[at]].special == 9 && (b.gaveup & (1 << at:~u32)) == 0) { pick = at; }
+            if (g.lv.sectors[g.navsecret[at]].special == 9 && (b.gaveup & (1 << at:~u32)) == 0 && !lost(g, g.navsecretx[at], g.navsecrety[at])) { pick = at; }
             k = k + 1;
         }
         if (pick < 0) { brk; }
@@ -1443,14 +1618,19 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
             }
             i = i + 1;
         }
-        if (friend != nil && distance(me, friend.x, friend.y) > 320) {
+        if (friend != nil && distance(me, friend.x, friend.y) > 320 && !given_up(g, b, friend.x, friend.y) && !lost(g, friend.x, friend.y)) {
             b.after = 5;
             val to: i32 = solve_to(g, me, b, friend.x, friend.y, friend.x, friend.y, have);
-            if (b.haveway) { ret to; }
+            if (b.haveway) {
+                if (stalling(g, b, me, friend.x, friend.y)) { give_up(g, b, friend.x, friend.y); }
+                or { ret to; }
+            }
         }
     }
 
     # Then, until it is time to leave, the monsters: the nearest one alive
+    # it has not given up on, one it has circled without ever reaching
+    # counted given up
     if (g.leveltime < LEAVE) {
         var prey:     *Mobj = nil;
         var bestdist: i32   = 0x7fffffff;
@@ -1458,7 +1638,7 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         for (th != ?g.thinkercap) {
             if (th.kind == defs.TH_MOBJ) {
                 val mo: *Mobj = th:~*Mobj;
-                if ((mo.flags & defs.MF_COUNTKILL) != 0 && mo.health > 0) {
+                if ((mo.flags & defs.MF_COUNTKILL) != 0 && mo.health > 0 && !given_up(g, b, mo.x, mo.y) && !lost(g, mo.x, mo.y)) {
                     val dist: i32 = distance(me, mo.x, mo.y);
                     if (dist < bestdist) {
                         prey     = mo;
@@ -1471,7 +1651,11 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         if (prey != nil) {
             b.after = 2;
             val to: i32 = solve_to(g, me, b, prey.x, prey.y, prey.x, prey.y, have);
-            if (b.haveway) { ret to; }
+            if (b.haveway) {
+                if (stalling(g, b, me, prey.x, prey.y)) { give_up(g, b, prey.x, prey.y); }
+                or { ret to; }
+            }
+            or { give_up(g, b, prey.x, prey.y); }
         }
     }
 
@@ -1538,21 +1722,24 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     # it gave itself is not up
     var k: i32 = 0;
     for (k < n && g.leveltime < b.keyuntil) {
-        if (keys[k].x == b.keyx && keys[k].y == b.keyy) {
+        if (keys[k].x == b.keyx && keys[k].y == b.keyy && !lost(g, b.keyx, b.keyy)) {
             val to: i32 = solve_to(g, me, b, b.keyx, b.keyy, b.keyx, b.keyy, have);
-            if (b.haveway && !unsure) { ret to; }
+            if (b.haveway && !unsure && !stalling(g, b, me, b.keyx, b.keyy)) { ret to; }
+            give_up(g, b, b.keyx, b.keyy);
         }
         k = k + 1;
     }
     k = 0;
     for (k < n) {
+        if (given_up(g, b, keys[k].x, keys[k].y) || lost(g, keys[k].x, keys[k].y)) { k = k + 1; cnt; }
         val to: i32 = solve_to(g, me, b, keys[k].x, keys[k].y, keys[k].x, keys[k].y, have);
-        if (b.haveway && !unsure) {
+        if (b.haveway && !unsure && !stalling(g, b, me, keys[k].x, keys[k].y)) {
             b.keyx     = keys[k].x;
             b.keyy     = keys[k].y;
             b.keyuntil = g.leveltime + 45 * 35;
             ret to;
         }
+        give_up(g, b, keys[k].x, keys[k].y);
         k = k + 1;
     }
     # none: the exit anyway, on trust

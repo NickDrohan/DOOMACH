@@ -39,7 +39,8 @@ The **way to an opponent** is real path-finding. Once a level, the map is cut in
 units square, and each cell records which of its four neighbours a player could walk to from
 its middle: no wall or blocking line between, room to stand, no step up of more than a stride.
 A line that does something (a door, a lift) is taken to open, and a sector some switch or
-trigger moves is taken to be where it needs to be. A bot searches that grid breadth-first from
+trigger moves is taken to be where it needs to be — a stair trigger marks its whole flight,
+the tag naming only the first step and the rest found by the flat, as the engine finds them. A bot searches that grid breadth-first from
 its opponent back to itself every sixteenth tic, and heads for the farthest of the next six
 cells it could walk straight to. `doom navdump` draws the grid; it is how the one-way pit on
 E1M5 was found (yellow: walked into, with no way back, until moving sectors were allowed for).
@@ -235,11 +236,14 @@ three things to do, in order:
    up when it can find no walk to it that it can vouch for, or has spent 45 seconds getting no
    nearer, and tries again a minute later or when it picks up a key.
 2. **Until five minutes are up, the monsters:** the nearest one alive. On Nightmare there is
-   always one.
+   always one. One it can find no walk to, or has made for for 45 seconds without getting 48
+   nearer, it gives up on for a while — the place remembered for ninety seconds, or until a
+   new key may have opened the way — and goes for the next thing instead.
 3. **Then, and not before, the exit.** Until 5:00 a bot will not press the exit switch, and
    lines that end the level when walked over are walls to it. If the way out needs a key, it
    goes for the nearest key it can find a sure walk to (keys stay where they are in co-op, so
-   each bot fetches its own).
+   each bot fetches its own), a key it cannot get to given up the same way. The exit itself it
+   never gives up: it is the only way the level ends.
 
 **Slime, pits and friends.** Three things every co-op bot does whatever decided, because a net
 that never learned them is a danger to itself and to its team:
@@ -248,8 +252,10 @@ that never learned them is a danger to itself and to its team:
   pits: cells the level's exit cannot be walked to from. A way is looked for first that never
   steps from a safe cell into a hurting one; only if there is no such way does the bot wade.
   And off its way, fighting, sidestepping, backing away from a wall, it will not take a step
-  that lands in slime or in a pit unless it is in one already. With no monsters on E1M3, bots
-  used to die in the slime 257 times in eight minutes; now 17.
+  that lands in slime or in a pit unless it is in one already. Nor does anything it goes
+  after stand in a pit: a secret, a key, a monster or an item that can be dropped down to
+  but never back is bait, and no bot takes it. With no monsters on E1M3, bots used to die in
+  the slime 257 times in eight minutes; now 17.
 - *It does not shoot through a friend.* Fire is held while another player stands in the line
   of it, nearer than the target or not much farther; the nearer the friend, the wider they
   stand. Four bots hit each other 17, 23 and 50 times a match on E1M1, E1M2 and E1M5 before;
@@ -335,9 +341,9 @@ route-finding apart from the fighting.
 |---|---|
 | E1M1 | 3 of 3, out at 5:00 |
 | E1M2 | 3 of 6, out at 5:01 |
-| E1M3 | 1 of 7, not out |
+| E1M3 | 1 of 7, out at 5:00 |
 | E1M4 | 2 of 3, out at 5:01 |
-| E1M5 | 9 of 9, out at 7:36 |
+| E1M5 | 9 of 9, out at 5:00 |
 | E1M6 | 4 of 4, not out |
 | E1M7 | 1 of 4, out at 5:06 |
 | E1M9 | 1 of 2, not out |
@@ -346,15 +352,25 @@ On Nightmare the same four finish E1M1 with two or three of its secrets, and in 
 (two, from the net the league begins as) a team finished one level of the nine and found ten
 of the episode's 39 secrets.
 
-So: with the monsters out, five maps of eight finished, two of them with every secret; on
-Nightmare, one. What is left is of two kinds. Where calm falls
-short, the route-finding does: a bot can circle a goal it believes in and cannot reach, with
-nothing yet to make it give it up (only secrets have that); the walk grid does not see
-E1M3's exit at all; and results have swung between builds (E1M3's secrets from seven to one
-and back on small changes), which says the steering is fragile where the planning is not. Where Nightmare falls short of calm (E1M5:
+So: with the monsters out, six maps of eight finished, two of them with every secret; on
+Nightmare, one. What is left is of three kinds, all measured on E1M6 and E1M9, the two calm
+maps still not finished. One: a bot can circle a goal it believes in and cannot reach —
+45 seconds without getting nearer now gives it up, for secrets, monsters, keys and the
+friend it follows alike, though the exit is never given up. Two: a place can be walked into
+but never back out of — E1M6's nukage trenches are one-way drops, and everything left inside
+one (secrets, keys, items, a monster, a friend) is now left alone; what enters anyway, roaming
+or pushed, does not come back. Three: a way believed can hinge on what is not working —
+E1M6's door pocket opens on a one-shot switch half the map away and shuts again on a timer,
+and on E1M9 the courtyard the bots file into wants the yellow key, and no bot found a walk
+to it. Where Nightmare falls short of calm (E1M5:
 nine secrets to two), the bots die, about once a minute each, and a death puts a bot back at
-the start. That part is the fighting, which is what the nets are there to learn. E1M8 is left
-out: it has no exit to walk to.
+the start. That part is the fighting, which is what the nets are there to learn. E1M8 is
+different from the rest: it has no exit line at all. The level ends on a floor that hurts to
+death, past walls that fall when the last bruiser dies and a teleporter inside them — so the
+grid marks the 666-tagged walls as movers it trusts, takes the teleport as the way out, and
+holds it shut to the bots until five minutes like any other way across the level's end. They
+still have to kill the bruisers to open it, and on Nightmare dead monsters come back; a calm
+E1M8 cannot end.
 
 **How a league learns.** Both leagues once learned by blocks: six games as a bot is against
 six as a mutant of itself, on whatever maps and against whomever the draw gave. That cannot
