@@ -24,7 +24,7 @@ Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5
 ## State at handoff
 
 - Working tree clean, everything pushed. 154 acceptance gates pass (`bash check.sh`).
-- What is deployed is `main` at `cc4d44e`. Nothing is built but undeployed.
+- What is deployed is `main` at `bb95b65`, tagged `v0.3.0`. Nothing is built but undeployed.
 - No local processes belong to this project. The owner's PC is dedicated to another project
   (a chess engine) for now: **do not run long Doom jobs on it**; short test runs are fine.
 - The co-op league was reset on 2026-10-13 and is starting from the untrained net on purpose:
