@@ -169,12 +169,10 @@ pub rec Relay {
     # for never
     shyin:    i32;
 
-    # the league match the arena last left to be watched, if any; and the
-    # co-op league's
-    watch:      [4096]u8;
-    watchlen:   i32;
-    cowatch:    [4096]u8;
-    cowatchlen: i32;
+    # the deathmatch league's match the arena last left to be watched, if
+    # any (the co-op league's campaign is joined from the site instead)
+    watch:    [4096]u8;
+    watchlen: i32;
 
     # the time of the datagram or tick being handled
     now: i64;
@@ -723,27 +721,15 @@ fun list(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
 }
 
 # the process read the arena's match file: keep it to hand out
-# ---
-# coop: it is the co-op league's
-pub fun set_watch(r: *Relay, data: *u8, len: i32, coop: bool) {
+pub fun set_watch(r: *Relay, data: *u8, len: i32) {
     var keep: i32 = len;
     if (len != p.WATCHFILE) { keep = 0; }
     var k: i32 = 0;
     for (k < keep) {
-        if (coop) {
-            r.cowatch[k] = data[k];
-        }
-        or {
-            r.watch[k] = data[k];
-        }
-        k = k + 1;
+        r.watch[k] = data[k];
+        k          = k + 1;
     }
-    if (coop) {
-        r.cowatchlen = keep;
-    }
-    or {
-        r.watchlen = keep;
-    }
+    r.watchlen = keep;
 }
 
 # one piece of the match to watch, to a request as long as the answer
@@ -755,13 +741,8 @@ fun watch(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     if (!rate_ok(r, from.ip, now)) { ret; }
     val piece: i32 = d[p.HEADER + 1]::i32;
     val start: i32 = piece * p.WATCHPIECE;
-    # which league's match: the byte after the piece, 1 for co-op's
-    var file:    *u8 = ?r.watch[0];
-    var filelen: i32 = r.watchlen;
-    if (d[p.HEADER + 2] == 1) {
-        file    = ?r.cowatch[0];
-        filelen = r.cowatchlen;
-    }
+    val file:    *u8 = ?r.watch[0];
+    val filelen: i32 = r.watchlen;
     val o: *Out = queue(r, from);
     if (o == nil) { ret; }
     val at: i32 = p.header(?o.data[0], p.MATCH, 0, 0, 0);

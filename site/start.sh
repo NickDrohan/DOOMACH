@@ -62,7 +62,7 @@ begin_again() {
     fi
 }
 begin_again epoch.dm "${LEAGUE_EPOCH:-1}" league.bin board.json watch.bin feel.bin
-begin_again epoch.coop "${COOP_EPOCH:-1}" coop.bin coop.json coopwatch.bin coopfeel.bin
+begin_again epoch.coop "${COOP_EPOCH:-1}" coop.bin coop.json coopfeel.bin coopnow.bin coopnow.tic coopdone.bin
 
 keep_arena league.beat "${ARENA_DUTY:-1}" 10 &
 keep_arena coop.beat "${COOP_DUTY:-5}" 10 coop &

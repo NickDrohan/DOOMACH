@@ -79,6 +79,14 @@ simulation from the same commands. A bot is part of the simulation, not a client
   regenerate the fixture deliberately and say so) or it is a bug.
 - Changing bot behaviour changes pinned bot fixtures (`fixtures/botmatch.expected`,
   `inset.sha256`). That is expected; regenerate them and check the diff is only what you meant.
+- **Things that outlive a build must say what made them.** A match left to watch is replayed
+  by whatever program fetches it, which may be older or newer than the arena that played it.
+  The file carries `RECIPE` (its layout and the meaning of its fields; raise it by hand in
+  `relayproto.mach` whenever either changes, and update `fixtures/recipe.expected`) and the
+  simulation's fingerprint (`game.fingerprint`, which changes by itself when the simulation or
+  the bots do). A game refuses a file that does not match both. The co-op league's
+  `coopnow.bin`, which a game joins a campaign from, carries the same two. If you add anything
+  else that one build writes and another reads, give it the same two guards.
 
 ## Where things are
 
@@ -173,6 +181,11 @@ Measured where it stands (hand-written bots, one run a map, not statistics):
 - **Results are chaotic.** A one-line change to steering moved E1M3 from seven secrets to one
   and back. Do not read meaning into one run of one map; gates on such things are written with
   slack for that reason.
+- **A format that changes meaning must change its version.** Campaigns were marked by a new
+  value in a byte of the watch file whose version was left as it was, and a player who had not
+  updated was shown a co-op campaign as four bots shooting each other on an empty E1M1. Even an
+  up-to-date game replayed it wrongly once the bots had changed, because nothing tied a match
+  to the simulation that played it. Both are guarded now (see the determinism section).
 - **Look at the server's logs after a deploy, and again a few hours later.** A memory leak (level
   tables never freed) had the league processes killed every few hours for days; the supervisor
   restarted them so it looked healthy. A crash on entering E1M3 with bots and a person shipped

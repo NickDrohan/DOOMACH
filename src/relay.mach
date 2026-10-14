@@ -24,7 +24,6 @@
 #                     Without it nothing sent is kept.
 #   RELAY_COOP_FILE   the co-op bot league, likewise, whose bots are seated
 #                     in co-op games; without it they are the other league's
-#   RELAY_COOP_WATCH_FILE  the co-op league's match to watch
 #   RELAY_WATCH_FILE  the bot league's match to watch, as the arena leaves
 #                     it; read every five seconds and handed to games that
 #                     ask (default none)
@@ -282,7 +281,7 @@ fun write_train(t: *core.Train, path: str) {
 }
 
 # read the arena's match file, if there is one, for the core to hand out
-fun read_watch(r: *core.Relay, path: str, coop: bool) {
+fun read_watch(r: *core.Relay, path: str) {
     val opened: res[fs.File, io_error.Error] = fs.open(path);
     if (sel opened.err) { ret; }
     var file: fs.File = opened.ok;
@@ -295,7 +294,7 @@ fun read_watch(r: *core.Relay, path: str, coop: bool) {
         have = have + got.ok::i32;
     }
     fs.close(?file);
-    core.set_watch(r, ?data[0], have, coop);
+    core.set_watch(r, ?data[0], have);
 }
 
 fun report(r: *core.Relay) {
@@ -340,8 +339,6 @@ fun main(argc: i64, argv: **u8) i64 {
     val trainsec:    str = setting("RELAY_TRAIN_SECONDS", ?trainsecbuf[0], 32);
     if (trainsec != nil) { trainevery = number(trainsec, 60); }
     var lasttrain:   i64 = 0;
-    var cowatchbuf:  [512]u8;
-    val cowatchfile: str = setting("RELAY_COOP_WATCH_FILE", ?cowatchbuf[0], 512);
 
     var m: Impair;
     var i: i64 = 1;
@@ -459,8 +456,7 @@ fun main(argc: i64, argv: **u8) i64 {
             lasttrain = now;
         }
         if (now - lastread >= 5000) {
-            if (watchfile != nil)   { read_watch(?r, watchfile, 0); }
-            if (cowatchfile != nil) { read_watch(?r, cowatchfile, 1); }
+            if (watchfile != nil) { read_watch(?r, watchfile); }
             lastread = now;
         }
         release(?sock, ?m, now);

@@ -428,9 +428,26 @@ the start and at its nearest; `trace` says every five seconds where each bot is 
 is after. `doom navcheck <wad> <map>` lists the level's exit and secrets as the walk grid
 sees them, and for each secret the lines round it that do something.
 
-**Watching, and playing with them.** The arena leaves `coopwatch.bin` as it leaves `watch.bin`;
-the relay hands either out (`RELAY_COOP_WATCH_FILE`; the request says which), and "Watch the
-co-op bots" plays it. The relay reads `coop.bin` (`RELAY_COOP_FILE`) and seats its bots in
+**Watching, and playing with them.** The deathmatch league leaves its last match in
+`watch.bin`, which the relay hands out and "Watch the deathmatch bots" plays again.
+
+The co-op league is not replayed: it is joined where it is. A campaign's level depends on
+nothing before it but what the players carried into it, since every level of a campaign begins
+the random table afresh and starts every bot afresh with a seed of the level's
+(`game.campaign_bots`). So as each level begins the arena writes `coopnow.bin`: the four bots
+(kind, seed, name, net) and what they carried in (`game.carry`). Every ten seconds of game it
+writes `coopnow.tic`, how far into the level it has got, playing a level in slices so its pace
+is even; and as a level ends, `coopdone.bin`, how it ended. hedge serves all three from the
+volume. "Watch the co-op bots" fetches the first two, begins the level as the league began it
+(`game.campaign_resume`), plays through to where the league had got without a sound, and from
+there goes on at the speed of a game, level after level, the same campaign the league is
+playing; when the campaign ends it joins the league again wherever it has got to. Unwatched,
+the league plays at its own pace, about four times the speed of a game. `doom joinleague
+<wad>` does the same with no window and checks the level ends as the league's did, and
+`doom resumecheck <wad> <levels> <tics>` checks that every level begun from what the one
+before handed on comes out as the campaign played straight through.
+
+The relay reads `coop.bin` (`RELAY_COOP_FILE`) and seats its bots in
 co-op games, the deathmatch league's in deathmatches. On Fly the two arenas share the
 processor: `ARENA_DUTY` 2% and `COOP_DUTY` 4%, which keeps the machine under the share a
 shared CPU may use all day. An eight-minute co-op match takes about three seconds of a desktop

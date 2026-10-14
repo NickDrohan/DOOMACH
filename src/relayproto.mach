@@ -81,7 +81,21 @@ pub val LISTSIZE:  i32 = 16 + 1 + 6 * 11;
 # length (2), the piece's number (1), a zero, the match's number (4), then
 # the piece. As with the list, a request must be as long as the longest
 # answer.
-pub val WATCHFILE:  i32 = 16 + 4 * 986;
+#
+# The file says what it is in two ways, and a game must refuse a file that
+# does not say both as it expects. RECIPE, in its fifth byte, is the layout
+# and the meaning of its fields: raise it whenever either changes. (It was
+# not raised when its sixth byte came to mean "a campaign" as well as "a
+# deathmatch" or "a co-op level", and games from before took campaigns for
+# deathmatches with no monsters, and showed them.) And its last four bytes
+# are the simulation's fingerprint (game.fingerprint): what the program
+# that played the match makes of a fixed probe of a game. A program whose
+# simulation or bots differ in anything the probe touches gets another
+# number, and a match played by one cannot be played again by the other.
+pub val RECIPE:     u8  = 2;
+pub val WATCHFILE:  i32 = 16 + 4 * 986 + 4;
+# where the fingerprint is in the file
+pub val WATCHPRINT: i32 = 16 + 4 * 986;
 pub val WATCHPIECE: i32 = 1000;
 pub val WATCHSIZE:  i32 = 16 + 8 + 1000;
 

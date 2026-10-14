@@ -63,7 +63,8 @@
 # three by that score, and the score is added to its running total, which
 # the standings show. Every campaign is every level, so no bot is ever
 # rated on an easy draw of maps. Its files are coop.bin, coop.json and
-# coopwatch.bin.
+# coopnow.bin, coopnow.tic and coopdone.bin: the campaign being played,
+# which a game joins where the league is in it (see publish).
 
 use std.allocator;
 use std.allocator.page;
@@ -89,6 +90,7 @@ use doom.defs;
 use doom.game;
 use doom.level;
 use lf: doom.leaguefile;
+use rp: doom.relayproto;
 use doom.rdata;
 use doom.wad;
 
@@ -216,6 +218,8 @@ rec Tally {
 }
 
 var seed: u64;
+# this program's fingerprint, which every match to watch carries
+var stamp: i32;
 # how each member feels about each other: feel[i * 100 + j] is i about j
 var feel: [10000]u8;
 # the match being played: each seat's kind as the game was told it (with its
@@ -841,12 +845,29 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
     var hurt:  [4]i32;
     var ammo:  [16]i32;
     var held:  [4]i32;
+    # what the players carried out of the last level: nothing yet
+    var carry_room: [1040]u8;
+    val carried:    *u8 = ?carry_room[0];
     var tic:   i32 = 0;
     # a deathmatch is this once round; a campaign, once a level
     for {
-        val level_began: i64 = millis();
+        var level_began: i64 = millis();
+        var level_tic:   i32 = 0;
+        # a campaign's level is published as it begins, for games to join
+        if (coop && !again) { publish(s, l, picks, seeds, nets, carried); }
     for (!s.completed && !s.broken && (coop || tic < length)) {
         game.ticker_cmds(s, ?cmds[0]);
+        # A campaign is played a slice of ten seconds at a time, with its
+        # rest after each, so that it goes through a level at an even pace
+        # and can say at any moment how far it has got; a game joining it
+        # starts that far in.
+        level_tic = level_tic + 1;
+        if (coop && level_tic % 350 == 0) {
+            if (!again) { progress(s.g.gamemap, level_tic); }
+            beat();
+            rest(level_began, share);
+            level_began = millis();
+        }
         # a locked door that has opened, or a line that has done its one
         # work: whoever is nearest it did that
         var w: i32 = 0;
@@ -925,8 +946,11 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
     }
         if (!coop || s.broken) { brk; }
         # a level of the campaign is over: count it, rest, say the process
-        # is alive, and go on to the next unless that was the last
+        # is alive, say how the level ended, keep what the players carry out
+        # of it, and go on to the next unless that was the last
         level_over(s, tally, ?held[0]);
+        if (!again) { ended(s.g.gamemap, level_tic, game.checksum(s)); }
+        game.carry(s, carried);
         i = 0;
         for (i < 4) {
             held[i] = 0;
@@ -1207,29 +1231,102 @@ fun save_feel(dir: str) bool {
     ret replace(dir, "feel.bin", ?feel[0], MEMBERS * MEMBERS);
 }
 
-# the match just played, for a game to play again: 16 bytes (magic, the
-# simulation's version, the map, 1 for co-op, the skill, the tics, the
-# match's number), then for each of the four its kind, seed, frags (in
-# co-op, monsters killed), deaths, rating, name (24 bytes) and net: 986
-# bytes each
+# A campaign, as a game joins it. coopnow.bin is written as each level of
+# the campaign begins: 20 bytes (magic "MDN1", RECIPE, the skill, the map,
+# a zero, what a level may take, the campaign's number, the fingerprint),
+# for each of the four its kind, seed, name (24 bytes) and net (974 bytes
+# each), and what the players carried into the level (game.carry; for the
+# first level, nothing). From that alone a game can begin the level as the
+# league began it (game.campaign_resume). coopnow.tic says how far into it
+# the league has got (magic "MDP1", the campaign, the map, the tic), and a
+# joining game starts there. coopdone.bin says how the last level ended
+# (magic "MDE1", the campaign, the map, its tics, its checksum), against
+# which a game that played the level may check itself.
+fun publish(s: *game.Session, l: *League, picks: *i32, seeds: *u32, nets: *i8, carried: *u8) {
+    if (beatdir == nil) { ret; }
+    var buf: [4956]u8;
+    buf[0] = 'M';
+    buf[1] = 'D';
+    buf[2] = 'N';
+    buf[3] = '1';
+    buf[4] = rp.RECIPE;
+    buf[5] = defs.SK_NIGHTMARE::u8;
+    buf[6] = s.g.gamemap::u8;
+    buf[7] = 0;
+    var at: i32 = put32(?buf[0], 8, COOPMATCH);
+    at = put32(?buf[0], at, (l.matches + 1)::i32);
+    at = put32(?buf[0], at, stamp);
+    var i: i32 = 0;
+    for (i < 4) {
+        at = put32(?buf[0], at, kinds[i]);
+        at = put32(?buf[0], at, seeds[i]:~i32);
+        var k: i32 = 0;
+        for (k < 24) {
+            buf[at + k] = 0;
+            k           = k + 1;
+        }
+        name_of(picks[i], ?buf[at]);
+        at = at + 24;
+        k  = 0;
+        for (k < NET) {
+            buf[at + k] = nets[i * NET + k]:~u8;
+            k           = k + 1;
+        }
+        at = at + NET;
+        i  = i + 1;
+    }
+    var k: i32 = 0;
+    for (k < 1040) {
+        buf[at + k] = carried[k];
+        if (s.g.gamemap == 1) { buf[at + k] = 0; }
+        k = k + 1;
+    }
+    replace(beatdir, "coopnow.bin", ?buf[0], at + 1040);
+    nowcampaign = (l.matches + 1)::i32;
+    progress(s.g.gamemap, 0);
+}
+
+var nowcampaign: i32;
+
+fun progress(map: i32, tic: i32) {
+    var buf: [16]u8;
+    buf[0] = 'M';
+    buf[1] = 'D';
+    buf[2] = 'P';
+    buf[3] = '1';
+    var at: i32 = put32(?buf[0], 4, nowcampaign);
+    at = put32(?buf[0], at, map);
+    put32(?buf[0], at, tic);
+    replace(beatdir, "coopnow.tic", ?buf[0], 16);
+}
+
+fun ended(map: i32, tics: i32, sum: u32) {
+    var buf: [20]u8;
+    buf[0] = 'M';
+    buf[1] = 'D';
+    buf[2] = 'E';
+    buf[3] = '1';
+    var at: i32 = put32(?buf[0], 4, nowcampaign);
+    at = put32(?buf[0], at, map);
+    at = put32(?buf[0], at, tics);
+    put32(?buf[0], at, sum:~i32);
+    replace(beatdir, "coopdone.bin", ?buf[0], 20);
+}
+
+# the deathmatch just played, for a game to play again: 16 bytes (magic,
+# RECIPE, the map, a zero, the skill, the tics, the match's number), then for
+# each of the four its kind, seed, frags, deaths, rating, name (24 bytes)
+# and net: 986 bytes each; and last the simulation's fingerprint
 fun watchable(l: *League, dir: str, buf: *u8, picks: *i32, tally: *Tally, map: i32, seeds: *u32, nets: *i8) bool {
     buf[0] = 'M';
     buf[1] = 'D';
     buf[2] = 'W';
     buf[3] = '1';
-    buf[4] = 1;
+    buf[4] = rp.RECIPE;
     buf[5] = map::u8;
     buf[6] = 0;
     buf[7] = defs.SK_MEDIUM::u8;
-    var length: i32 = MATCH;
-    if (coop) {
-        # 2: a campaign, every level from the first, and the tics are what
-        # a level of it may take
-        buf[6] = 2;
-        buf[7] = defs.SK_NIGHTMARE::u8;
-        length = COOPMATCH;
-    }
-    var at: i32 = put32(buf, 8, length);
+    var at: i32 = put32(buf, 8, MATCH);
     at = put32(buf, at, (l.matches & 0x7fffffff)::i32);
     var i: i32 = 0;
     for (i < 4) {
@@ -1254,8 +1351,8 @@ fun watchable(l: *League, dir: str, buf: *u8, picks: *i32, tally: *Tally, map: i
         at = at + NET;
         i  = i + 1;
     }
-    if (coop) { ret replace(dir, "coopwatch.bin", buf, at); }
-    ret replace(dir, "watch.bin", buf, at);
+    put32(buf, rp.WATCHPRINT, stamp);
+    ret replace(dir, "watch.bin", buf, rp.WATCHFILE);
 }
 
 fun name_of(i: i32, out: *u8) {
@@ -1454,10 +1551,20 @@ fun beat() {
 
 # rest, to stay within the share of the processor: work that took t earns
 # t * (100 - duty) / duty of sleep
+# (in slices of half a minute, saying the process is alive between them:
+# within a hundredth of a processor, a match of seven seconds earns twelve
+# minutes of rest, and a process asleep that long without a word was taken
+# for stalled and killed)
 fun rest(began: i64, duty: i64) {
     if (duty >= 100) { ret; }
-    val idle: i64 = (millis() - began) * (100 - duty) / duty;
-    if (idle > 0) { os.sleep(idle * 1000000); }
+    var idle: i64 = (millis() - began) * (100 - duty) / duty;
+    for (idle > 0) {
+        var nap: i64 = idle;
+        if (nap > 30000) { nap = 30000; }
+        os.sleep(nap * 1000000);
+        idle = idle - nap;
+        beat();
+    }
 }
 
 #[symbol("main")]
@@ -1545,6 +1652,9 @@ fun main(argc: i64, argv: **u8) i64 {
     if (sel sg.err) { ret 2; }
     val s: *game.Session = sg.ok;
     game.init(s, ?a, ?w, ?d);
+    # what this program makes of the probe, for every match it leaves to watch
+    stamp = game.fingerprint(s):~i32;
+    print.printlnf("arena: the simulation's fingerprint is {}", stamp:~u32);
 
     val fb: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, (FILE_BYTES + 64)::usize);
     val jb: res[*u8, allocator.Error] = allocator.zallocate[u8](?a, 65536);
@@ -1600,9 +1710,8 @@ fun main(argc: i64, argv: **u8) i64 {
         # worth watching: a match with some fighting in it, or the first
         # there is
         var worth: bool = tally[0].frags + tally[1].frags + tally[2].frags + tally[3].frags >= 4;
-        # in co-op: every campaign
-        if (coop) { worth = 1; }
-        if (worth || !shown) {
+        # (a co-op campaign is joined as it is played, not replayed: publish)
+        if (!coop && (worth || !shown)) {
             shown = watchable(l, dir, wb.ok, ?picks[0], ?tally[0], map, ?seeds[0], nb.ok:~*i8);
         }
         keep(l, ?a, dir, fb.ok, jb.ok, pb.ok, ?picks[0], ?tally[0], map, millis() - began, 0);

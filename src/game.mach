@@ -87,6 +87,10 @@ pub rec Session {
     campaign: bool;
     levelcap: i32;
     capped:   bool;
+    # each bot as it was set, so that a campaign can start it afresh at
+    # every level: its kind as told, and its seed
+    botkind: [4]i32;
+    botseed: [4]u32;
 
     # the players the simulation plays itself; set after a game starts
     bots: [4]bot.Bot;
@@ -270,6 +274,209 @@ fun load_level(s: *Session) bool {
 pub fun set_bot(s: *Session, player: i32, kind: i32, net: *i8, seed: u32) {
     bot.start(?s.bots[player], kind, net, seed);
     s.g.isbot[player] = 1;
+    s.botkind[player] = kind;
+    s.botseed[player] = seed;
+}
+
+# A level of a campaign begins as if the campaign began there: the random
+# table from its start, and every bot started afresh with a seed of its own
+# and the level's. So a level depends on nothing that went before it but
+# what the players carry into it (carry), and someone can begin watching a
+# campaign at any level of it (campaign_resume) and see what the league saw.
+fun level_seed(seed: u32, map: i32) u32 {
+    ret seed ^ ((map - 1):~u32 * 2654435761);
+}
+
+pub fun campaign_bots(s: *Session) {
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (s.bots[i].active) {
+            var net: [942]i8 = s.bots[i].net;
+            bot.start(?s.bots[i], s.botkind[i], ?net[0], level_seed(s.botseed[i], s.g.gamemap));
+        }
+        i = i + 1;
+    }
+}
+
+# what each player takes into the next level, as numbers: CARRY of them a
+# player, written into out (4 * CARRY * 4 bytes)
+pub val CARRY: i32 = 65;
+
+fun put_le(out: *u8, at: i32, v: i32) i32 {
+    val u: u32 = v:~u32;
+    out[at]     = u::u8;
+    out[at + 1] = (u >> 8)::u8;
+    out[at + 2] = (u >> 16)::u8;
+    out[at + 3] = (u >> 24)::u8;
+    ret at + 4;
+}
+
+fun get_le(in: *u8, at: i32) i32 {
+    ret (in[at]::u32 | (in[at + 1]::u32 << 8) | (in[at + 2]::u32 << 16) | (in[at + 3]::u32 << 24)):~i32;
+}
+
+# Every number in a player that outlives a level, in one order both ways.
+# (Not where its body is, nor who last hurt it: those are of the level.)
+fun carry_player(p: *Player, buf: *u8, at_in: i32, out: bool) i32 {
+    var at: i32 = at_in;
+    var v:  [65]i32;
+    if (out) {
+        v[0] = p.playerstate;
+        v[1] = p.viewz;
+        v[2] = p.viewheight;
+        v[3] = p.deltaviewheight;
+        v[4] = p.bob;
+        v[5] = p.health;
+        v[6] = p.armorpoints;
+        v[7] = p.armortype;
+        var k: i32 = 0;
+        for (k < 6) {
+            v[8 + k]  = p.powers[k];
+            v[14 + k] = p.cards[k]::i32;
+            k         = k + 1;
+        }
+        v[20] = p.backpack::i32;
+        v[21] = p.readyweapon;
+        v[22] = p.pendingweapon;
+        k = 0;
+        for (k < 9) {
+            v[23 + k] = p.weaponowned[k]::i32;
+            k         = k + 1;
+        }
+        k = 0;
+        for (k < 4) {
+            v[32 + k] = p.ammo[k];
+            v[36 + k] = p.maxammo[k];
+            v[47 + k] = p.frags[k];
+            k         = k + 1;
+        }
+        v[40] = p.attackdown;
+        v[41] = p.usedown;
+        v[42] = p.cheats;
+        v[43] = p.refire;
+        v[44] = p.killcount;
+        v[45] = p.itemcount;
+        v[46] = p.secretcount;
+        v[51] = p.damagecount;
+        v[52] = p.bonuscount;
+        v[53] = p.extralight;
+        v[54] = p.fixedcolormap;
+        v[55] = p.colormap;
+        k = 0;
+        for (k < 2) {
+            v[56 + k * 4] = p.psprites[k].state;
+            v[57 + k * 4] = p.psprites[k].tics;
+            v[58 + k * 4] = p.psprites[k].sx;
+            v[59 + k * 4] = p.psprites[k].sy;
+            k             = k + 1;
+        }
+        v[64] = p.didsecret::i32;
+        k = 0;
+        for (k < CARRY) {
+            at = put_le(buf, at, v[k]);
+            k  = k + 1;
+        }
+        ret at;
+    }
+    var k: i32 = 0;
+    for (k < CARRY) {
+        v[k] = get_le(buf, at);
+        at   = at + 4;
+        k    = k + 1;
+    }
+    p.mo              = nil;
+    p.attacker        = nil;
+    p.message         = nil;
+    p.playerstate     = v[0];
+    p.viewz           = v[1];
+    p.viewheight      = v[2];
+    p.deltaviewheight = v[3];
+    p.bob             = v[4];
+    p.health          = v[5];
+    p.armorpoints     = v[6];
+    p.armortype       = v[7];
+    k = 0;
+    for (k < 6) {
+        p.powers[k] = v[8 + k];
+        p.cards[k]  = v[14 + k] != 0;
+        k           = k + 1;
+    }
+    p.backpack      = v[20] != 0;
+    p.readyweapon   = v[21];
+    p.pendingweapon = v[22];
+    k = 0;
+    for (k < 9) {
+        p.weaponowned[k] = v[23 + k] != 0;
+        k                = k + 1;
+    }
+    k = 0;
+    for (k < 4) {
+        p.ammo[k]    = v[32 + k];
+        p.maxammo[k] = v[36 + k];
+        p.frags[k]   = v[47 + k];
+        k            = k + 1;
+    }
+    p.attackdown    = v[40];
+    p.usedown       = v[41];
+    p.cheats        = v[42];
+    p.refire        = v[43];
+    p.killcount     = v[44];
+    p.itemcount     = v[45];
+    p.secretcount   = v[46];
+    p.damagecount   = v[51];
+    p.bonuscount    = v[52];
+    p.extralight    = v[53];
+    p.fixedcolormap = v[54];
+    p.colormap      = v[55];
+    k = 0;
+    for (k < 2) {
+        p.psprites[k].state = v[56 + k * 4];
+        p.psprites[k].tics  = v[57 + k * 4];
+        p.psprites[k].sx    = v[58 + k * 4];
+        p.psprites[k].sy    = v[59 + k * 4];
+        k                   = k + 1;
+    }
+    p.didsecret = v[64] != 0;
+    ret at;
+}
+
+# what the players take into the level a finished one leads to: call it
+# between the level's end (completed) and world_done
+# ---
+# ret: the bytes written
+pub fun carry(s: *Session, out: *u8) i32 {
+    var at: i32 = 0;
+    var i:  i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        at = carry_player(?s.g.players[i], out, at, 1);
+        i  = i + 1;
+    }
+    ret at;
+}
+
+# Begin watching a campaign at a level after the first: the game as it was
+# when the league's team walked into it, from what they carried. The bots
+# are set after this, as for any game, and then campaign_bots.
+# ---
+# map:   the level, 2 to 9
+# carried: what carry wrote as the level before ended
+pub fun campaign_resume(s: *Session, players: i32, me: i32, skill: i32, cap: i32, map: i32, carried: *u8) bool {
+    if (!coop_game(s, players, me, skill, 1)) { ret 0; }
+    val g: *Game = ?s.g;
+    s.campaign = 1;
+    s.levelcap = cap;
+    s.capped   = 0;
+    var at: i32 = 0;
+    var i:  i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        at = carry_player(?g.players[i], carried, at, 0);
+        i  = i + 1;
+    }
+    s.completed = 0;
+    g.exited    = 0;
+    g.gamemap   = map;
+    random.clear(?g.rnd);
+    ret load_level(s);
 }
 
 fun clear_bots(s: *Session) {
@@ -650,7 +857,10 @@ pub fun world_done(s: *Session) {
     s.completed = 0;
     s.capped    = 0;
     s.g.gamemap = s.wi.next;
+    # a campaign's level begins as if the campaign began there
+    if (s.campaign) { random.clear(?s.g.rnd); }
     load_level(s);
+    if (s.campaign) { campaign_bots(s); }
 }
 
 # G_CheckSpot: whether a player can be spawned at a start without a thing in
@@ -878,6 +1088,50 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
 # a running sum over the state that a demo must reproduce: every map
 # object's place, momentum, health and state, the random walk, and the
 # player. two runs that agree here tic after tic are in sync.
+# The simulation's fingerprint: what this program makes of a fixed probe.
+# Four bots (two nets with fixed weights, a brawler and the hand-written
+# bot) play a co-op level on Nightmare, then a deathmatch, 350 tics each,
+# and the two checksums are the fingerprint. Whatever changes the simulation
+# or the bots in any way the probe reaches changes it: the monsters, the
+# moving sectors, the senses, the nets, the route-finding, the reflexes.
+# Every program computes it the same on every machine, as it computes every
+# game. The session is left with the probe's game in it, to be replaced.
+pub fun fingerprint(s: *Session) u32 {
+    var net:  [942]i8;
+    var seed: u32 = 0x2545f491;
+    var k:    i32 = 0;
+    for (k < 942) {
+        seed   = seed * 1103515245 + 12345;
+        net[k] = (((seed >> 16) & 0x3f):~i32 - 32)::i8;
+        k      = k + 1;
+    }
+    var sum: u32 = 0;
+    var round: i32 = 0;
+    for (round < 2) {
+        var ok: bool = 0;
+        if (round == 0) {
+            ok = coop_game(s, 4, 0, defs.SK_NIGHTMARE, 1);
+        }
+        or {
+            ok = deathmatch_game(s, 4, 0, defs.SK_MEDIUM, 1, 1, 1);
+        }
+        if (!ok) { ret 0; }
+        set_bot(s, 0, bot.KIND_NET, ?net[0], 11);
+        set_bot(s, 1, bot.KIND_NET | (bot.QUIRK_LOYAL << bot.QUIRK_SHIFT) | bot.feel_bits(0, 10), ?net[0], 12);
+        set_bot(s, 2, bot.KIND_NET | bot.TRAIT_FISTS, ?net[0], 13);
+        set_bot(s, 3, bot.KIND_SCRIPT, nil, 14);
+        var cmds: [4]Ticcmd;
+        var tic:  i32 = 0;
+        for (tic < 350 && !s.completed && !s.broken) {
+            ticker_cmds(s, ?cmds[0]);
+            tic = tic + 1;
+        }
+        sum   = sum * 2654435761 ^ checksum(s);
+        round = round + 1;
+    }
+    ret sum;
+}
+
 pub fun checksum(s: *Session) u32 {
     val g:   *Game = ?s.g;
     var sum: u32   = g.rnd.play::u32;

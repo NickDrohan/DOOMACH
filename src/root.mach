@@ -513,6 +513,8 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     var lobby:      net.Lobby;
     # an update asked for: a moment for the screen to say so, then done
     var updating:   i32 = 0;
+    # joining the co-op league where it is: a frame or two to say so first
+    var joining:    i32 = 0;
     tidy_update();
     # watching the bot league: a match being fetched, or one being played
     # again, and how long it runs
@@ -624,18 +626,41 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
             f.mode        = front.MODE_FINALE;
             f.finalestage = 1;
             f.menuactive  = 0;
-            if (n == nil && fetch != nil && menu_relay(argc, argv, ?where) && net.watch_open(fetch, ?where, f.watchcoop)) {
+            if (f.watchcoop && n == nil) {
+                # the co-op league is joined where it is: a frame to say so,
+                # then the joining, which takes a moment
+                joining = 2;
+                front.notice(?f, "joining the co-op bots where\nthey are...");
+            }
+            or (n == nil && fetch != nil && menu_relay(argc, argv, ?where) && net.watch_open(fetch, ?where)) {
                 fetching = 1;
-                if (f.watchcoop) {
-                    front.notice(?f, "fetching a match from the co-op\nbot league...\n\n(esc to give up)");
-                }
-                or {
-                    front.notice(?f, "fetching a match from the bot league...\n\n(esc to give up)");
-                }
+                front.notice(?f, "fetching a match from the bot league...\n\n(esc to give up)");
             }
             or {
                 front.to_title(?f);
                 front.notice(?f, "the relay could not be reached.\n\n(press a key)");
+            }
+        }
+        if (joining > 0) {
+            joining = joining - 1;
+            if (joining == 0) {
+                var names:  [96]u8;
+                val joined: i32 = join_league(?a, s, ?names[0]);
+                if (joined > 0) {
+                    front.start_watching(?f, s, ?names[0]);
+                }
+                or (joined == ANOTHER_SIMULATION) {
+                    front.to_title(?f);
+                    front.notice(?f, "the co-op bots are playing another\nversion of the game. options,\nupdate the game; if this is the\nnewest, the league will catch up\nwithin the hour.\n\n(press a key)");
+                }
+                or (joined == UNREACHED) {
+                    front.to_title(?f);
+                    front.notice(?f, "the league could not be reached.\nis this computer online?\n\n(press a key)");
+                }
+                or {
+                    front.to_title(?f);
+                    front.notice(?f, "the co-op bots have no campaign\nunder way just now.\n\n(press a key)");
+                }
             }
         }
         if (fetching) {
@@ -644,7 +669,11 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                 net.watch_close(fetch);
                 fetching  = 0;
                 watchtics = watch_setup(s, ?fetch.data[0], 0);
-                if (watchtics > 0) {
+                if (watchtics == ANOTHER_SIMULATION) {
+                    front.to_title(?f);
+                    front.notice(?f, "that match was played by another\nversion of the bots. options,\nupdate the game; if this is the\nnewest, the league will catch up\nwithin the hour.\n\n(press a key)");
+                }
+                or (watchtics > 0) {
                     var names: [96]u8;
                     var q:     i32 = 0;
                     for (q < 96) {
@@ -655,7 +684,7 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                 }
                 or {
                     front.to_title(?f);
-                    front.notice(?f, "that match is from another version\nof the game. download it again.\n\n(press a key)");
+                    front.notice(?f, "that match is from another version\nof the game. options, update the\ngame.\n\n(press a key)");
                 }
             }
             or (fetch.asks >= 4) {
@@ -3094,11 +3123,315 @@ fun get32(p: *u8, at: i32) u32 {
 }
 
 # whether what is being watched is over, and the next should be fetched: a
-# match when its tics are up or its level is left; a campaign when its last
-# level is, which is when the front end turns to the finale
+# deathmatch when its tics are up or its level is left; a campaign when its
+# last level is, which is when the front end turns to the finale, and then
+# the league is joined again where it has got to
 fun watched_out(f: *front.Front, s: *game.Session, tics: i32) bool {
     if (s.campaign) { ret f.mode == front.MODE_FINALE; }
     ret s.g.leveltime >= tics || s.completed;
+}
+
+val ANOTHER_SIMULATION: i32 = -1;
+val UNREACHED:          i32 = -2;
+
+# ------------------------------------------------- joining the co-op league
+
+# what the league writes as each level of a campaign begins (arena.mach,
+# publish): its head, four seats, and what the players carried in
+val NOW_HEAD:  i32 = 20;
+val NOW_SEAT:  i32 = 974;
+val NOW_BYTES: i32 = 20 + 4 * 974 + 1040;
+
+# the place the newest program and the league's files are kept:
+# UPDATE_URL, or DOOM_UPDATE_URL if that is set
+fun site_base(out: *u8) {
+    var other: [256]u8;
+    append(out, 0, UPDATE_URL);
+    val place: res[opt[usize], env.EnvError] = env.get("DOOM_UPDATE_URL", ?other[0], 200);
+    if (sel place.ok) {
+        if (sel place.ok.some) { append(out, 0, ?other[0]); }
+    }
+}
+
+# fetch one of the league's files from the site, whole, into a buffer
+# ---
+# ret: its length, or -1 if it could not be had
+fun fetch_league(a: *allocator.Allocator, name: str, into: *u8, room: i32) i32 {
+    var exe: [512]u8;
+    if (!win.exe_path(?exe[0])) { ret -1; }
+    var base: [256]u8;
+    site_base(?base[0]);
+    var url:  [512]u8;
+    var path: [600]u8;
+    var at:   i32 = append(?url[0], 0, ?base[0]);
+    at = append(?url[0], at, "/league/");
+    at = append(?url[0], at, name);
+    # the time in the address, so that no cache answers with an old one
+    at = append(?url[0], at, "?t=");
+    at = append_number(?url[0], at, win.micros_now());
+    at = append(?path[0], 0, ?exe[0]);
+    at = append(?path[0], at, ".league");
+    if (!win.download(?url[0], ?path[0])) { ret -1; }
+    val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    fs.remove_file(?path[0]);
+    if (sel bytes.err) { ret -1; }
+    var n: i32 = bytes.ok.len::i32;
+    if (n > room) { n = room; }
+    var k: i32 = 0;
+    for (k < n) {
+        into[k] = bytes.ok.data[k];
+        k       = k + 1;
+    }
+    ret n;
+}
+
+# Join the co-op league's campaign where it has got to: the level it is on,
+# begun as the league began it (game.campaign_resume), then played through
+# quickly, without a sound, to the tic the league last said it had reached.
+# From there a game goes on at the speed of a game, level after level, the
+# same game the league played.
+# ---
+# names: the four bots' names, 24 bytes each
+# ret:   the level joined, or 0 if there is no campaign to join,
+#        UNREACHED, or ANOTHER_SIMULATION
+fun join_league(a: *allocator.Allocator, s: *game.Session, names: *u8) i32 {
+    var now:  [4956]u8;
+    var tick: [16]u8;
+    val got:  i32 = fetch_league(a, "coopnow.bin", ?now[0], NOW_BYTES);
+    if (got < 0) { ret UNREACHED; }
+    ret join_campaign(s, ?now[0], got, ?tick[0], fetch_league(a, "coopnow.tic", ?tick[0], 16), 0, names);
+}
+
+# join a campaign from what the league published, as join_league does
+# ---
+# now:  coopnow.bin, so many bytes of it
+# tick: coopnow.tic, so many bytes of it (or -1 for none: the level from its start)
+# view: whose eyes
+fun join_campaign(s: *game.Session, now: *u8, nowlen: i32, tick: *u8, ticklen: i32, view: i32, names: *u8) i32 {
+    if (nowlen != NOW_BYTES || now[0] != 'M' || now[1] != 'D' || now[2] != 'N' || now[3] != '1' || now[4] != relayproto.RECIPE) { ret 0; }
+    if (get32(now, 16) != our_fingerprint(s)) { ret ANOTHER_SIMULATION; }
+    val skill:    i32 = now[5]::i32;
+    val map:      i32 = now[6]::i32;
+    val cap:      i32 = get32(now, 8):~i32;
+    val campaign: u32 = get32(now, 12);
+    if (map < 1 || map > 9 || cap < 1) { ret 0; }
+    if (map == 1) {
+        if (!game.campaign_game(s, 4, view, skill, cap)) { ret 0; }
+    }
+    or (!game.campaign_resume(s, 4, view, skill, cap, map, ?now[NOW_HEAD + 4 * NOW_SEAT])) {
+        ret 0;
+    }
+    var i: i32 = 0;
+    for (i < 4) {
+        val at: i32 = NOW_HEAD + i * NOW_SEAT;
+        game.set_bot(s, i, seat_kind(get32(now, at):~i32), (?now[at + 32]):~*i8, get32(now, at + 4));
+        var k: i32 = 0;
+        for (k < 24) {
+            names[i * 24 + k] = now[at + 8 + k];
+            k                 = k + 1;
+        }
+        i = i + 1;
+    }
+    game.campaign_bots(s);
+
+    # as far in as the league has got, if it says so of this level
+    var target: i32 = 0;
+    if (ticklen == 16 && tick[0] == 'M' && tick[1] == 'D' && tick[2] == 'P' && tick[3] == '1' && get32(tick, 4) == campaign && get32(tick, 8):~i32 == map) {
+        target = get32(tick, 12):~i32;
+    }
+    if (target > cap - 35) { target = cap - 35; }
+    val hook: defs.SoundHook = s.g.start_sound;
+    s.g.start_sound = nil;
+    var cmds: [4]defs.Ticcmd;
+    var tic:  i32 = 0;
+    for (tic < target && !s.completed && !s.broken) {
+        game.ticker_cmds(s, ?cmds[0]);
+        tic = tic + 1;
+    }
+    s.g.start_sound = hook;
+    if (s.broken) { ret 0; }
+    ret map;
+}
+
+# Join the co-op league where it is, play the level it is on to the end,
+# and, if the league has since said how that level ended, check this
+# program came out the same.
+#
+#   doom joinleague <wad>
+fun joinleague(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+    val got: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+    if (sel got.err) { ret EXIT_DATA; }
+    val s: *game.Session = got.ok;
+    game.init(s, ?a, ?w, ?d);
+
+    var names: [96]u8;
+    val map:   i32 = join_league(?a, s, ?names[0]);
+    if (map == UNREACHED) {
+        print.eprintln("doom: the league could not be reached");
+        ret EXIT_MAP;
+    }
+    if (map == ANOTHER_SIMULATION) {
+        print.eprintln("doom: the league is playing another version of the simulation or the bots");
+        ret EXIT_DATA;
+    }
+    if (map == 0) {
+        print.eprintln("doom: the league has no campaign to join");
+        ret EXIT_DATA;
+    }
+    val began: i32 = s.g.leveltime;
+    var cmds:  [4]defs.Ticcmd;
+    for (!s.completed && !s.broken) { game.ticker_cmds(s, ?cmds[0]); }
+    val sum: u32 = game.checksum(s);
+    print.printlnf("joined E1M{} at tic {}, played it to its end at tic {}: sum {}", map, began, s.g.leveltime, sum);
+    var done: [20]u8;
+    val dlen: i32 = fetch_league(?a, "coopdone.bin", ?done[0], 20);
+    if (dlen == 20 && done[0] == 'M' && done[1] == 'D' && done[2] == 'E' && done[3] == '1' && get32(?done[0], 8):~i32 == map) {
+        val was: u32 = get32(?done[0], 16);
+        print.printlnf("the league ended E1M{} at tic {}: sum {}", map, get32(?done[0], 12), was);
+        if (was != sum) {
+            print.println("joined, the level came out otherwise than the league's");
+            ret EXIT_MAP;
+        }
+        print.println("joined, the level came out as the league's did");
+    }
+    ret EXIT_OK;
+}
+
+# Whether a campaign can be begun at any level of it and come out as the
+# whole campaign does: four bots play the first levels straight through, a
+# level at most tics long, and what each level ends on (its checksum and its
+# length) is noted with what the players carried out of it; then every level
+# after the first is played again from what the one before handed on alone,
+# and must end the same.
+#
+#   doom resumecheck <wad> <levels> <tics a level>
+fun resumecheck(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+    val got: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+    if (sel got.err) { ret EXIT_DATA; }
+    val s: *game.Session = got.ok;
+    game.init(s, ?a, ?w, ?d);
+    var levels: i32 = number(argv[3], 3)::i32;
+    val cap:    i32 = number(argv[4], 2100)::i32;
+    if (levels < 2) { levels = 2; }
+    if (levels > 9) { levels = 9; }
+
+    # the bots: two nets of fixed weights, a brawler, the hand-written one
+    var net: [942]i8;
+    var seed: u32 = 0x1234567;
+    var k: i32 = 0;
+    for (k < 942) {
+        seed   = seed * 1103515245 + 12345;
+        net[k] = (((seed >> 16) & 0x3f):~i32 - 32)::i8;
+        k      = k + 1;
+    }
+    val kinds: [4]i32 = [4]i32{bot.KIND_NET, bot.KIND_NET | (bot.QUIRK_RECKLESS << bot.QUIRK_SHIFT), bot.KIND_NET | bot.TRAIT_FISTS, bot.KIND_SCRIPT | (bot.QUIRK_LOYAL << bot.QUIRK_SHIFT) | bot.feel_bits(0, 90)};
+
+    var maps:  [9]i32;
+    var sums:  [9]u32;
+    var ends:  [9]i32;
+    var carry: [9 * 1040]u8;
+    var cmds:  [4]defs.Ticcmd;
+    if (!game.campaign_game(s, 4, 0, defs.SK_NIGHTMARE, cap)) { ret EXIT_MAP; }
+    var i: i32 = 0;
+    for (i < 4) {
+        game.set_bot(s, i, kinds[i], ?net[0], (i * 7919 + 3)::u32);
+        i = i + 1;
+    }
+    var n: i32 = 0;
+    for (n < levels) {
+        maps[n] = s.g.gamemap;
+        var tic: i32 = 0;
+        for (!s.completed && !s.broken) {
+            game.ticker_cmds(s, ?cmds[0]);
+            tic = tic + 1;
+        }
+        if (s.broken) { ret EXIT_MAP; }
+        sums[n] = game.checksum(s);
+        ends[n] = tic;
+        game.carry(s, ?carry[n * 1040]);
+        n = n + 1;
+        if (n < levels) { game.world_done(s); }
+    }
+
+    var same: bool = 1;
+    n = 1;
+    for (n < levels) {
+        if (!game.campaign_resume(s, 4, 0, defs.SK_NIGHTMARE, cap, maps[n], ?carry[(n - 1) * 1040])) { ret EXIT_MAP; }
+        i = 0;
+        for (i < 4) {
+            game.set_bot(s, i, kinds[i], ?net[0], (i * 7919 + 3)::u32);
+            i = i + 1;
+        }
+        game.campaign_bots(s);
+        var tic: i32 = 0;
+        for (!s.completed && !s.broken) {
+            game.ticker_cmds(s, ?cmds[0]);
+            tic = tic + 1;
+        }
+        val sum: u32 = game.checksum(s);
+        print.printlnf("E1M{}: played through {} tics sum {}, begun there {} tics sum {}", maps[n], ends[n], sums[n], tic, sum);
+        if (sum != sums[n] || tic != ends[n]) { same = 0; }
+        n = n + 1;
+    }
+    if (!same) {
+        print.println("a level begun from what the one before handed on came out otherwise");
+        ret EXIT_MAP;
+    }
+    print.println("every level begun from what the one before handed on came out the same");
+    ret EXIT_OK;
+}
+
+# say this program's fingerprint, as the arena says its own
+#
+#   doom fingerprint <wad>
+fun print_fingerprint(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+    val got: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+    if (sel got.err) { ret EXIT_DATA; }
+    val s: *game.Session = got.ok;
+    game.init(s, ?a, ?w, ?d);
+    print.printlnf("the simulation's fingerprint is {}", our_fingerprint(s));
+    ret EXIT_OK;
+}
+
+# this program's fingerprint (game.fingerprint), worked out the first time
+# it is asked for, in the session given, which the probe leaves in a state
+# to be replaced
+var fingerprinted: bool;
+var fingerprint:   u32;
+
+fun our_fingerprint(s: *game.Session) u32 {
+    if (!fingerprinted) {
+        fingerprint   = game.fingerprint(s);
+        fingerprinted = 1;
+    }
+    ret fingerprint;
 }
 
 # set a session up to play a league match again, as the arena left it in
@@ -3107,21 +3440,18 @@ fun watched_out(f: *front.Front, s: *game.Session, tics: i32) bool {
 # view: whose eyes, 0 to 3
 # ret:  the match's length in tics, or 0 if the file is not one or its map
 #       does not load
+# ret:  the match's length in tics; 0 if the file is not one this program
+#       can read; ANOTHER_SIMULATION if it was played by a program whose
+#       simulation or bots differ from this one's, so that playing it here
+#       would show something that never happened
 fun watch_setup(s: *game.Session, data: *u8, view: i32) i32 {
-    if (data[0] != 'M' || data[1] != 'D' || data[2] != 'W' || data[3] != '1' || data[4] != 1) { ret 0; }
+    if (data[0] != 'M' || data[1] != 'D' || data[2] != 'W' || data[3] != '1' || data[4] != relayproto.RECIPE) { ret 0; }
+    if (get32(data, relayproto.WATCHPRINT) != our_fingerprint(s)) { ret ANOTHER_SIMULATION; }
     val map:  i32 = data[5]::i32;
     val tics: i32 = get32(data, 8):~i32;
     if (map < 1 || map > 9 || tics < 1 || tics > 35 * 600) { ret 0; }
-    if (data[6] == 2) {
-        # the co-op league's: a campaign, the whole episode from the first
-        # map, a level of it taking at most the tics the file names
-        if (!game.campaign_game(s, 4, view, data[7]::i32, tics)) { ret 0; }
-    }
-    or (data[6] == 1) {
-        # the co-op league's: a team, at the skill the file names
-        if (!game.coop_game(s, 4, view, data[7]::i32, map)) { ret 0; }
-    }
-    or (!game.deathmatch_game(s, 4, view, defs.SK_MEDIUM, map, 1, 1)) {
+    if (data[6] != 0) { ret 0; }
+    if (!game.deathmatch_game(s, 4, view, defs.SK_MEDIUM, map, 1, 1)) {
         ret 0;
     }
     var i: i32 = 0;
@@ -3138,9 +3468,8 @@ fun watch_setup(s: *game.Session, data: *u8, view: i32) i32 {
 # recorded it, which it must if this program and the arena, on whatever
 # machines, compute the same game
 #
-#   doom watch <wad> <relay address> [coop]
+#   doom watch <wad> <relay address>
 fun watch(argc: i64, argv: **u8) i64 {
-    val coop: bool = argc == 5;
     var a:    allocator.Allocator;
     val made: err[allocator.Error] = page.make(?a);
     if (sel made.err) { ret EXIT_WAD; }
@@ -3159,7 +3488,7 @@ fun watch(argc: i64, argv: **u8) i64 {
     val wg: res[*net.Watch, allocator.Error] = allocator.zallocate[net.Watch](?a, 1);
     if (sel wg.err) { ret EXIT_DATA; }
     val fetch: *net.Watch = wg.ok;
-    if (!net.watch_open(fetch, ?relay, coop)) {
+    if (!net.watch_open(fetch, ?relay)) {
         print.eprintln("doom: the network could not be opened");
         ret EXIT_WINDOW;
     }
@@ -3184,37 +3513,20 @@ fun watch(argc: i64, argv: **u8) i64 {
     val s: *game.Session = got.ok;
     game.init(s, ?a, ?w, ?d);
     val tics: i32 = watch_setup(s, ?fetch.data[0], 0);
+    if (tics == ANOTHER_SIMULATION) {
+        print.eprintln("doom: that match was played by another version of the simulation or the bots");
+        ret EXIT_DATA;
+    }
     if (tics == 0) {
         print.eprintln("doom: that is not a match this program can play");
         ret EXIT_DATA;
     }
-    var cmds:   [4]defs.Ticcmd;
-    var dead:   [4]bool;
-    var died:   [4]i32;
-    var killed: [4]i32;
-    var tic:    i32 = 0;
-    var i:      i32 = 0;
-    # a match is this once round; a campaign, once a level
-    for {
-        for (!s.completed && !s.broken && (s.campaign || tic < tics)) {
-            game.ticker_cmds(s, ?cmds[0]);
-            i = 0;
-            for (i < 4) {
-                val gone: bool = s.g.players[i].playerstate == defs.PST_DEAD;
-                if (gone && !dead[i]) { died[i] = died[i] + 1; }
-                dead[i] = gone;
-                i       = i + 1;
-            }
-            tic = tic + 1;
-        }
-        if (!s.campaign || s.broken) { brk; }
-        i = 0;
-        for (i < 4) {
-            killed[i] = killed[i] + s.g.players[i].killcount;
-            i         = i + 1;
-        }
-        if (s.wi.finale) { brk; }
-        game.world_done(s);
+    var cmds: [4]defs.Ticcmd;
+    var tic:  i32 = 0;
+    var i:    i32 = 0;
+    for (tic < tics && !s.completed && !s.broken) {
+        game.ticker_cmds(s, ?cmds[0]);
+        tic = tic + 1;
     }
 
     var same: bool = 1;
@@ -3231,16 +3543,6 @@ fun watch(argc: i64, argv: **u8) i64 {
                 deaths = deaths + s.g.players[k].frags[i];
             }
             k = k + 1;
-        }
-        # a co-op match is told by monsters killed and deaths counted
-        if (fetch.data[6] == 1) {
-            frags  = p.killcount;
-            deaths = died[i];
-        }
-        # and a campaign by those over all its levels
-        if (fetch.data[6] == 2) {
-            frags  = killed[i];
-            deaths = died[i];
         }
         val wasfrags:  i32 = get32(?fetch.data[0], at + 8):~i32;
         val wasdeaths: i32 = get32(?fetch.data[0], at + 12):~i32;
@@ -3346,9 +3648,12 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc >= 4 && str_equals(argv[1], "script"))                           { ret script(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "mus"))                              { ret mus(argv); }
     if ((argc == 4 || argc == 5 || argc == 9 || argc == 11) && str_equals(argv[1], "navcheck")) { ret navcheck(argc, argv); }
+    if (argc == 3 && str_equals(argv[1], "joinleague"))                       { ret joinleague(argv); }
+    if (argc == 5 && str_equals(argv[1], "resumecheck"))                      { ret resumecheck(argv); }
+    if (argc == 3 && str_equals(argv[1], "fingerprint"))                      { ret print_fingerprint(argv); }
     if ((argc == 5 || argc == 6) && str_equals(argv[1], "coopmatch"))         { ret coopmatch(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "rooms"))                            { ret rooms(argv); }
-    if ((argc == 4 || argc == 5) && str_equals(argv[1], "watch"))             { ret watch(argc, argv); }
+    if (argc == 4 && str_equals(argv[1], "watch"))                            { ret watch(argc, argv); }
     if (argc == 6 && str_equals(argv[1], "muswav"))                           { ret muswav(argv); }
     if (argc == 5 && str_equals(argv[1], "wav"))                              { ret wav(argv); }
     if (argc >= 3 && argc <= 9 && str_equals(argv[1], "host"))                { ret play_net(argc, argv, 1); }

@@ -571,13 +571,26 @@ PY
     dm_learns() { awk '/mutants tried since it started/ { tried = $2 } END { exit !(tried >= 4) }' "$work/arena.log"; }
     gate "and the deathmatch league learns by replays too" 0 dm_learns
     gate "and it tried mutants in every match played again" 0 coop_learns
-    RELAY_COOP_WATCH_FILE="$(cygpath -m "$work/league/coopwatch.bin" 2>/dev/null || echo "$work/league/coopwatch.bin")" "$here/out/windows-x86_64/release/bin/relay.exe" 5151 >"$work/relay8.log" 2>&1 &
-    cowatchpid=$!
-    sleep 1
-    gate "a co-op league match fetched through the relay replays to the result the arena recorded" 0 "$release" watch "$wad" 127.0.0.1:5151 coop
-    gate "and a relay with only the co-op league's match has no deathmatch to give" 3 "$release" watch "$wad" 127.0.0.1:5151
-    kill "$cowatchpid" 2>/dev/null
-    wait "$cowatchpid" 2>/dev/null
+fi
+
+# Joining the co-op league where it is. A campaign's level depends on
+# nothing before it but what the players carried in: every level after the
+# first, begun from what the one before handed on alone, ends as it does in
+# the campaign played straight through. And a game joins the league's
+# campaign from the files the league leaves on the site (coopnow.bin, .tic),
+# fast forward to where the league said it had got, plays that level out,
+# and ends it where the league did (coopdone.bin).
+gate "a campaign begun at any level comes out as the whole campaign does" 0 "$release" resumecheck "$wad" 9 2100
+if [[ -n "$python" ]]; then
+    (cd "$work" && exec "$python" -m http.server 5156 --bind 127.0.0.1 >/dev/null 2>&1) &
+    sitepid=$!
+    sleep 1.5
+    cp "$release" "$work/joiner.exe"
+    DOOM_UPDATE_URL=http://127.0.0.1:5156 "$work/joiner.exe" joinleague "$wad" >"$work/join.out" 2>&1
+    kill "$sitepid" 2>/dev/null
+    wait "$sitepid" 2>/dev/null
+    gate "a game joins the co-op league's campaign where it is" 0 grep -q "^joined E1M" "$work/join.out"
+    gate "and ends the level where the league did" 0 grep -q "came out as the league's did" "$work/join.out"
 fi
 # Four hand-written bots play a level through: into every secret, not out
 # before five minutes are up, then out. On Nightmare they do all of that on
@@ -754,6 +767,54 @@ if [[ -n "$python" ]]; then
     gate "a league match fetched through the relay replays to the result the arena recorded" 0 "$release" watch "$wad" 127.0.0.1:5146
     kill "$watchpid" 2>/dev/null
     wait "$watchpid" 2>/dev/null
+fi
+
+# A match to watch says what made it, and a game refuses one it cannot play
+# truly. Once it did not: a campaign, which the file marks in a byte that
+# older games read as "a deathmatch", was shown to a player who had not
+# updated as four bots shooting each other on an empty E1M1. So:
+#
+# - the game, debug and release, and the arena all make the same of the
+#   simulation's probe (game.fingerprint);
+# - a match whose fingerprint is not this program's is refused, as played
+#   by another version of the simulation or the bots;
+# - a match in a layout from before (RECIPE, its fifth byte) is refused.
+#
+# A change to the simulation or the bots changes the fingerprint by itself.
+# A change to what the file's fields mean must raise RECIPE by hand
+# (relayproto.mach); the last gate here fails if the file's length changes
+# without RECIPE changing with it.
+if [[ -n "$python" ]]; then
+    printed() { "$1" fingerprint "$wad" 2>/dev/null | awk '{ print $NF }'; }
+    arena_print="$(awk '/fingerprint is/ { print $NF; exit }' "$work/arena.log")"
+    prints_agree() { [[ -n "$arena_print" && "$(printed "$release")" == "$arena_print" && "$(printed "$debug")" == "$arena_print" ]]; }
+    gate "the game, debug and release, and the arena have the same fingerprint" 0 prints_agree
+    mkdir -p "$work/recipes"
+    "$python" - "$work/league/watch.bin" "$work/recipes" <<'PY'
+import struct, sys
+good = open(sys.argv[1], "rb").read()
+print_ = struct.unpack("<I", good[-4:])[0]
+open(sys.argv[2] + "/other.bin", "wb").write(good[:-4] + struct.pack("<I", print_ ^ 1))
+open(sys.argv[2] + "/older.bin", "wb").write(good[:4] + bytes([good[4] - 1]) + good[5:])
+PY
+    for kind in other older; do
+        RELAY_WATCH_FILE="$(cygpath -m "$work/recipes/$kind.bin" 2>/dev/null || echo "$work/recipes/$kind.bin")" "$here/out/windows-x86_64/release/bin/relay.exe" 5155 >"$work/relay-$kind.log" 2>&1 &
+        recipepid=$!
+        sleep 1
+        "$release" watch "$wad" 127.0.0.1:5155 >"$work/recipes/$kind.out" 2>&1
+        echo "exit $?" >>"$work/recipes/$kind.out"
+        kill "$recipepid" 2>/dev/null
+        wait "$recipepid" 2>/dev/null
+    done
+    gate "a match played by another simulation is refused, and says so" 0 grep -q "played by another version" "$work/recipes/other.out"
+    gate "a match in a layout from before is refused" 0 grep -q "not a match this program can play" "$work/recipes/older.out"
+    recipe_pinned() {
+        local size recipe
+        size="$(wc -c <"$work/league/watch.bin" | tr -d ' ')"
+        recipe="$(awk '/pub val RECIPE:/ { gsub(";", ""); print $NF }' "$here/src/relayproto.mach")"
+        grep -qx "$size $recipe" "$here/fixtures/recipe.expected"
+    }
+    gate "the watch file's layout has not changed without RECIPE changing (fixtures/recipe.expected)" 0 recipe_pinned
 fi
 
 # The network. A host and a joiner as two processes on this machine's

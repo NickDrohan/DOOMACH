@@ -853,16 +853,12 @@ pub rec Watch {
     done:  bool;
     # the relay answered, but has no match to give
     none:  bool;
-    # which league's match: 1 for the co-op league's
-    which: u8;
     asked: i64;
     asks:  i32;
     buf:   [1100]u8;
 }
 
-pub fun watch_open(w: *Watch, relay: *Peer, coop: bool) bool {
-    w.which = 0;
-    if (coop) { w.which = 1; }
+pub fun watch_open(w: *Watch, relay: *Peer) bool {
     val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(ip.endpoint(0, 0, 0, 0, 0), socket_api.async_flags());
     if (sel bound.err) { ret 0; }
     w.sock        = bound.ok;
@@ -907,7 +903,6 @@ pub fun watch_poll(w: *Watch, now: i64) {
                 val at: i32 = rp.header(?w.buf[0], rp.WATCH, 0, 0, 0);
                 w.buf[at]     = rp.VERSION;
                 w.buf[at + 1] = piece::u8;
-                w.buf[at + 2] = w.which;
                 udp.send_to(?w.sock, ?w.buf[0], rp.WATCHSIZE::usize, endpoint_of(?w.relay));
             }
             piece = piece + 1;
