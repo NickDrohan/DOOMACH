@@ -3,9 +3,12 @@
 #
 # A reduced port of st_stuff.c, st_lib.c, hu_stuff.c and v_video.c. The
 # numbers, keys and weapon slots are placed as the original places them. The
-# face is not: the original's face looks toward damage, grins at a new weapon
-# and grimaces under fire, and this one only shows how hurt the player is.
+# Ported, reduced, from st_stuff.c, st_lib.c, hu_stuff.c and v_video.c. The
+# numbers, keys and weapon slots are placed as the original places them, and
+# the face keeps the original's precedence: dead > grin > looking toward
+# what hurt you > straight ahead.
 
+use std.types.bool.bool;
 use std.types.option.opt;
 use std.types.string.str;
 
@@ -13,6 +16,7 @@ use doom.defs;
 use doom.defs.Game;
 use doom.defs.Player;
 use doom.rdata;
+use doom.tables;
 use doom.wad;
 use doom.world;
 
@@ -21,11 +25,40 @@ val SCREENHEIGHT: i32 = 200;
 
 val ST_Y: i32 = 168;
 
+# the faces, as st_stuff.c numbers them: five pained levels of eight —
+# three straight-ahead, looking right, looking left, the open-mouthed hurt
+# of a twenty-point wound, the grin of a weapon just got, the set jaw of
+# firing without pause — then the god-mode eyes and the dead face
+val FACESTRIDE: i32 = 8;
+val TURNOFFSET: i32 = 3;
+val OUCHOFFSET: i32 = 5;
+val EVILGRIN:   i32 = 6;
+val RAMPAGE:    i32 = 7;
+val GODFACE:    i32 = 40;
+val DEADFACE:   i32 = 41;
+
+val EVILGRINCOUNT:  i32 = 2 * defs.TICRATE;
+val STRAIGHTCOUNT:  i32 = defs.TICRATE / 2;
+val TURNCOUNT:      i32 = defs.TICRATE;
+val RAMPAGEDELAY:   i32 = 2 * defs.TICRATE;
+val MUCHPAIN:       i32 = 20;
+
 # what the bar remembers between tics
 pub rec State {
-    # which of the three straight-ahead faces, and tics until it changes
-    faceindex: i32;
-    facecount: i32;
+    # which face (as st_stuff.c numbers them) and tics until it may drop
+    faceindex:    i32;
+    facecount:    i32;
+    facepriority: i32;
+    # health last tic — so a sudden drop, or the original's famous twenty-
+    # point jump the other way, shows in the face — and the pain row it last
+    # worked out
+    oldhealth:     i32;
+    calcoldhealth: i32;
+    lastcalc:      i32;
+    # tics the trigger has been held, for the rampage face
+    lastattackdown: i32;
+    # what was owned when the last pickup flashed, so the next weapon is new
+    oldweapons: [9]bool;
     # its own walk through a cheap random sequence, so that drawing never
     # draws from the simulation's
     seed: u32;
@@ -34,6 +67,13 @@ pub rec State {
     msgtics: i32;
     # which of the 14 palettes the screen should be shown through
     palette: i32;
+}
+
+# fresh state: the sentinels a stack of zeroes does not give
+pub fun init(st: *State) {
+    st.oldhealth      = -1;
+    st.calcoldhealth  = -1;
+    st.lastattackdown = -1;
 }
 
 fun le16(p: *u8, at: i32) i32 {
@@ -136,15 +176,146 @@ fun st_random(st: *State) i32 {
     ret ((st.seed >> 16) & 0xff)::i32;
 }
 
+# ST_calcPainOffset: which of the five pained rows, cached as the original
+# caches it
+fun pain_offset(g: *Game, st: *State) i32 {
+    val player: *Player = ?g.players[g.consoleplayer];
+    var health: i32     = player.health;
+    if (health > 100) { health = 100; }
+    if (health != st.calcoldhealth) {
+        st.lastcalc      = FACESTRIDE * ((100 - health) * 5 / 101);
+        st.calcoldhealth = health;
+    }
+    ret st.lastcalc;
+}
+
+# ST_updateFaceWidget: the face states and their timing, precedence dead >
+# evil grin > turned head > straight ahead
+fun face_ticker(g: *Game, st: *State) {
+    val player: *Player = ?g.players[g.consoleplayer];
+
+    if (st.facepriority < 10) {
+        # dead
+        if (player.health <= 0) {
+            st.facepriority = 9;
+            st.faceindex    = DEADFACE;
+            st.facecount    = 1;
+        }
+    }
+
+    if (st.facepriority < 9) {
+        if (player.bonuscount != 0) {
+            # a weapon just picked up grins; weapons owned are remembered
+            # only while a pickup is still flashing, as the original does
+            var grin: bool = 0;
+            var i:    i32  = 0;
+            for (i < 9) {
+                if (st.oldweapons[i] != player.weaponowned[i]) {
+                    grin             = 1;
+                    st.oldweapons[i] = player.weaponowned[i];
+                }
+                i = i + 1;
+            }
+            if (grin) {
+                st.facepriority = 8;
+                st.facecount    = EVILGRINCOUNT;
+                st.faceindex    = pain_offset(g, st) + EVILGRIN;
+            }
+        }
+    }
+
+    if (st.facepriority < 8) {
+        if (player.damagecount != 0 && player.mo != nil && player.attacker != nil && player.attacker != player.mo) {
+            # being attacked by something else: look toward it, unless the
+            # hit was big — or, as the original has it, the health jump was
+            st.facepriority = 7;
+            if (player.health - st.oldhealth > MUCHPAIN) {
+                st.facecount = TURNCOUNT;
+                st.faceindex = pain_offset(g, st) + OUCHOFFSET;
+            }
+            or {
+                val toward: u32 = world.point_to_angle2(player.mo.x, player.mo.y, player.attacker.x, player.attacker.y);
+                var diff:   u32;
+                var right:  bool;
+                if (toward > player.mo.angle) {
+                    diff  = toward - player.mo.angle;
+                    right = diff > tables.ANG180;
+                }
+                or {
+                    diff  = player.mo.angle - toward;
+                    right = diff <= tables.ANG180;
+                }
+                st.facecount = TURNCOUNT;
+                st.faceindex = pain_offset(g, st);
+                if (diff < tables.ANG45) { st.faceindex = st.faceindex + RAMPAGE; }
+                or (right)               { st.faceindex = st.faceindex + TURNOFFSET; }
+                or                       { st.faceindex = st.faceindex + TURNOFFSET + 1; }
+            }
+        }
+    }
+
+    if (st.facepriority < 7) {
+        # hurt with nobody else to blame
+        if (player.damagecount != 0) {
+            if (player.health - st.oldhealth > MUCHPAIN) {
+                st.facepriority = 7;
+                st.facecount    = TURNCOUNT;
+                st.faceindex    = pain_offset(g, st) + OUCHOFFSET;
+            }
+            or {
+                st.facepriority = 6;
+                st.facecount    = TURNCOUNT;
+                st.faceindex    = pain_offset(g, st) + RAMPAGE;
+            }
+        }
+    }
+
+    if (st.facepriority < 6) {
+        # firing without a pause sets the jaw
+        if (player.attackdown != 0) {
+            if (st.lastattackdown == -1) {
+                st.lastattackdown = RAMPAGEDELAY;
+            }
+            or {
+                st.lastattackdown = st.lastattackdown - 1;
+                if (st.lastattackdown == 0) {
+                    st.facepriority   = 5;
+                    st.faceindex      = pain_offset(g, st) + RAMPAGE;
+                    st.facecount      = 1;
+                    st.lastattackdown = 1;
+                }
+            }
+        }
+        or {
+            st.lastattackdown = -1;
+        }
+    }
+
+    if (st.facepriority < 5) {
+        # untouchable
+        if ((player.cheats & defs.CF_GODMODE) != 0 || player.powers[defs.PW_INVULNERABILITY] != 0) {
+            st.facepriority = 4;
+            st.faceindex    = GODFACE;
+            st.facecount    = 1;
+        }
+    }
+
+    # nothing pressing: one of the three straight-ahead faces, looking about
+    if (st.facecount <= 0) {
+        st.faceindex    = pain_offset(g, st) + st_random(st) % 3;
+        st.facecount    = STRAIGHTCOUNT;
+        st.facepriority = 0;
+    }
+
+    st.facecount = st.facecount - 1;
+    st.oldhealth = player.health;
+}
+
 # ST_Ticker: once a tic, age the face and the message, pick the palette
 pub fun ticker(g: *Game, st: *State) {
     val player: *Player = ?g.players[g.consoleplayer];
 
-    st.facecount = st.facecount - 1;
-    if (st.facecount <= 0) {
-        st.faceindex = st_random(st) % 3;
-        st.facecount = defs.TICRATE / 2;
-    }
+    face_ticker(g, st);
 
     # a new message replaces the old and starts its time again
     if (player.message != nil) {
@@ -250,19 +421,59 @@ pub fun draw(g: *Game, st: *State, screen: *u8) {
         i = i + 1;
     }
 
-    # the face: one of five levels of hurt, or dead
-    if (player.health <= 0) {
-        draw_patch(screen, 143, ST_Y, patch(d, "STFDEAD0"));
+    # the face: st.faceindex numbers it the way st_stuff.c does — a pained
+    # row of eight for each level of hurt, then the god and dead faces
+    var name: [9]u8 = [9]u8{'S', 'T', 'F', 'D', 'E', 'A', 'D', '0', 0};
+    val idx: i32    = st.faceindex;
+    if (idx == DEADFACE || player.health <= 0) {
+        draw_patch(screen, 143, ST_Y, patch(d, ?name[0]));
     }
-    or ((player.cheats & defs.CF_GODMODE) != 0 || player.powers[defs.PW_INVULNERABILITY] != 0) {
-        draw_patch(screen, 143, ST_Y, patch(d, "STFGOD0"));
+    or (idx == GODFACE) {
+        name[3] = 'G';
+        name[4] = 'O';
+        name[5] = 'D';
+        name[6] = '0';
+        name[7] = 0;
+        draw_patch(screen, 143, ST_Y, patch(d, ?name[0]));
     }
     or {
-        var health: i32 = player.health;
-        if (health > 100) { health = 100; }
-        var name: [9]u8 = [9]u8{'S', 'T', 'F', 'S', 'T', '0', '0', 0, 0};
-        name[5] = ('0' + ((100 - health) * 5) / 101)::u8;
-        name[6] = ('0' + st.faceindex)::u8;
+        name[5] = ('0' + idx / FACESTRIDE)::u8;
+        name[6] = '0';
+        name[7] = 0;
+        val sub: i32 = idx % FACESTRIDE;
+        if (sub < 3) {
+            name[3] = 'S';
+            name[4] = 'T';
+            name[6] = ('0' + sub)::u8;
+        }
+        or (sub == 3) {
+            name[3] = 'T';
+            name[4] = 'R';
+        }
+        or (sub == 4) {
+            name[3] = 'T';
+            name[4] = 'L';
+        }
+        or (sub == OUCHOFFSET) {
+            name[3] = 'O';
+            name[4] = 'U';
+            name[5] = 'C';
+            name[6] = 'H';
+            name[7] = ('0' + idx / FACESTRIDE)::u8;
+        }
+        or (sub == EVILGRIN) {
+            name[3] = 'E';
+            name[4] = 'V';
+            name[5] = 'L';
+            name[6] = ('0' + idx / FACESTRIDE)::u8;
+        }
+        or {
+            name[3] = 'K';
+            name[4] = 'I';
+            name[5] = 'L';
+            name[6] = 'L';
+            name[7] = ('0' + idx / FACESTRIDE)::u8;
+        }
         draw_patch(screen, 143, ST_Y, patch(d, ?name[0]));
     }
 

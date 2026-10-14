@@ -1,0 +1,501 @@
+# the automap: the level drawn from above while the game goes on
+#
+# A reduced port of am_map.c. The walls are what the player has seen —
+# ML_MAPPED, set by the renderer as it draws — plus every wall once the
+# computer-map powerup is held or 'iddt' is typed into the map. North is up,
+# the player is the white arrow, 'm' drops numbered marks and 'c' clears
+# them. The map asks nothing of the simulation and tells it nothing, so a
+# game with it open stays in step with one without.
+
+use std.types.bool.bool;
+use std.types.string.str;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.fixed;
+use doom.fixed.Fixed;
+use doom.level;
+use doom.rdata;
+use doom.tables;
+use doom.video;
+
+# the screen's middle, in pixels
+val CX: i32 = 160;
+val CY: i32 = 100;
+
+# the palette ranges the original colours its walls from
+val REDS:    i32 = 256 - 5 * 16;   # a one-sided wall
+val GRAYS:   i32 = 6 * 16;         # a two-sided wall known only through 'iddt'
+val BROWNS:  i32 = 4 * 16;         # a floor step between the sides
+val YELLOWS: i32 = 256 - 32 + 7;   # a ceiling step
+val GREENS:  i32 = 7 * 16;         # a thing, 'iddt' typed twice
+val WHITE:   i32 = 256 - 47;       # the player
+val GRIDC:   i32 = 6 * 16 + 8;     # the grid
+val XHAIR:   i32 = 6 * 16;         # the cross at the middle
+
+# map units to a pixel, fixed-point, with its limits and zoom steps
+val INITSCALE: Fixed = 0x2000;
+val MINSCALE:  Fixed = 0x0400;
+val MAXSCALE:  Fixed = 0x40000;
+val ZOOMIN:    Fixed = 0x18000;
+val ZOOMOUT:   Fixed = 0x0aaab;
+
+# a grid line every blockmap cell
+val GCELL: Fixed = 128 << 16;
+
+# the window's own key numbers, and what '=' and '-' arrive as
+val KEY_LEFT:  i32 = 0x25;
+val KEY_UP:    i32 = 0x26;
+val KEY_RIGHT: i32 = 0x27;
+val KEY_DOWN:  i32 = 0x28;
+val KEY_PLUS:  i32 = 0xbb;
+val KEY_MINUS: i32 = 0xbd;
+
+pub val KEY_TAB: i32 = 0x09;
+
+# the player arrow is drawn from this many map units of player radius
+val ARR: i32 = 8 * 16 * 65536 / 7;
+
+# the other players' arrows in a network game, the original's colours
+val THEIRS: [4]i32 = [4]i32{GREENS, GRAYS, BROWNS, REDS};
+
+# the marks' number pictures
+val MARKNUMS: [10]str = [10]str{
+    "AMMNUM0", "AMMNUM1", "AMMNUM2", "AMMNUM3", "AMMNUM4",
+    "AMMNUM5", "AMMNUM6", "AMMNUM7", "AMMNUM8", "AMMNUM9",
+};
+
+pub rec State {
+    on:     bool;
+    follow: bool;
+    grid:   bool;
+    # 'iddt' typed once shows every wall, twice the things as well
+    iddt:   i32;
+    # map units to a pixel, fixed-point
+    scale:  Fixed;
+    # the middle of the screen in map units while not following
+    cx:     Fixed;
+    cy:     Fixed;
+    # '0' zooms to the whole level; the view it replaces is kept here
+    big:        bool;
+    savedscale: Fixed;
+    savedcx:    Fixed;
+    savedcy:    Fixed;
+    # the marks dropped with 'm', and how many so far
+    marks:  i32;
+    markx:  [10]Fixed;
+    marky:  [10]Fixed;
+    # the letters last pressed, for 'iddt'
+    typed:  [5]u8;
+    ntyped: i32;
+}
+
+pub fun init(am: *State) {
+    am.on     = 0;
+    am.follow = 1;
+    am.grid   = 0;
+    am.iddt   = 0;
+    am.scale  = INITSCALE;
+    am.cx     = 0;
+    am.cy     = 0;
+    am.big    = 0;
+    am.marks  = 0;
+    am.ntyped = 0;
+    var i: i32 = 0;
+    for (i < 10) {
+        am.markx[i] = -1;
+        am.marky[i] = -1;
+        i           = i + 1;
+    }
+}
+
+# a key while the level plays: 1 when the map has taken it, 0 to pass it on
+# ---
+# g:   the game, for whose eyes to follow and the map powerup
+# am:  the map's state
+# key: the key, as Windows numbers it; a script may send small letters
+pub fun keypress(g: *Game, am: *State, key: i32) bool {
+    val plr: *defs.Player = ?g.players[g.consoleplayer];
+    if (!am.on) {
+        if (key != KEY_TAB) { ret 0; }
+        am.on     = 1;
+        am.follow = 1;
+        if (plr.mo != nil) {
+            am.cx = plr.mo.x;
+            am.cy = plr.mo.y;
+        }
+        ret 1;
+    }
+    if (key == KEY_TAB) { am.on = 0; ret 1; }
+
+    var k: i32 = key;
+    if (k >= 'a' && k <= 'z') { k = k - 32; }
+
+    # 'iddt': every letter pressed while the map is up
+    if (g.deathmatch == 0 && k >= 'A' && k <= 'Z') {
+        am.typed[am.ntyped % 5] = (k + 32)::u8;
+        am.ntyped               = am.ntyped + 1;
+        if (am.ntyped >= 4) {
+            val want: str = "iddt";
+            var i:    i32 = 0;
+            for (i < 4) {
+                if (am.typed[(am.ntyped - 4 + i) % 5] != want[i]) { brk; }
+                i = i + 1;
+            }
+            if (i == 4) {
+                am.iddt   = (am.iddt + 1) % 3;
+                am.ntyped = 0;
+            }
+        }
+    }
+
+    if (k == 'F') {
+        am.follow = !am.follow;
+        ret 1;
+    }
+    if (k == 'G') {
+        am.grid = !am.grid;
+        ret 1;
+    }
+    if (k == '=' || k == '+' || key == KEY_PLUS) {
+        am.scale = fixed.mul(am.scale, ZOOMIN);
+        if (am.scale > MAXSCALE) { am.scale = MAXSCALE; }
+        ret 1;
+    }
+    if (k == '-' || key == KEY_MINUS) {
+        am.scale = fixed.mul(am.scale, ZOOMOUT);
+        if (am.scale < MINSCALE) { am.scale = MINSCALE; }
+        ret 1;
+    }
+    if (k == '0') {
+        go_big(g, am);
+        ret 1;
+    }
+    if (key == KEY_LEFT) {
+        if (!am.follow) { am.cx = am.cx - panstep(am); }
+        ret 1;
+    }
+    if (key == KEY_RIGHT) {
+        if (!am.follow) { am.cx = am.cx + panstep(am); }
+        ret 1;
+    }
+    if (key == KEY_UP) {
+        if (!am.follow) { am.cy = am.cy + panstep(am); }
+        ret 1;
+    }
+    if (key == KEY_DOWN) {
+        if (!am.follow) { am.cy = am.cy - panstep(am); }
+        ret 1;
+    }
+    if (k == 'M') {
+        mark(g, am);
+        ret 1;
+    }
+    if (k == 'C') {
+        clear(am);
+        ret 1;
+    }
+    ret 0;
+}
+
+# '0': the whole level fitted on screen, or back to what it was
+fun go_big(g: *Game, am: *State) {
+    if (am.big) {
+        am.scale = am.savedscale;
+        am.cx    = am.savedcx;
+        am.cy    = am.savedcy;
+        am.big   = 0;
+        ret;
+    }
+    var minx: Fixed = 2147483647;
+    var maxx: Fixed = -2147483648;
+    var miny: Fixed = 2147483647;
+    var maxy: Fixed = -2147483648;
+    var i:    i32   = 0;
+    for (i < g.lv.numvertexes) {
+        val v: *level.Vertex = ?g.lv.vertexes[i];
+        if (v.x < minx) { minx = v.x; }
+        if (v.x > maxx) { maxx = v.x; }
+        if (v.y < miny) { miny = v.y; }
+        if (v.y > maxy) { maxy = v.y; }
+        i = i + 1;
+    }
+    if (maxx <= minx || maxy <= miny) { ret; }
+    val w: Fixed = 320 << 16;
+    val h: Fixed = 200 << 16;
+    am.savedscale = am.scale;
+    am.savedcx    = am.cx;
+    am.savedcy    = am.cy;
+    am.scale      = fixed.div(w, maxx - minx);
+    val hs: Fixed = fixed.div(h, maxy - miny);
+    if (hs < am.scale) { am.scale = hs; }
+    am.cx     = minx + (maxx - minx) / 2;
+    am.cy     = miny + (maxy - miny) / 2;
+    am.follow = 0;
+    am.big    = 1;
+}
+
+# 'm': a numbered mark at the map's middle, the player when following
+fun mark(g: *Game, am: *State) {
+    val plr: *defs.Player = ?g.players[g.consoleplayer];
+    var x:   Fixed        = am.cx;
+    var y:   Fixed        = am.cy;
+    if (am.follow && plr.mo != nil) {
+        x = plr.mo.x;
+        y = plr.mo.y;
+    }
+    val i: i32  = am.marks % 10;
+    am.markx[i] = x;
+    am.marky[i] = y;
+    am.marks    = am.marks + 1;
+}
+
+# 'c': the marks away
+fun clear(am: *State) {
+    var i: i32 = 0;
+    for (i < 10) {
+        am.markx[i] = -1;
+        i           = i + 1;
+    }
+    am.marks = 0;
+}
+
+# an arrow pan step: a quarter of the screen's width in map units
+fun panstep(am: *State) Fixed {
+    val w: Fixed = 80 << 16;
+    ret fixed.div(w, am.scale);
+}
+
+# the screen column a map x lands on; mul's answer is fixed-point pixels
+fun sx_of(am: *State, wx: Fixed) i32 {
+    ret CX + (fixed.mul(wx - am.cx, am.scale)::i32 >> 16);
+}
+
+# the screen row a map y lands on; north is up
+fun sy_of(am: *State, wy: Fixed) i32 {
+    ret CY - (fixed.mul(wy - am.cy, am.scale)::i32 >> 16);
+}
+
+# which sides of the screen a pixel is off
+fun outcode(x: i32, y: i32) i32 {
+    var c: i32 = 0;
+    if (x < 0)   { c = c | 1; }
+    or (x > 319) { c = c | 2; }
+    if (y < 0)   { c = c | 4; }
+    or (y > 199) { c = c | 8; }
+    ret c;
+}
+
+# a pixel line between two screen points, clipped to the screen
+fun segline(screen: *u8, x1_in: i32, y1_in: i32, x2_in: i32, y2_in: i32, color: i32) {
+    var x1: i32 = x1_in;
+    var y1: i32 = y1_in;
+    var x2: i32 = x2_in;
+    var y2: i32 = y2_in;
+    for {
+        val c1: i32 = outcode(x1, y1);
+        val c2: i32 = outcode(x2, y2);
+        if ((c1 | c2) == 0) { brk; }
+        if ((c1 & c2) != 0) { ret; }
+        var c: i32 = c1;
+        if (c == 0) { c = c2; }
+        var x: i32 = 0;
+        var y: i32 = 0;
+        if ((c & 8) != 0) {
+            x = x1 + (x2 - x1) * (199 - y1) / (y2 - y1);
+            y = 199;
+        }
+        or ((c & 4) != 0) {
+            x = x1 + (x2 - x1) * (0 - y1) / (y2 - y1);
+            y = 0;
+        }
+        or ((c & 2) != 0) {
+            y = y1 + (y2 - y1) * (319 - x1) / (x2 - x1);
+            x = 319;
+        }
+        or {
+            y = y1 + (y2 - y1) * (0 - x1) / (x2 - x1);
+            x = 0;
+        }
+        if (c == c1) {
+            x1 = x;
+            y1 = y;
+        }
+        or {
+            x2 = x;
+            y2 = y;
+        }
+    }
+    var dx: i32 = x2 - x1;
+    var dy: i32 = y2 - y1;
+    var n:  i32 = dx;
+    if (n < 0) { n = -n; }
+    if (dy < 0) {
+        if (-dy > n) { n = -dy; }
+    }
+    or (dy > n) {
+        n = dy;
+    }
+    if (n == 0) {
+        screen[y1 * 320 + x1] = color::u8;
+        ret;
+    }
+    var i: i32 = 0;
+    for (i <= n) {
+        screen[(y1 + dy * i / n) * 320 + x1 + dx * i / n] = color::u8;
+        i                                                = i + 1;
+    }
+}
+
+# the grid: a line every blockmap cell, on blockmap boundaries
+fun draw_grid(g: *Game, am: *State, screen: *u8) {
+    val w:  Fixed = 160 << 16;
+    val h:  Fixed = 100 << 16;
+    val hw: Fixed = fixed.div(w, am.scale);
+    val hh: Fixed = fixed.div(h, am.scale);
+    val x0: Fixed = am.cx - hw;
+    val y0: Fixed = am.cy - hh;
+    var gx: Fixed = x0 - (x0 - g.lv.bmaporgx) % GCELL;
+    if (gx < x0) { gx = gx + GCELL; }
+    for (gx <= x0 + hw * 2) {
+        val sx: i32 = sx_of(am, gx);
+        segline(screen, sx, 0, sx, 199, GRIDC);
+        gx = gx + GCELL;
+    }
+    var gy: Fixed = y0 - (y0 - g.lv.bmaporgy) % GCELL;
+    if (gy < y0) { gy = gy + GCELL; }
+    for (gy <= y0 + hh * 2) {
+        val sy: i32 = sy_of(am, gy);
+        segline(screen, 0, sy, 319, sy, GRIDC);
+        gy = gy + GCELL;
+    }
+}
+
+# every wall the map knows of, coloured as the original colours it
+fun draw_walls(g: *Game, am: *State, screen: *u8) {
+    val plr:    *defs.Player = ?g.players[g.consoleplayer];
+    val allmap: i32          = plr.powers[defs.PW_ALLMAP];
+    var i:      i32          = 0;
+    for (i < g.lv.numlines) {
+        val line:  *level.Line = ?g.lv.lines[i];
+        var color: i32         = -1;
+        if (am.iddt != 0 || (line.flags::i32 & defs.ML_MAPPED) != 0) {
+            if ((line.flags::i32 & defs.ML_DONTDRAW) != 0 && am.iddt == 0) {
+                color = -1;
+            }
+            or (line.backsector < 0) {
+                color = REDS;
+            }
+            or (line.special == 39) {
+                color = REDS + 8;
+            }
+            or ((line.flags::i32 & defs.ML_SECRET) != 0) {
+                color = REDS;
+            }
+            or (g.lv.sectors[line.backsector].floorheight != g.lv.sectors[line.frontsector].floorheight) {
+                color = BROWNS;
+            }
+            or (g.lv.sectors[line.backsector].ceilingheight != g.lv.sectors[line.frontsector].ceilingheight) {
+                color = YELLOWS;
+            }
+            or (am.iddt != 0) {
+                color = GRAYS;
+            }
+        }
+        or (allmap != 0 && (line.flags::i32 & defs.ML_DONTDRAW) == 0) {
+            color = GRAYS + 3;
+        }
+        if (color >= 0) {
+            segline(screen,
+                    sx_of(am, g.lv.vertexes[line.v1].x), sy_of(am, g.lv.vertexes[line.v1].y),
+                    sx_of(am, g.lv.vertexes[line.v2].x), sy_of(am, g.lv.vertexes[line.v2].y),
+                    color);
+        }
+        i = i + 1;
+    }
+}
+
+# one line of a figure like the player's arrow, given in map units and spun
+# around the figure's point; it is drawn pointing right for a thing facing
+# east, so the spin is a quarter turn less its angle
+fun arrow_seg(am: *State, screen: *u8, ox: Fixed, oy: Fixed, angle: u32,
+              ax: Fixed, ay: Fixed, bx: Fixed, by: Fixed, color: i32) {
+    val rot:  u32   = tables.ANG90 - angle;
+    val fine: u32   = rot >> tables.ANGLETOFINESHIFT;
+    val c:    Fixed = tables.FINESINE[fine + 2048];
+    val s:    Fixed = tables.FINESINE[fine];
+    val x1:   Fixed = ox + fixed.mul(ax, c) - fixed.mul(ay, s);
+    val y1:   Fixed = oy + fixed.mul(ax, s) + fixed.mul(ay, c);
+    val x2:   Fixed = ox + fixed.mul(bx, c) - fixed.mul(by, s);
+    val y2:   Fixed = oy + fixed.mul(bx, s) + fixed.mul(by, c);
+    segline(screen, sx_of(am, x1), sy_of(am, y1), sx_of(am, x2), sy_of(am, y2), color);
+}
+
+# every player as the arrow, this one white and the others their colours
+fun draw_players(g: *Game, am: *State, screen: *u8) {
+    var i: i32 = 0;
+    for (i < 4) {
+        val mo: *defs.Mobj = g.players[i].mo;
+        if (!g.playeringame[i] || mo == nil) { i = i + 1; cnt; }
+        var color: i32 = WHITE;
+        if (i != g.consoleplayer) { color = THEIRS[i]; }
+        arrow_seg(am, screen, mo.x, mo.y, mo.angle, -ARR + ARR / 8, 0, ARR, 0, color);
+        arrow_seg(am, screen, mo.x, mo.y, mo.angle, ARR, 0, ARR - ARR / 2, ARR / 4, color);
+        arrow_seg(am, screen, mo.x, mo.y, mo.angle, ARR, 0, ARR - ARR / 2, -ARR / 4, color);
+        arrow_seg(am, screen, mo.x, mo.y, mo.angle, -ARR + ARR / 8, 0, -ARR - ARR / 8, ARR / 4, color);
+        arrow_seg(am, screen, mo.x, mo.y, mo.angle, -ARR + ARR / 8, 0, -ARR - ARR / 8, -ARR / 4, color);
+        arrow_seg(am, screen, mo.x, mo.y, mo.angle, -ARR + 3 * ARR / 8, 0, -ARR + ARR / 8, ARR / 4, color);
+        arrow_seg(am, screen, mo.x, mo.y, mo.angle, -ARR + 3 * ARR / 8, 0, -ARR + ARR / 8, -ARR / 4, color);
+        i = i + 1;
+    }
+}
+
+# every thing as a thin triangle, when 'iddt' has been typed twice
+fun draw_things(g: *Game, am: *State, screen: *u8) {
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            val mo: *defs.Mobj = th:~*defs.Mobj;
+            val r:  i32        = 16 << 16;
+            arrow_seg(am, screen, mo.x, mo.y, mo.angle, -r / 2, -r * 7 / 10, r, 0, GREENS);
+            arrow_seg(am, screen, mo.x, mo.y, mo.angle, r, 0, -r / 2, r * 7 / 10, GREENS);
+            arrow_seg(am, screen, mo.x, mo.y, mo.angle, -r / 2, r * 7 / 10, -r / 2, -r * 7 / 10, GREENS);
+        }
+        th = th.next;
+    }
+}
+
+# the marks as their number pictures
+fun draw_marks(d: *rdata.Data, am: *State, screen: *u8) {
+    var i: i32 = 0;
+    for (i < 10) {
+        if (am.markx[i] != -1) {
+            val fx: i32 = sx_of(am, am.markx[i]);
+            val fy: i32 = sy_of(am, am.marky[i]);
+            if (fx >= 0 && fx <= 315 && fy >= 0 && fy <= 194) {
+                val p: *u8 = video.patch(d, MARKNUMS[i]);
+                if (p != nil) { video.draw_patch(screen, fx, fy, p); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+pub fun draw(g: *Game, d: *rdata.Data, am: *State, screen: *u8) {
+    val plr: *defs.Player = ?g.players[g.consoleplayer];
+    if (am.follow && plr.mo != nil) {
+        am.cx = plr.mo.x;
+        am.cy = plr.mo.y;
+    }
+    var i: i32 = 0;
+    for (i < 64000) {
+        screen[i] = 0;
+        i         = i + 1;
+    }
+    if (am.grid) { draw_grid(g, am, screen); }
+    draw_walls(g, am, screen);
+    draw_players(g, am, screen);
+    if (am.iddt == 2) { draw_things(g, am, screen); }
+    draw_marks(d, am, screen);
+    screen[CY * 320 + CX] = XHAIR::u8;
+}

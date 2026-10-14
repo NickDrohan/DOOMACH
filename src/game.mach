@@ -333,6 +333,22 @@ pub fun init_new(s: *Session, skill_in: i32, episode_in: i32, map_in: i32) bool 
     ret load_level(s);
 }
 
+# G_DoLoadGame: a saved game becomes the game in progress, replacing whatever
+# this machine was doing — a game alone or with others, watched or played;
+# save.mach reads the saved state over the level this loads
+# ---
+# s:       the session
+# skill:   SK_BABY to SK_NIGHTMARE
+# episode: 1 in the shareware game
+# map:     1 to 9
+# ret:     whether the level loaded
+pub fun load_game(s: *Session, skill: i32, episode: i32, map: i32) bool {
+    clear_bots(s);
+    s.g.netgame       = 0;
+    s.g.consoleplayer = 0;
+    ret init_new(s, skill, episode, map);
+}
+
 # start a game for one player, undoing whatever a demo set up
 # ---
 # s:       the session

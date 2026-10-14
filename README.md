@@ -94,15 +94,12 @@ straight into a level.
 | Esc | the menu; arrows, Enter and Backspace move through it |
 
 It is the game: monsters, weapons, doors, lifts, switches, keys, secrets, damaging floors,
-teleporters, pickups, the status bar, the red and gold screen flashes, sound effects placed in
+teleporters, pickups, the automap, saved games in the six slots the menu shows, the status bar, the red and gold screen flashes, sound effects placed in
 stereo by where they come from, and each level's music. Finishing a level brings up the
 intermission (kills, items, secrets and time counting up, then the map with where you are going),
 and finishing E1M8 the episode's closing text.
 
-What is missing: the automap, saved games (the menu says so), the screen melt between screens,
-and the screen-size, detail and mouse options. The marine's face on the status
-bar shows how hurt he is and nothing else. Nightmare skill does not speed the demons up as it
-should, because the state table is a constant here and the original edits it in place.
+What is missing: the screen-size, detail and mouse options.
 
 The window procedure Windows calls is a plain Mach function, the frame goes to the screen as an
 8-bit image through `StretchDIBits`, sound goes out through `waveOut` in four short blocks that

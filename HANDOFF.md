@@ -182,9 +182,31 @@ Measured where it stands (hand-written bots, one run a map, not statistics):
 
 Bots and leagues:
 
-- Route-finding gaps: a bot can circle a goal it believes in and cannot reach (only secrets have
-  a give-up timer); the walk grid finds no walk to E1M3's exit; E1M8 has no exit to walk to and
-  only ends on the time cap in a campaign.
+- Route-finding gaps: E1M6 and E1M9's exits are reached by the grid, so their "not out" is
+  circling, not topology. (E1M8's end is now in the grid too: it has no exit line — the level
+  ends on a special-11 floor past the star walls — so tag-666 sectors count as movers and a
+  teleport landing on the ending floor counts as the exit, held shut to the bots until five
+  minutes. Whether the team ever takes it still rests on killing every bruiser at once, which
+  Nightmare's respawning makes rare.) (Give-up is now general, not secrets-only: a monster, key or followed friend the
+  bot spends 45 s getting no nearer is given up for 90 s, re-armed by a new key or a minute.)
+  (E1M3's exit island was fixed the same day: a stair trigger's tag names only the flight's first
+  step — line 967 builds ten steps from sector 16 through 13 — and the untagged steps' walks were
+  never trusted, sealing the exit room. `mark_stairs` in bot.mach follows the chain the engine's
+  `build_stairs` would raise; calm bots finish E1M3 at 5:00.)
+  The calm sweep after that: six of eight finish. What is left is diagnosed, not fixed:
+  - E1M6 strands bots in the nukage trenches — one-way drops in, no way back. Goals standing
+    in cells the exit cannot be walked to from are now never taken up (`lost` in bot.mach:
+    secrets, keys, monsters, a followed friend, and items that can be seen); a bot that ends
+    up inside anyway — pushed, or roaming off its way — still cannot get out. Separately, the
+    exit approach passes a door pocket (sector 37, tags 4) whose only trigger is a one-shot
+    open-wait-close switch (line 438) half the map away: pressed, it shuts again before the
+    walk back. Remote timed doors like it are unsolved.
+  - E1M9 pens the team in sector 132's courtyard: every way out is a yellow door and the key
+    they are missing is the goal they circle (1856,-1088, a structure inside the courtyard).
+    Reaching it is the open problem there.
+  Calm table (one run a map, not statistics): E1M1 3/3 out 5:00; E1M2 3/6 out 5:00; E1M3 1/7
+  out 5:00; E1M4 2/3 out 5:00; E1M5 9/9 out 5:00 (was 7:36); E1M6 4/4 not out; E1M7 1/4 out
+  5:04; E1M8 1/1 not out (no exit to reach); E1M9 1/2 not out.
 - On Nightmare the bots die about once a minute each and respawn at the level start, which is
   most of why they do not finish levels. This is what the nets are meant to learn.
 - Apprentices do nothing until 5,000 samples of human play exist for their game type (about
@@ -199,8 +221,25 @@ Bots and leagues:
   levels) is tested headless and not by hand.
 
 The port itself (see README's build order): the AVX2 and SPIR-V renderers are not started;
-automap, save games, the screen melt, the full status-bar face and a reference-engine
-comparison are owed.
+a reference-engine comparison is owed. (Done since:
+the melt between screens — it runs on tics, not draws, so scripted shots of
+it pin, fixtures/melt.sha256 — and the full status-bar face, ported from
+st_stuff.c with its precedence dead > grin > looking toward the hurt >
+straight ahead, the twenty-point "ouch" quirk included; fixtures/face.sha256.
+Small script verbs for gates: fire:<n>, hurt:<n>, heal:<n>, god, give:<n>. And the
+automap — a reduced port of am_map.c: seen walls from ML_MAPPED, the grid, marks, follow,
+pan, zoom, go-big, and 'iddt' cycling to everything and the things; key:tab scripts it and
+fixtures/automap.sha256 pins nine screens. And save games — a reduced p_saveg.c in
+src/save.mach, single-player only: the whole mutable world (game numbers and RNG place,
+players, sector heights and lights, side textures and scroll, buttons, every thinker)
+with pointers written as numbers and put back as pointers. The load and save menus show
+the six slots as the original's did; saving refuses a network game, loading leaves one
+behind. Scripts: save:<n>, load:<n>, sum (the lockstep checksum); the gate replays a run
+against a saved-and-loaded one, sums and screen byte-identical, debug and release
+sharing the file. Records are written field by field, never as memory — a debug file
+and a release file agree — and a 32-bit mix sits before the trailer: a file that
+fails it, the framing, or an index bound is refused whole, and leaves the game it
+found alone.)
 
 Other:
 

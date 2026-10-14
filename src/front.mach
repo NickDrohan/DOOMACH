@@ -7,12 +7,13 @@
 # starts and ends it, and draws whatever is on screen when it is not the view
 # through the marine's eyes.
 #
-# Left out: saving and loading (the menu says so), the screen size, detail
-# and mouse options, and the "melt" between screens.
+# Left out: saving and loading (the menu says so), and the screen size,
+# detail and mouse options.
 
 use std.types.bool.bool;
 use std.types.string.str;
 
+use doom.am;
 use doom.announce;
 use doom.defs;
 use rp: doom.relayproto;
@@ -21,6 +22,7 @@ use doom.info;
 use doom.music;
 use doom.rdata;
 use doom.render;
+use doom.save;
 use doom.sound;
 use doom.st;
 use doom.video;
@@ -44,6 +46,8 @@ val MENU_READ2:   i32 = 6;
 val MENU_COOP:    i32 = 7;
 val MENU_CODE:    i32 = 8;
 val MENU_LIST:    i32 = 9;
+val MENU_LOAD:    i32 = 10;
+val MENU_SAVE:    i32 = 11;
 
 # the lines of the co-op menu
 val COOP_MODE:   i32 = 3;
@@ -124,7 +128,7 @@ pub rec Front {
     # the menu
     menuactive: bool;
     menu:       i32;
-    itemon:     [10]i32;
+    itemon:     [12]i32;
     skulltics:  i32;
     whichskull: i32;
     episode:    i32;
@@ -190,6 +194,8 @@ pub rec Front {
     liststate:   i32;
     nrooms:      i32;
     rooms:       [6]Listing;
+    # what the load and save menus call the six slots, read when one opens
+    savenames:   [6][24]u8;
     # watching a league match: the four bots' names, shown with their frags
     watching: bool;
     watched:  [96]u8;
@@ -215,6 +221,15 @@ pub rec Front {
     # and there is none); spy is whose eyes, or -1 for nobody's.
     inset: *render.Renderer;
     spy:   i32;
+
+    # the melt from one screen to the next: 0 for none, 1 until the frame
+    # being left has been kept aside, 2 while it is coming down; meltmode is
+    # the mode that frame was drawn in
+    melting:  i32;
+    meltmode: i32;
+
+    # the automap, over the view while its key is toggled
+    am: am.State;
 
     # the player chose to quit
     quit: bool;
@@ -262,6 +277,58 @@ fun random(f: *Front) i32 {
     ret ((f.seed >> 16) & 0x7fff)::i32;
 }
 
+# ------------------------------------------------------------ the melt
+# Between one screen and the next — title to demo to level to intermission —
+# the new picture melts down over the old one a column at a time, as f_wipe.c
+# did it. meltfrom is the frame being left; melty is how far down each of its
+# columns the new screen has got. The melt moves on tics, not draws, so a
+# picture taken of it mid-melt is the same whoever asked.
+
+var meltfrom: [64000]u8;
+var melty:    [320]i32;
+
+# set a melt going toward the mode the front is now in: every column starts
+# at the top or a little above it, staggered as the original's were
+fun melt_begin(f: *Front) {
+    f.meltmode = f.mode;
+    f.melting  = 1;
+    melty[0]   = 0 - random(f) % 16;
+    var i: i32 = 1;
+    for (i < 320) {
+        melty[i] = melty[i - 1] + random(f) % 3 - 1;
+        if (melty[i] > 0)   { melty[i] = 0; }
+        or (melty[i] < -16) { melty[i] = -16; }
+        i = i + 1;
+    }
+}
+
+# move the melt on one tic, beginning it if the mode has changed; a slow
+# start (the first columns barely move), then eight rows a tic
+fun melt_tic(f: *Front) {
+    if (f.mode != f.meltmode) { melt_begin(f); }
+    if (f.melting == 0) { ret; }
+    var done: bool = 1;
+    var i:    i32  = 0;
+    for (i < 320) {
+        if (melty[i] < 0) {
+            melty[i] = melty[i] + 1;
+            done     = 0;
+        }
+        or (melty[i] < render.SCREENHEIGHT) {
+            if (melty[i] < 16) {
+                melty[i] = melty[i] + melty[i] + 1;
+            }
+            or {
+                melty[i] = melty[i] + 8;
+            }
+            if (melty[i] > render.SCREENHEIGHT) { melty[i] = render.SCREENHEIGHT; }
+            done = 0;
+        }
+        i = i + 1;
+    }
+    if (done) { f.melting = 0; }
+}
+
 # set up the front end; the game starts on the title screen
 pub fun init(f: *Front) {
     f.sfxvolume          = 8;
@@ -270,6 +337,9 @@ pub fun init(f: *Front) {
     f.itemon[MENU_SKILL] = 2;
     f.seed               = 1;
     f.spy                = -1;
+    f.melting            = 0;
+    f.meltmode           = MODE_PAGE;
+    am.init(?f.am);
     start_title(f);
 }
 
@@ -282,6 +352,7 @@ fun start_title(f: *Front) {
     f.menuactive   = 0;
     f.mode         = MODE_PAGE;
     f.pagetic      = 0;
+    f.pagename     = "TITLEPIC";
 }
 
 # D_DoAdvanceDemo: title, demo, credits, demo, help, demo, and round again
@@ -368,6 +439,7 @@ fun items_in(menu: i32) i32 {
     if (menu == MENU_SKILL)   { ret 5; }
     if (menu == MENU_OPTIONS) { ret 5; }
     if (menu == MENU_SOUND)   { ret 4; }
+    if (menu == MENU_LOAD || menu == MENU_SAVE) { ret 6; }
     ret 1;
 }
 
@@ -379,6 +451,7 @@ fun parent_of(f: *Front, menu: i32) i32 {
     if (menu == MENU_CODE || menu == MENU_LIST)                             { ret MENU_COOP; }
     if (menu == MENU_SOUND)                                                 { ret MENU_OPTIONS; }
     if (menu == MENU_READ2)                                                 { ret MENU_READ1; }
+    if (menu == MENU_LOAD || menu == MENU_SAVE)                                  { ret MENU_MAIN; }
     ret -1;
 }
 
@@ -415,6 +488,54 @@ fun slide(f: *Front, item: i32, right: bool) {
     }
 }
 
+# read what each save slot is called, for the menus that show them
+fun open_slots(f: *Front, s: *game.Session, menu: i32) {
+    var i: i32 = 0;
+    for (i < save.SLOTS) {
+        if (!save.peek(s.a, i, ?f.savenames[i][0])) { f.savenames[i][0] = 0; }
+        i = i + 1;
+    }
+    f.itemon[menu] = 0;
+    f.menu         = menu;
+}
+
+# what a save is called when the menu cannot take typing: the map and how
+# long it has been played, "E1M3 12:34"
+fun save_name(f: *Front, s: *game.Session, out: *u8) {
+    val g: *defs.Game = ?s.g;
+    var k: i32 = 0;
+    out[k] = 'E';                        k = k + 1;
+    out[k] = ('0' + g.gameepisode)::u8;  k = k + 1;
+    out[k] = 'M';                        k = k + 1;
+    out[k] = ('0' + g.gamemap)::u8;      k = k + 1;
+    out[k] = ' ';                        k = k + 1;
+    val t: i32 = g.leveltime / 35;
+    var m: i32 = t / 60;
+    if (m > 99) { m = 99; }
+    out[k] = ('0' + m / 10)::u8;         k = k + 1;
+    out[k] = ('0' + m % 10)::u8;         k = k + 1;
+    out[k] = ':';                        k = k + 1;
+    out[k] = ('0' + (t % 60) / 10)::u8;  k = k + 1;
+    out[k] = ('0' + t % 10)::u8;         k = k + 1;
+    out[k] = 0;
+}
+
+# a saved game is the game in progress: back to its view and its song,
+# whatever was on screen before
+pub fun loaded(f: *Front, s: *game.Session) {
+    announce.reset(?f.ann);
+    f.watching   = 0;
+    f.scores     = 0;
+    f.spy        = -1;
+    f.netgame    = 0;
+    f.menuactive = 0;
+    f.message    = nil;
+    f.ask        = ASK_NONE;
+    f.am.on      = 0;
+    f.mode       = MODE_LEVEL;
+    level_song(f, s);
+}
+
 # what choosing a line of a menu does
 fun choose(f: *Front, s: *game.Session) {
     val item: i32 = f.itemon[f.menu];
@@ -440,8 +561,16 @@ fun choose(f: *Front, s: *game.Session) {
         or (item == 2) {
             f.menu = MENU_OPTIONS;
         }
-        or (item == 3 || item == 4) {
-            start_message(f, "saving and loading games is not\nbuilt in this port yet.\n\npress a key.", 0, ASK_NONE);
+        or (item == 3) {
+            open_slots(f, s, MENU_LOAD);
+        }
+        or (item == 4) {
+            if (f.mode != MODE_LEVEL || s.g.netgame || s.g.deathmatch != 0) {
+                start_message(f, "you can't save a game here.\n\npress a key.", 0, ASK_NONE);
+            }
+            or {
+                open_slots(f, s, MENU_SAVE);
+            }
         }
         or (item == 5) {
             f.menu = MENU_READ1;
@@ -565,6 +694,25 @@ fun choose(f: *Front, s: *game.Session) {
     or (f.menu == MENU_READ2) {
         f.menuactive = 0;
     }
+    or (f.menu == MENU_LOAD) {
+        if (save.read_game(s, s.a, item)) {
+            loaded(f, s);
+        }
+        or {
+            sfx(s, info.SFX_OOF);
+        }
+    }
+    or (f.menu == MENU_SAVE) {
+        var name: [25]u8;
+        save_name(f, s, ?name[0]);
+        if (save.write_game(s, item, ?name[0])) {
+            f.menuactive = 0;
+            s.g.players[s.g.consoleplayer].message = "Game saved.";
+        }
+        or {
+            sfx(s, info.SFX_OOF);
+        }
+    }
 }
 
 # a skill was chosen: a game alone, or, for a host, a co-op game for the
@@ -657,6 +805,8 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
             open_menu(f, s);
             ret;
         }
+        # the automap takes its own keys while the level is up
+        if (f.mode == MODE_LEVEL && am.keypress(?s.g, ?f.am, key)) { ret; }
         # in a network game every machine must leave the intermission on the
         # same tic, so only the commands every machine plays may hurry it
         # (fire or use, in net_ticker), never a key on one machine
@@ -873,6 +1023,31 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         draw_thermo(d, screen, x, y + LINEHEIGHT, 16, f.sfxvolume);
         video.draw_patch(screen, x, y + LINEHEIGHT * 2, video.patch(d, "M_MUSVOL"));
         draw_thermo(d, screen, x, y + LINEHEIGHT * 3, 16, f.musicvolume);
+    }
+    or (f.menu == MENU_LOAD || f.menu == MENU_SAVE) {
+        if (f.menu == MENU_LOAD) {
+            video.draw_patch(screen, 72, 28, video.patch(d, "M_LGTTL"));
+        }
+        or {
+            video.draw_patch(screen, 72, 28, video.patch(d, "M_SGTTL"));
+        }
+        x = 72;
+        y = 54;
+        var n: i32 = 0;
+        for (n < save.SLOTS) {
+            val sy: i32 = y + n * 16;
+            video.draw_patch(screen, x, sy, video.patch(d, "M_LSLEFT"));
+            var w: i32 = 0;
+            for (w < 24) {
+                video.draw_patch(screen, x + 8 + w * 8, sy, video.patch(d, "M_LSCNTR"));
+                w = w + 1;
+            }
+            video.draw_patch(screen, x + 8 + 24 * 8, sy, video.patch(d, "M_LSRGHT"));
+            if (f.savenames[n][0] != 0) {
+                video.write_text(d, screen, x + 10, sy + 5, ?f.savenames[n][0], -1);
+            }
+            n = n + 1;
+        }
     }
 
     # the skull blinks beside the chosen line
@@ -1351,6 +1526,7 @@ pub fun ticker(f: *Front, s: *game.Session, bar: *st.State, input: *game.Input) 
     }
 
     if (!f.showmessages) { bar.msgtics = 0; }
+    melt_tic(f);
 }
 
 # start a co-op game that every machine starts the same way
@@ -1512,6 +1688,7 @@ pub fun net_ticker(f: *Front, s: *game.Session, bar: *st.State, cmds: *defs.Ticc
     }
 
     if (!f.showmessages) { bar.msgtics = 0; }
+    melt_tic(f);
 }
 
 # show a message, such as the network's state, until replaced or cleared
@@ -1526,12 +1703,30 @@ pub fun notice(f: *Front, text: str) {
 pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
     val screen: *u8 = ?r.screen[0];
 
+    # a melt just begun still has the old screen: keep it before it is
+    # drawn over (a mode changed without a tic starts the melt here)
+    if (f.mode != f.meltmode) { melt_begin(f); }
+    if (f.melting == 1) {
+        var i: i32 = 0;
+        for (i < 64000) {
+            meltfrom[i] = screen[i];
+            i           = i + 1;
+        }
+        f.melting = 2;
+    }
+
     if (f.mode == MODE_DEMO || f.mode == MODE_LEVEL) {
         val player: *defs.Player = ?s.g.players[s.g.consoleplayer];
         if (player.mo != nil) {
             r.lv = s.g.lv;
-            render.render_player_view(r, ?s.g, player);
-            if (f.mode == MODE_LEVEL) { draw_inset(f, s, screen); }
+            if (f.mode == MODE_LEVEL && f.am.on) {
+                # the map where the view would be; the bar stays over it
+                am.draw(?s.g, s.d, ?f.am, screen);
+            }
+            or {
+                render.render_player_view(r, ?s.g, player);
+                if (f.mode == MODE_LEVEL) { draw_inset(f, s, screen); }
+            }
             st.draw(?s.g, bar, screen);
         }
     }
@@ -1543,6 +1738,22 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
     }
     or (f.mode == MODE_FINALE) {
         finale_draw(f, s, screen);
+    }
+
+    # where a melting column has not come down to, the frame it melts from
+    # hangs below, its top rows drawn again under the new screen's edge
+    if (f.melting == 2) {
+        var x: i32 = 0;
+        for (x < render.SCREENWIDTH) {
+            var y: i32 = melty[x];
+            if (y < 0) { y = 0; }
+            var j: i32 = 0;
+            for (y + j < render.SCREENHEIGHT) {
+                screen[(y + j) * render.SCREENWIDTH + x] = meltfrom[j * render.SCREENWIDTH + x];
+                j                                        = j + 1;
+            }
+            x = x + 1;
+        }
     }
 
     # the announcer's line, over the view and under everything else

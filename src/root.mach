@@ -35,6 +35,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 
+use doom.am;
 use doom.announce;
 use doom.bot;
 use doom.defs;
@@ -50,6 +51,7 @@ use doom.relaycore;
 use doom.relayproto;
 use doom.rdata;
 use doom.render;
+use doom.save;
 use doom.sound;
 use doom.st;
 use doom.tables;
@@ -500,6 +502,7 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     win.fine_timer(1);
 
     var bar:     st.State;
+    st.init(?bar);
     var palette: i32 = -1;
     var weapon:  i32 = 0;
 
@@ -1329,6 +1332,7 @@ fun mus(argv: **u8) i64 {
 # a key named on the command line: a letter or digit stands for itself
 fun key_named(name: str) i32 {
     if (str_equals(name, "enter")) { ret front.KEY_ENTER; }
+    if (str_equals(name, "tab"))   { ret am.KEY_TAB; }
     if (str_equals(name, "esc"))   { ret front.KEY_ESCAPE; }
     if (str_equals(name, "back"))  { ret front.KEY_BACKSPACE; }
     if (str_equals(name, "up"))    { ret front.KEY_UP; }
@@ -1375,6 +1379,7 @@ fun script(argc: i64, argv: **u8) i64 {
     var f:   front.Front;
     var bar: st.State;
     front.init(?f);
+    st.init(?bar);
     val second: res[*render.Renderer, render.RenderError] = render.make(?a, ?d, ?first);
     if (sel second.ok) { f.inset = second.ok; }
     # a scripted walk is of a player who has answered, unless it says "unasked"
@@ -1410,6 +1415,33 @@ fun script(argc: i64, argv: **u8) i64 {
             input.fire = 1;
             front.ticker(?f, s, ?bar, ?input);
         }
+        or (step[0] == 'f' && step[1] == 'i' && step[2] == 'r' && step[3] == 'e' && step[4] == ':') {
+            # fire:<n>: hold fire for n tics — long enough and the face sets
+            var n: i64 = number(?step[5], 1);
+            input.fire = 1;
+            for (n > 0) {
+                front.ticker(?f, s, ?bar, ?input);
+                n = n - 1;
+            }
+        }
+        or (step[0] == 'h' && step[1] == 'u' && step[2] == 'r' && step[3] == 't' && step[4] == ':') {
+            # hurt:<damage>: the console player is wounded, by no one
+            val pl: *defs.Player = ?s.g.players[s.g.consoleplayer];
+            if (pl.mo != nil) { world.damage_mobj(?s.g, pl.mo, nil, nil, number(?step[5], 0)::i32); }
+        }
+        or (step[0] == 'h' && step[1] == 'e' && step[2] == 'a' && step[3] == 'l' && step[4] == ':') {
+            # heal:<n>: wounded and suddenly whole again, the face opens up
+            s.g.players[s.g.consoleplayer].health = s.g.players[s.g.consoleplayer].health + number(?step[5], 0)::i32;
+        }
+        or (str_equals(step, "god")) {
+            s.g.players[s.g.consoleplayer].cheats = s.g.players[s.g.consoleplayer].cheats ^ defs.CF_GODMODE;
+        }
+        or (step[0] == 'g' && step[1] == 'i' && step[2] == 'v' && step[3] == 'e' && step[4] == ':') {
+            # give:<slot>: a weapon arrives; a pickup flash makes the face grin
+            val pl: *defs.Player = ?s.g.players[s.g.consoleplayer];
+            pl.weaponowned[number(?step[5], 2)::i32] = 1;
+            pl.bonuscount                          = defs.TICRATE;
+        }
         or (step[0] == 'm' && step[1] == 'a' && step[2] == 'p' && step[3] == ':') {
             front.start_game(?f, s, defs.SK_MEDIUM, number(?step[4], 1)::i32);
         }
@@ -1436,6 +1468,25 @@ fun script(argc: i64, argv: **u8) i64 {
         }
         or (step[0] == 's' && step[1] == 'a' && step[2] == 'y' && step[3] == ':') {
             front.announce_now(?f, number(?step[4], 0)::i32, 0);
+        }
+        or (step[0] == 's' && step[1] == 'a' && step[2] == 'v' && step[3] == 'e' && step[4] == ':') {
+            # save:<n>: the game so far goes to doomsav<n>.sav
+            if (!save.write_game(s, number(?step[5], 0)::i32, "scripted")) {
+                print.println("save refused");
+            }
+        }
+        or (step[0] == 'l' && step[1] == 'o' && step[2] == 'a' && step[3] == 'd' && step[4] == ':') {
+            # load:<n>: doomsav<n>.sav becomes the game in progress
+            if (save.read_game(s, ?a, number(?step[5], 0)::i32)) {
+                front.loaded(?f, s);
+            }
+            or {
+                print.println("load refused");
+            }
+        }
+        or (str_equals(step, "sum")) {
+            # the lockstep checksum: a resumed game must hash as the run it left
+            print.printlnf("sum {} {}", s.g.gametic, game.checksum(s));
         }
         or (step[0] == 'k' && step[1] == 'e' && step[2] == 'y' && step[3] == ':') {
             front.responder(?f, s, key_named(?step[4]));
@@ -2017,6 +2068,28 @@ fun navcheck(argc: i64, argv: **u8) i64 {
         print.printlnf("walk: {} (cells walked to; negative if the place was not among them)", r);
         ret EXIT_OK;
     }
+    if (argc == 5 && str_equals(argv[4], "gap")) {
+        ret navgap(g, mo, marks.ok, ?a);
+    }
+    if (argc == 9 && str_equals(argv[4], "walk")) {
+        # navcheck <wad> <map> walk x1 y1 x2 y2: try the walk both ways
+        val x1: i32 = number(argv[5], 0)::i32 << 16;
+        val y1: i32 = number(argv[6], 0)::i32 << 16;
+        val x2: i32 = number(argv[7], 0)::i32 << 16;
+        val y2: i32 = number(argv[8], 0)::i32 << 16;
+        bot.grid_flood(g, mo.x, mo.y, marks.ok, 0);
+        var st:  bool = 0;
+        var stl: i32  = -1;
+        val e1:  i32  = bot.probe_walk(g, x1, y1, x2, y2, ?st, ?stl);
+        print.printlnf("walk {},{} -> {},{}", x1 >> 16, y1 >> 16, x2 >> 16, y2 >> 16);
+        gap_why(g, e1, e1 < 0);
+        gap_why(g, stl, st);
+        val e2:  i32  = bot.probe_walk(g, x2, y2, x1, y1, ?st, ?stl);
+        print.printlnf("walk {},{} -> {},{}", x2 >> 16, y2 >> 16, x1 >> 16, y1 >> 16);
+        gap_why(g, e2, e2 < 0);
+        gap_why(g, stl, st);
+        ret EXIT_OK;
+    }
     val reached: i32 = bot.grid_flood(g, mo.x, mo.y, marks.ok, 0);
     print.printlnf("grid {} by {}, {} cells walked to from the start, locks {}", g.navw, g.navh, reached, g.navlocks);
     if (g.navexitline < 0) {
@@ -2052,6 +2125,127 @@ fun navcheck(argc: i64, argv: **u8) i64 {
         i = i + 1;
     }
     print.printlnf("{} of {} secrets reached (the map has {})", found, g.navsecrets, g.totalsecret);
+    ret EXIT_OK;
+}
+
+# one line of the gap report: the line that stops a walk, with its flags and
+# the floors and ceilings either side, or "goes" when nothing stops it
+fun gap_why(g: *defs.Game, line: i32, goes: bool) {
+    if (goes) { print.println("      goes"); ret; }
+    if (line < 0) { print.println("      stops, no line recorded"); ret; }
+    val ln: *level.Line = ?g.lv.lines[line];
+    val f:  i32 = ln.frontsector;
+    val b:  i32 = ln.backsector;
+    if (b < 0) {
+        print.printlnf("      line {} flags {} special {} tag {} one-sided to sector {} floor {} ceiling {}", line, ln.flags, ln.special, ln.tagnum, f, g.lv.sectors[f].floorheight >> 16, g.lv.sectors[f].ceilingheight >> 16);
+        ret;
+    }
+    print.printlnf("      line {} flags {} special {} tag {} sectors {} {} floors {} {} ceilings {} {}", line, ln.flags, ln.special, ln.tagnum, f, b, g.lv.sectors[f].floorheight >> 16, g.lv.sectors[b].floorheight >> 16, g.lv.sectors[f].ceilingheight >> 16, g.lv.sectors[b].ceilingheight >> 16);
+}
+
+#   doom navcheck <wad> <map> gap: where the flood from the start and the
+#   flood that can reach the exit come a cell apart without a walk between
+fun navgap(g: *defs.Game, mo: *defs.Mobj, marks: *u8, a: *allocator.Allocator) i64 {
+    if (g.navexitline < 0) { print.println("exit: none"); ret EXIT_OK; }
+    val backs: res[*u8, allocator.Error] = allocator.zallocate[u8](a, 65536);
+    if (sel backs.err) { ret EXIT_DATA; }
+    val reached:  i32 = bot.grid_flood(g, mo.x, mo.y, marks, 0);
+    val returned: i32 = bot.grid_flood(g, g.navax, g.navay, backs.ok, 1);
+    print.printlnf("grid {} by {}, {} cells walked to from the start, {} can walk to the exit", g.navw, g.navh, reached, returned);
+    val cells: i32 = g.navw * g.navh;
+    var gaps:  i32 = 0;
+    var c:     i32 = 0;
+    for (c < cells) {
+        if (marks[c] == 0) { c = c + 1; cnt; }
+        val cx: i32 = c % g.navw;
+        var k:  i32 = 0;
+        for (k < 4) {
+            var n: i32 = -1;
+            if (k == 0 && cx + 1 < g.navw)    { n = c + 1; }
+            if (k == 1 && cx > 0)              { n = c - 1; }
+            if (k == 2 && c + g.navw < cells) { n = c + g.navw; }
+            if (k == 3 && c >= g.navw)        { n = c - g.navw; }
+            k = k + 1;
+            if (n < 0 || backs.ok[n] == 0 || marks[n] != 0) { cnt; }
+            # c is reached from the start, n reaches the exit, and neither can
+            # be walked to from the other: both ways tried, both reported
+            gaps = gaps + 1;
+            val x1: i32 = bot.cell_x(g, c % g.navw);
+            val y1: i32 = bot.cell_y(g, c / g.navw);
+            val x2: i32 = bot.cell_x(g, n % g.navw);
+            val y2: i32 = bot.cell_y(g, n / g.navw);
+            print.printlnf("  cells {} -> {} at {},{} to {},{}", c, n, x1 >> 16, y1 >> 16, x2 >> 16, y2 >> 16);
+            var st:  bool = 0;
+            var stl: i32  = -1;
+            val e1:  i32  = bot.probe_walk(g, x1, y1, x2, y2, ?st, ?stl);
+            gap_why(g, e1, e1 < 0);
+            gap_why(g, stl, st);
+            val e2:  i32  = bot.probe_walk(g, x2, y2, x1, y1, ?st, ?stl);
+            gap_why(g, e2, e2 < 0);
+            gap_why(g, stl, st);
+        }
+        c = c + 1;
+    }
+    # every sealed edge of the exit flood: a cell in it whose walk out was
+    # never built, with the line that stops it — once per line
+    var cell:   i32 = 0;
+    var nlines: i32 = 0;
+    var listed: [64]i32;
+    for (cell < cells) {
+        if (backs.ok[cell] == 0) { cell = cell + 1; cnt; }
+        val bx: i32 = cell % g.navw;
+        var k:   i32 = 0;
+        for (k < 4) {
+            var n:    i32 = -1;
+            var way:  i32 = 0;
+            if (k == 0) { n = cell + 1;      way = 1; }
+            if (k == 1) { n = cell - 1;      way = 4; }
+            if (k == 2) { n = cell + g.navw; way = 2; }
+            if (k == 3) { n = cell - g.navw; way = 8; }
+            k = k + 1;
+            if (n < 0 || n >= cells || (g.navgrid[cell]::i32 & way) != 0 || backs.ok[n] != 0) { cnt; }
+            val x1: i32 = bot.cell_x(g, cell % g.navw);
+            val y1: i32 = bot.cell_y(g, cell / g.navw);
+            val x2: i32 = bot.cell_x(g, n % g.navw);
+            val y2: i32 = bot.cell_y(g, n / g.navw);
+            var st:  bool = 0;
+            var stl: i32  = -1;
+            val e:   i32  = bot.probe_walk(g, x1, y1, x2, y2, ?st, ?stl);
+            if (e < 0) { cnt; }
+            var dup: i32 = 0;
+            var j:   i32 = 0;
+            for (j < nlines) {
+                if (listed[j] == e) { dup = 1; }
+                j = j + 1;
+            }
+            if (dup == 0 && nlines < 64) {
+                listed[nlines] = e;
+                nlines         = nlines + 1;
+                print.printlnf("  sealed edge out of cell {} at {},{} stopped by", cell, x1 >> 16, y1 >> 16);
+                gap_why(g, e, 0);
+                if (st) { print.println("      strict goes"); }
+                or { gap_why(g, stl, 0); }
+            }
+        }
+        cell = cell + 1;
+    }
+    print.printlnf("{} sealed edge kinds", nlines);
+    var x0: i32 = 0x7fffffff;
+    var y0: i32 = 0x7fffffff;
+    var x1: i32 = 0 - 0x7fffffff;
+    var y1: i32 = 0 - 0x7fffffff;
+    c = 0;
+    for (c < cells) {
+        if (backs.ok[c] == 0) { c = c + 1; cnt; }
+        val wx: i32 = bot.cell_x(g, c % g.navw) >> 16;
+        val wy: i32 = bot.cell_y(g, c / g.navw) >> 16;
+        if (wx < x0) { x0 = wx; }
+        if (wx > x1) { x1 = wx; }
+        if (wy < y0) { y0 = wy; }
+        if (wy > y1) { y1 = wy; }
+        c = c + 1;
+    }
+    print.printlnf("exit flood bounds x {}..{} y {}..{}", x0, x1, y0, y1);
     ret EXIT_OK;
 }
 
@@ -2770,6 +2964,7 @@ fun netplay(argc: i64, argv: **u8) i64 {
     f.mode    = front.MODE_LEVEL;
     f.netgame = 1;
     var bar:     st.State;
+    st.init(?bar);
     var pressed: bool = 0;
 
     var gametic: i32 = 0;
@@ -3150,7 +3345,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc >= 5 && argc <= 7 && str_equals(argv[1], "botmatch"))          { ret botmatch(argc, argv); }
     if (argc >= 4 && str_equals(argv[1], "script"))                           { ret script(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "mus"))                              { ret mus(argv); }
-    if ((argc == 4 || argc == 11) && str_equals(argv[1], "navcheck"))         { ret navcheck(argc, argv); }
+    if ((argc == 4 || argc == 5 || argc == 9 || argc == 11) && str_equals(argv[1], "navcheck")) { ret navcheck(argc, argv); }
     if ((argc == 5 || argc == 6) && str_equals(argv[1], "coopmatch"))         { ret coopmatch(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "rooms"))                            { ret rooms(argv); }
     if ((argc == 4 || argc == 5) && str_equals(argv[1], "watch"))             { ret watch(argc, argv); }

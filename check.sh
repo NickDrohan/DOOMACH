@@ -189,13 +189,15 @@ gate "the synthesized music matches fixtures/opl.sha256" 0 opl_is_pinned
 # The front end: title, menus, the sound menu's sliders, an intermission
 # counting up and moving on, the end-of-episode text, and the quit prompt,
 # driven by a script of keys and tics with no window, in both profiles.
-frontwalk="5 key:a key:enter key:enter key:enter 30 shot key:esc 2 shot key:down key:down key:enter 2 shot
-    key:down key:down key:enter key:right key:right key:right 2 shot key:esc 70 exit 1 60 shot 500 shot
-    fire 20 shot 60 shot map:8 10 exit 1 100 shot 2000 shot
-    key:a key:down key:down key:down key:down key:down key:enter 2 shot
-    key:N key:up key:up key:up key:up key:up key:enter 2 shot
-    key:down key:down key:down key:enter 2 shot key:down key:down key:enter 2 shot
-    key:back key:down key:enter key:K key:Q key:7 2 shot"
+# Shots sit some seventy tics past whatever changed the screen, clear of the
+# melt that runs between one screen and the next.
+frontwalk="5 key:a key:enter key:enter key:enter 100 shot key:esc 70 shot key:down key:down key:enter 70 shot
+    key:down key:down key:enter key:right key:right key:right 70 shot key:esc 70 exit 1 130 shot 500 shot
+    fire 20 shot 60 shot map:8 10 exit 1 160 shot 2000 shot
+    key:a key:down key:down key:down key:down key:down key:enter 70 shot
+    key:N key:up key:up key:up key:up key:up key:enter 70 shot
+    key:down key:down key:down key:enter 70 shot key:down key:down key:enter 70 shot
+    key:back key:down key:enter key:K key:Q key:7 70 shot"
 mkdir -p "$work/front-debug" "$work/front-release"
 # shellcheck disable=SC2086
 gate "the scripted front-end walk runs (debug)" 0 "$debug" script "$wad" "$work/front-debug/s" $frontwalk
@@ -220,6 +222,79 @@ gate "the announcer's ten screens match the committed hashes" 0 say_is_pinned "$
 gate "release draws the same ten" 0 say_is_pinned "$work/say-release"
 ten_differ() { [[ "$(cut -d' ' -f1 "$here/fixtures/announce.sha256" | sort -u | wc -l)" -eq 10 ]]; }
 gate "and every line has a screen of its own" 0 ten_differ
+
+# The melt: the title screen melts down into the level when a game starts,
+# a column at a time — pinned twice mid-melt and once it is done.
+meltwalk="0 shot map:1 12 shot 12 shot 60 shot"
+mkdir -p "$work/melt-debug" "$work/melt-release"
+# shellcheck disable=SC2086
+"$debug" script "$wad" "$work/melt-debug/m" $meltwalk >/dev/null 2>&1
+# shellcheck disable=SC2086
+"$release" script "$wad" "$work/melt-release/m" $meltwalk >/dev/null 2>&1
+melt_is_pinned() { (cd "$1" && sha256sum -c --status "$here/fixtures/melt.sha256"); }
+gate "the screens melt as pinned, debug" 0 melt_is_pinned "$work/melt-debug"
+gate "and in release" 0 melt_is_pinned "$work/melt-release"
+melt_moves() { [[ "$(cut -d' ' -f1 "$here/fixtures/melt.sha256" | sort -u | wc -l)" -eq 4 ]]; }
+gate "and no two melt frames are alike" 0 melt_moves
+
+# The marine's face. Six pinned screens of a scripted game: looking about,
+# the set jaw of a wound taken, the open mouth of a twenty-point turn, the
+# grin of a weapon just picked up, the god-mode eyes and the dead face.
+facewalk="map:1 70 shot hurt:6 10 shot 40 hurt:10 heal:40 5 shot
+    60 give:3 5 shot 80 god 5 shot god hurt:200 5 shot"
+mkdir -p "$work/face-debug" "$work/face-release"
+# shellcheck disable=SC2086
+"$debug" script "$wad" "$work/face-debug/f" $facewalk >/dev/null 2>&1
+# shellcheck disable=SC2086
+"$release" script "$wad" "$work/face-release/f" $facewalk >/dev/null 2>&1
+face_is_pinned() { (cd "$1" && sha256sum -c --status "$here/fixtures/face.sha256"); }
+gate "the marine's six faces match the committed hashes" 0 face_is_pinned "$work/face-debug"
+gate "and in release" 0 face_is_pinned "$work/face-release"
+
+# The automap: the level from above — the walls seen so far, the grid, the
+# whole level zoomed out, 'iddt' revealing every wall and a second time the
+# things, a numbered mark, and the same again on another map.
+amwalk="map:1 70 shot key:tab shot key:G shot key:0 shot key:i key:d key:d key:t shot
+    key:i key:d key:d key:t shot key:i key:d key:d key:t shot key:tab
+    map:2 70 shot key:tab key:0 key:i key:d key:d key:t key:m shot"
+mkdir -p "$work/am-debug" "$work/am-release"
+# shellcheck disable=SC2086
+"$debug" script "$wad" "$work/am-debug/a" $amwalk >/dev/null 2>&1
+# shellcheck disable=SC2086
+"$release" script "$wad" "$work/am-release/a" $amwalk >/dev/null 2>&1
+am_is_pinned() { (cd "$1" && sha256sum -c --status "$here/fixtures/automap.sha256"); }
+gate "the automap's nine screens match the committed hashes" 0 am_is_pinned "$work/am-debug"
+gate "release draws the same nine" 0 am_is_pinned "$work/am-release"
+
+# Saved games. A game written to a slot mid-run and read back must go on as
+# if it had never stopped: the same lockstep sums at the same tics and a
+# byte-identical screen, whichever build wrote the file and whichever reads
+# it. And the menu's load game reaches the same place as the script verb.
+(cd "$work" && "$debug" script "$wad" "$work/sg-a" map:3 1500 sum save:0 1000 sum shot) >"$work/sg-a.out" 2>&1
+(cd "$work" && "$debug" script "$wad" "$work/sg-b" map:3 1500 sum load:0 1000 sum shot) >"$work/sg-b.out" 2>&1
+(cd "$work" && "$release" script "$wad" "$work/sg-c" map:3 1500 sum load:0 1000 sum) >"$work/sg-c.out" 2>&1
+(cd "$work" && "$debug" script "$wad" "$work/sg-m" 5 key:esc key:down key:down key:down key:enter key:enter sum) >"$work/sg-m.out" 2>&1
+grep '^sum' "$work/sg-a.out" >"$work/sg-a.sums"
+grep '^sum' "$work/sg-b.out" >"$work/sg-b.sums"
+grep '^sum' "$work/sg-c.out" >"$work/sg-c.sums"
+same "a saved and loaded game goes on as if it had never stopped (debug)" "$work/sg-a.sums" "$work/sg-b.sums"
+same "release reads the debug build's save identically" "$work/sg-b.sums" "$work/sg-c.sums"
+same "the screen after a load is the screen of the run it left" "$work/sg-a00.ppm" "$work/sg-b00.ppm"
+menu_loaded() { grep -qF "$(head -1 "$work/sg-a.sums")" "$work/sg-m.out"; }
+gate "a game loads through the title menu too" 0 menu_loaded
+
+# A file that is no save — gone, cut short, or rewritten — is refused whole
+# and without a crash, and the game it found goes on untouched.
+head -c 3000 "$work/doomsav0.sav" >"$work/doomsav4.sav"
+"$python" -c "
+import sys
+d = bytearray(open(sys.argv[1],'rb').read())
+d[30000] ^= 255
+open(sys.argv[2],'wb').write(d)" "$work/doomsav0.sav" "$work/doomsav5.sav"
+(cd "$work" && "$debug" script "$wad" "$work/sg-x" map:1 100 load:3 50 load:4 50 load:5 50 sum) >"$work/sg-x.out" 2>&1
+refused_ok() { [ "$(grep -c 'load refused' "$work/sg-x.out")" -eq 3 ] && grep -q '^sum' "$work/sg-x.out"; }
+gate "a missing, cut or rewritten save is refused whole" 0 refused_ok
+
 
 # Co-op. Two games in one process fed the same bot players' commands must
 # agree every tic, with a forced death and respawn at tic 100; debug and
@@ -548,6 +623,22 @@ gate "bots in co-op hold their fire when a friend is in the way" 0 few_friendly_
 "$release" coopmatch "$wad" 3 16800 calm >"$work/coopslime.out" 2>/dev/null
 few_slime_deaths() { awk '/^bot/ { d += $6 } END { exit !(d < 40) }' "$work/coopslime.out"; }
 gate "and keep out of the slime" 0 few_slime_deaths
+gate "and get out of it, the rising stairs letting them into the exit room" 0 grep -q "finished 1" "$work/coopslime.out"
+
+# The walk grid the bots navigate by. Its flood from the player start must
+# reach every exit: on E1M3 it once did not, because a stair trigger's tag
+# names only the first step of the flight it builds — the grid trusted the
+# tagged step and sealed the rest, leaving the exit room cut off and the
+# bots circling below it forever. On E1M8 there is no exit line: the level
+# ends on a floor that hurts to death, reached by the star's teleporter once
+# the bruisers are dead — the grid finds it by the ending floor's tag.
+exits_reach() {
+    local m
+    for m in 1 2 3 4 5 6 7 8 9; do
+        "$debug" navcheck "$wad" "$m" 2>/dev/null | grep -q "^exit:.*reached 1" || return 1
+    done
+}
+gate "the bots' walk grid reaches every map's exit" 0 exits_reach
 
 # With a person in the game a bot leaves them what lies about. E1M3 begins
 # in a room with a clip, shells and a stimpack on the floor; a person who

@@ -1,0 +1,1078 @@
+# saving a game to a file and loading it back
+#
+# A reduced p_saveg.c, for the game played alone: saving during a network
+# game is refused, and loading one leaves the network game behind. A file
+# holds the whole mutable world — the game's numbers and its place in the
+# random table, the players, every sector's heights and light, every side's
+# textures and scroll, the buttons still ticking, and every thinker: the
+# monsters, missiles and items, and the doors, floors, ceilings, platforms
+# and lights that move. Pointers into the level's memory are written as
+# numbers and become pointers again on load; a file holds no address.
+#
+# Loading starts the saved map over, building its fixed parts, then empties
+# the thinker ring and the sector and blockmap lists the spawn filled, and
+# reads what was saved in place of all of it. A game saved and loaded goes
+# on from the same tic as if it had never stopped.
+
+use std.allocator;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use doom.defs;
+use doom.fixed.Fixed;
+use doom.game;
+use doom.info;
+use doom.level;
+use doom.maputl;
+use doom.movers;
+use doom.rdata;
+use doom.world;
+
+val MAGIC:   u32 = 0x56415344;   # "DSAV"
+val VERSION: i32 = 1;
+pub val SLOTS:   i32 = 6;
+val NAMESIZE: usize = 24;
+
+# the six files beside the program, one a slot
+pub fun filename(slot: i32, out: *u8) {
+    var name: [13]u8 = [13]u8{'d', 'o', 'o', 'm', 's', 'a', 'v', '0', '.', 's', 'a', 'v', 0};
+    name[7] = ('0' + slot)::u8;
+    var k: i32 = 0;
+    for (k < 13) {
+        out[k] = name[k];
+        k      = k + 1;
+    }
+}
+
+# -------------------------------------------------------------- the bytes
+
+# one file's worth of bytes, assembled whole and written in one call, or
+# read whole and picked over; bad goes up when a read or write runs off
+# its end, and everything after is skipped
+var store: [1048576]u8;
+var src:   *u8;
+var at:    usize;
+var lim:   usize;
+var bad:   bool = 0;
+
+fun put8(v: i32) {
+    if (at + 1 > 1048576) { bad = 1; ret; }
+    store[at] = v::u8;
+    at        = at + 1;
+}
+
+fun put32(v: i32) {
+    put8(v & 0xff);
+    put8((v >> 8) & 0xff);
+    put8((v >> 16) & 0xff);
+    put8((v >> 24) & 0xff);
+}
+
+fun put_bool(v: bool) {
+    if (v) { put32(1); }
+    or     { put32(0); }
+}
+
+fun put_rec(p: *u8, n: usize) {
+    if (at + n > 1048576) { bad = 1; ret; }
+    var i: usize = 0;
+    for (i < n) {
+        store[at + i] = p[i];
+        i             = i + 1;
+    }
+    at = at + n;
+}
+
+fun put_name(p: *u8, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        put8(p[i]::i32);
+        i = i + 1;
+    }
+}
+
+fun get8() i32 {
+    if (at + 1 > lim) { bad = 1; ret 0; }
+    val v: i32 = src[at]::i32;
+    at         = at + 1;
+    ret v;
+}
+
+fun get32() i32 {
+    if (at + 4 > lim) { bad = 1; ret 0; }
+    val v: i32 = (src[at]::i32) | (src[at + 1]::i32 << 8) | (src[at + 2]::i32 << 16) | (src[at + 3]::i32 << 24);
+    at         = at + 4;
+    ret v;
+}
+
+fun get_rec(p: *u8, n: usize) {
+    if (at + n > lim) { bad = 1; ret; }
+    var i: usize = 0;
+    for (i < n) {
+        p[i] = src[at + i];
+        i    = i + 1;
+    }
+    at = at + n;
+}
+
+fun get_name(p: *u8, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        p[i] = get8()::u8;
+        i    = i + 1;
+    }
+}
+
+# ------------------------------------------------- pointers become numbers
+
+# the map objects in the thinker ring, in file order; a pointer to one is
+# written as its place here, and on load loaded[i] is what i means
+var mobjs:   [4096]*defs.Mobj;
+var nmobjs:  i32;
+var loaded:  [4096]*defs.Mobj;
+var nloaded: i32;
+
+# on load, the numbers a saved mobj's pointers carried, until the pass that
+# puts them back as pointers; wantmo and wantat are each player's body and
+# attacker, wantbody the corpses in the deathmatch queue
+var wanttarget: [4096]i32;
+var wanttracer: [4096]i32;
+var wantplayer: [4096]i32;
+var wantmo:     [4]i32;
+var wantat:     [4]i32;
+var wantbody:   [32]i32;
+
+fun collect_mobjs(g: *defs.Game) {
+    nmobjs = 0;
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            if (nmobjs < 4096) {
+                mobjs[nmobjs] = th:~*defs.Mobj;
+            }
+            nmobjs = nmobjs + 1;
+        }
+        th = th.next;
+    }
+}
+
+fun number_of(mo: *defs.Mobj) i32 {
+    if (mo == nil) { ret -1; }
+    var i: i32 = 0;
+    for (i < nmobjs && i < 4096) {
+        if (mobjs[i] == mo) { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# ------------------------------------------------------------ writing it
+
+fun put_mobj_links(g: *defs.Game, mo: *defs.Mobj) {
+    put32(number_of(mo.target));
+    put32(number_of(mo.tracer));
+    var who: i32 = -1;
+    var i:   i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (mo.player == ?g.players[i]) { who = i; }
+        i = i + 1;
+    }
+    put32(who);
+}
+
+# a map thing as it sits in a thing array or a corpse's spawn point
+fun put_thing(t: *level.Thing) {
+    put32(t.x::i32);
+    put32(t.y::i32);
+    put32(t.angle::i32);
+    put32(t.kind::i32);
+    put32(t.options::i32);
+}
+
+fun get_thing(t: *level.Thing) {
+    t.x       = get32()::i16;
+    t.y       = get32()::i16;
+    t.angle   = get32()::i16;
+    t.kind    = get32()::i16;
+    t.options = get32()::i16;
+}
+
+# a map object, its list links and pointers excepted: on load the links are
+# built again from x and y and the pointers from the numbers that follow
+fun put_mobj(g: *defs.Game, mo: *defs.Mobj) {
+    put32(mo.x::i32);
+    put32(mo.y::i32);
+    put32(mo.z::i32);
+    put32(mo.angle:~i32);
+    put32(mo.sprite);
+    put32(mo.frame);
+    put32(mo.floorz::i32);
+    put32(mo.ceilingz::i32);
+    put32(mo.radius::i32);
+    put32(mo.height::i32);
+    put32(mo.momx::i32);
+    put32(mo.momy::i32);
+    put32(mo.momz::i32);
+    put32(mo.kind);
+    put32(mo.tics);
+    put32(mo.state);
+    put32(mo.flags);
+    put32(mo.health);
+    put32(mo.movedir);
+    put32(mo.movecount);
+    put32(mo.reactiontime);
+    put32(mo.threshold);
+    put32(mo.lastlook);
+    put_thing(?mo.spawnpoint);
+    put_mobj_links(g, mo);
+}
+
+fun get_mobj(g: *defs.Game, mo: *defs.Mobj) {
+    mo.x            = get32()::Fixed;
+    mo.y            = get32()::Fixed;
+    mo.z            = get32()::Fixed;
+    mo.angle        = get32():~u32;
+    mo.sprite       = get32();
+    mo.frame        = get32();
+    mo.floorz       = get32()::Fixed;
+    mo.ceilingz     = get32()::Fixed;
+    mo.radius       = get32()::Fixed;
+    mo.height       = get32()::Fixed;
+    mo.momx         = get32()::Fixed;
+    mo.momy         = get32()::Fixed;
+    mo.momz         = get32()::Fixed;
+    mo.kind         = get32();
+    mo.tics         = get32();
+    mo.state        = get32();
+    mo.flags        = get32();
+    mo.health       = get32();
+    mo.movedir      = get32();
+    mo.movecount    = get32();
+    mo.reactiontime = get32();
+    mo.threshold    = get32();
+    mo.lastlook     = get32();
+    get_thing(?mo.spawnpoint);
+    wanttarget[nloaded] = get32();
+    wanttracer[nloaded] = get32();
+    wantplayer[nloaded] = get32();
+    mo.snext      = nil;
+    mo.sprev      = nil;
+    mo.bnext      = nil;
+    mo.bprev      = nil;
+    mo.validcount = 0;
+    mo.target     = nil;
+    mo.tracer     = nil;
+    mo.player     = nil;
+}
+
+# a player: the tic command, the view, the inventory, the tallies, and the
+# weapon sprites; the body and attacker go as numbers after the record
+fun put_player(g: *defs.Game, p: *defs.Player) {
+    put32(p.playerstate);
+    put32(p.cmd.forwardmove::i32);
+    put32(p.cmd.sidemove::i32);
+    put32(p.cmd.angleturn::i32);
+    put32(p.cmd.consistancy::i32);
+    put32(p.cmd.chatchar::i32);
+    put32(p.cmd.buttons::i32);
+    put32(p.viewz::i32);
+    put32(p.viewheight::i32);
+    put32(p.deltaviewheight::i32);
+    put32(p.bob::i32);
+    put32(p.health);
+    put32(p.armorpoints);
+    put32(p.armortype);
+    var i: i32 = 0;
+    for (i < 6) { put32(p.powers[i]); i = i + 1; }
+    i = 0;
+    for (i < 6) { put_bool(p.cards[i]); i = i + 1; }
+    put_bool(p.backpack);
+    put32(p.readyweapon);
+    put32(p.pendingweapon);
+    i = 0;
+    for (i < 9) { put_bool(p.weaponowned[i]); i = i + 1; }
+    i = 0;
+    for (i < 4) { put32(p.ammo[i]); put32(p.maxammo[i]); i = i + 1; }
+    put32(p.attackdown);
+    put32(p.usedown);
+    put32(p.cheats);
+    put32(p.refire);
+    put32(p.killcount);
+    put32(p.itemcount);
+    put32(p.secretcount);
+    i = 0;
+    for (i < 4) { put32(p.frags[i]); i = i + 1; }
+    put32(p.damagecount);
+    put32(p.bonuscount);
+    put32(p.extralight);
+    put32(p.fixedcolormap);
+    put32(p.colormap);
+    i = 0;
+    for (i < 2) {
+        put32(p.psprites[i].state);
+        put32(p.psprites[i].tics);
+        put32(p.psprites[i].sx::i32);
+        put32(p.psprites[i].sy::i32);
+        i = i + 1;
+    }
+    put_bool(p.didsecret);
+    put32(number_of(p.mo));
+    put32(number_of(p.attacker));
+}
+
+fun get_player(g: *defs.Game, p: *defs.Player) {
+    p.playerstate      = get32();
+    p.cmd.forwardmove  = get32()::i8;
+    p.cmd.sidemove     = get32()::i8;
+    p.cmd.angleturn    = get32()::i16;
+    p.cmd.consistancy  = get32()::i16;
+    p.cmd.chatchar     = get32()::u8;
+    p.cmd.buttons      = get32()::u8;
+    p.viewz            = get32()::Fixed;
+    p.viewheight       = get32()::Fixed;
+    p.deltaviewheight  = get32()::Fixed;
+    p.bob              = get32()::Fixed;
+    p.health           = get32();
+    p.armorpoints      = get32();
+    p.armortype        = get32();
+    var i: i32 = 0;
+    for (i < 6) { p.powers[i] = get32(); i = i + 1; }
+    i = 0;
+    for (i < 6) { p.cards[i] = get32() != 0; i = i + 1; }
+    p.backpack      = get32() != 0;
+    p.readyweapon   = get32();
+    p.pendingweapon = get32();
+    i = 0;
+    for (i < 9) { p.weaponowned[i] = get32() != 0; i = i + 1; }
+    i = 0;
+    for (i < 4) { p.ammo[i] = get32(); p.maxammo[i] = get32(); i = i + 1; }
+    p.attackdown  = get32();
+    p.usedown     = get32();
+    p.cheats      = get32();
+    p.refire      = get32();
+    p.killcount   = get32();
+    p.itemcount   = get32();
+    p.secretcount = get32();
+    i = 0;
+    for (i < 4) { p.frags[i] = get32(); i = i + 1; }
+    p.damagecount   = get32();
+    p.bonuscount    = get32();
+    p.extralight    = get32();
+    p.fixedcolormap = get32();
+    p.colormap      = get32();
+    i = 0;
+    for (i < 2) {
+        p.psprites[i].state = get32();
+        p.psprites[i].tics  = get32();
+        p.psprites[i].sx    = get32()::Fixed;
+        p.psprites[i].sy    = get32()::Fixed;
+        i = i + 1;
+    }
+    p.didsecret = get32() != 0;
+}
+
+# a moving sector part or blinking light; the thinker links are rebuilt by
+# the ring, the sector's specialdata pointer by the record's own number
+fun put_door(r: *movers.Door) {
+    put32(r.kind);
+    put32(r.sector);
+    put32(r.topheight::i32);
+    put32(r.speed::i32);
+    put32(r.direction);
+    put32(r.topwait);
+    put32(r.topcountdown);
+}
+
+fun get_door(r: *movers.Door) {
+    r.kind         = get32();
+    r.sector       = get32();
+    r.topheight    = get32()::Fixed;
+    r.speed        = get32()::Fixed;
+    r.direction    = get32();
+    r.topwait      = get32();
+    r.topcountdown = get32();
+}
+
+fun put_floormove(r: *movers.FloorMove) {
+    put32(r.kind);
+    put_bool(r.crush);
+    put32(r.sector);
+    put32(r.direction);
+    put32(r.newspecial);
+    put32(r.texture);
+    put32(r.floordestheight::i32);
+    put32(r.speed::i32);
+}
+
+fun get_floormove(r: *movers.FloorMove) {
+    r.kind            = get32();
+    r.crush           = get32() != 0;
+    r.sector          = get32();
+    r.direction       = get32();
+    r.newspecial      = get32();
+    r.texture         = get32();
+    r.floordestheight = get32()::Fixed;
+    r.speed           = get32()::Fixed;
+}
+
+fun put_ceiling(r: *movers.Ceiling) {
+    put32(r.kind);
+    put32(r.sector);
+    put32(r.bottomheight::i32);
+    put32(r.topheight::i32);
+    put32(r.speed::i32);
+    put_bool(r.crush);
+    put32(r.direction);
+    put32(r.tagnum);
+    put32(r.olddirection);
+}
+
+fun get_ceiling(r: *movers.Ceiling) {
+    r.kind         = get32();
+    r.sector       = get32();
+    r.bottomheight = get32()::Fixed;
+    r.topheight    = get32()::Fixed;
+    r.speed        = get32()::Fixed;
+    r.crush        = get32() != 0;
+    r.direction    = get32();
+    r.tagnum       = get32();
+    r.olddirection = get32();
+}
+
+fun put_plat(r: *movers.Plat) {
+    put32(r.sector);
+    put32(r.speed::i32);
+    put32(r.low::i32);
+    put32(r.high::i32);
+    put32(r.wait);
+    put32(r.count);
+    put32(r.status);
+    put32(r.oldstatus);
+    put_bool(r.crush);
+    put32(r.tagnum);
+    put32(r.kind);
+}
+
+fun get_plat(r: *movers.Plat) {
+    r.sector    = get32();
+    r.speed     = get32()::Fixed;
+    r.low       = get32()::Fixed;
+    r.high      = get32()::Fixed;
+    r.wait      = get32();
+    r.count     = get32();
+    r.status    = get32();
+    r.oldstatus = get32();
+    r.crush     = get32() != 0;
+    r.tagnum    = get32();
+    r.kind      = get32();
+}
+
+fun put_fireflicker(r: *movers.FireFlicker) {
+    put32(r.sector);
+    put32(r.count);
+    put32(r.maxlight);
+    put32(r.minlight);
+}
+
+fun get_fireflicker(r: *movers.FireFlicker) {
+    r.sector   = get32();
+    r.count    = get32();
+    r.maxlight = get32();
+    r.minlight = get32();
+}
+
+fun put_lightflash(r: *movers.LightFlash) {
+    put32(r.sector);
+    put32(r.count);
+    put32(r.maxlight);
+    put32(r.minlight);
+    put32(r.maxtime);
+    put32(r.mintime);
+}
+
+fun get_lightflash(r: *movers.LightFlash) {
+    r.sector   = get32();
+    r.count    = get32();
+    r.maxlight = get32();
+    r.minlight = get32();
+    r.maxtime  = get32();
+    r.mintime  = get32();
+}
+
+fun put_strobe(r: *movers.Strobe) {
+    put32(r.sector);
+    put32(r.count);
+    put32(r.minlight);
+    put32(r.maxlight);
+    put32(r.darktime);
+    put32(r.brighttime);
+}
+
+fun get_strobe(r: *movers.Strobe) {
+    r.sector     = get32();
+    r.count      = get32();
+    r.minlight   = get32();
+    r.maxlight   = get32();
+    r.darktime   = get32();
+    r.brighttime = get32();
+}
+
+fun put_glow(r: *movers.Glow) {
+    put32(r.sector);
+    put32(r.minlight);
+    put32(r.maxlight);
+    put32(r.direction);
+}
+
+fun get_glow(r: *movers.Glow) {
+    r.sector    = get32();
+    r.minlight  = get32();
+    r.maxlight  = get32();
+    r.direction = get32();
+}
+
+fun put_thinkers(g: *defs.Game) {
+    var count: i32 = 0;
+    var th:    *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind != defs.TH_REMOVED) { count = count + 1; }
+        th = th.next;
+    }
+    put32(count);
+
+    th = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_REMOVED) { th = th.next; cnt; }
+        put32(th.kind::i32);
+        if (th.kind == defs.TH_MOBJ) {
+            put_mobj(g, th:~*defs.Mobj);
+        }
+        or (th.kind == defs.TH_DOOR)        { put_door(th:~*movers.Door); }
+        or (th.kind == defs.TH_FLOOR)       { put_floormove(th:~*movers.FloorMove); }
+        or (th.kind == defs.TH_CEILING)     { put_ceiling(th:~*movers.Ceiling); }
+        or (th.kind == defs.TH_PLAT)        { put_plat(th:~*movers.Plat); }
+        or (th.kind == defs.TH_FIREFLICKER) { put_fireflicker(th:~*movers.FireFlicker); }
+        or (th.kind == defs.TH_LIGHTFLASH)  { put_lightflash(th:~*movers.LightFlash); }
+        or (th.kind == defs.TH_STROBE)      { put_strobe(th:~*movers.Strobe); }
+        or (th.kind == defs.TH_GLOW)        { put_glow(th:~*movers.Glow); }
+        or { bad = 1; }
+        th = th.next;
+    }
+}
+
+fun put_world(g: *defs.Game) {
+    put32(g.lv.numsectors);
+    var i: i32 = 0;
+    for (i < g.lv.numsectors) {
+        val sec: *level.Sector = ?g.lv.sectors[i];
+        put32(sec.floorheight::i32);
+        put32(sec.ceilingheight::i32);
+        put32(sec.lightlevel::i32);
+        put32(sec.special::i32);
+        put32(sec.floorflat);
+        put32(sec.ceilingflat);
+        put_name(?sec.floorpic[0], 9);
+        put_name(?sec.ceilingpic[0], 9);
+        i = i + 1;
+    }
+
+    put32(g.lv.numlines);
+    i = 0;
+    for (i < g.lv.numlines) {
+        val line: *level.Line = ?g.lv.lines[i];
+        put32(line.flags::i32);
+        put32(line.special::i32);
+        var k: i32 = 0;
+        for (k < 2) {
+            val side: i32 = line.sidenum[k];
+            if (side < 0) {
+                put8(0);
+            }
+            or {
+                val sd: *level.Side = ?g.lv.sides[side];
+                put8(1);
+                put32(sd.textureoffset::i32);
+                put32(sd.rowoffset::i32);
+                put_name(?sd.toptexture[0], 9);
+                put_name(?sd.midtexture[0], 9);
+                put_name(?sd.bottomtexture[0], 9);
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun put_game(g: *defs.Game) {
+    put32(g.gametic);
+    put32(g.leveltime);
+    put32(g.deathmatch);
+    put32(g.consoleplayer);
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        put_bool(g.playeringame[i]);
+        put_bool(g.isbot[i]);
+        i = i + 1;
+    }
+    put32(g.rnd.play::i32);
+    put32(g.rnd.misc::i32);
+    put32(g.totalkills);
+    put32(g.totalitems);
+    put32(g.totalsecret);
+    put32(g.iquehead);
+    put32(g.iquetail);
+    put32(g.bodyqueslot);
+
+    i = 0;
+    for (i < 128) {
+        put_thing(?g.itemrespawnque[i]);
+        put32(g.itemrespawntime[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 32) {
+        put32(number_of(g.bodyque[i]));
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        put_player(g, ?g.players[i]);
+        i = i + 1;
+    }
+}
+
+fun put_buttons(g: *defs.Game) {
+    var i: i32 = 0;
+    for (i < 16) {
+        put32(g.buttonlist[i].line);
+        put32(g.buttonlist[i].where);
+        put32(g.buttonlist[i].btexture);
+        put32(g.buttonlist[i].btimer);
+        put32(g.buttonlist[i].soundorg);
+        i = i + 1;
+    }
+}
+
+# a 32-bit mix of the whole file up to here: any corruption anywhere in a
+# save changes it, so a file that fails to mix to itself is refused whole
+fun mix(p: *u8, n: usize) u32 {
+    var h:   u32   = 5381;
+    var i:   usize = 0;
+    for (i < n) {
+        h = h * 33 + p[i]::u32;
+        i = i + 1;
+    }
+    ret h;
+}
+
+# serialize the game into the file for a slot
+# ---
+# s:    the session, mid-level and not a network game
+# slot: 0 to SLOTS - 1
+# name: what the load menu shows, at most NAMESIZE - 1 letters
+# ret:  whether the file was written
+pub fun write_game(s: *game.Session, slot: i32, name: str) bool {
+    val g: *defs.Game = ?s.g;
+    if (g.netgame || g.deathmatch != 0) { ret 0; }
+
+    at  = 0;
+    bad = 0;
+    collect_mobjs(g);
+    if (nmobjs > 4096) { ret 0; }
+
+    put32(MAGIC::i32);
+    put32(VERSION);
+    var k: usize = 0;
+    for (k < NAMESIZE - 1 && name[k] != 0) {
+        put8(name[k]::i32);
+        k = k + 1;
+    }
+    for (k < NAMESIZE) {
+        put8(0);
+        k = k + 1;
+    }
+    put32(g.gameskill);
+    put32(g.gameepisode);
+    put32(g.gamemap);
+    put_game(g);
+    put_world(g);
+    put_thinkers(g);
+    put_buttons(g);
+    put32(mix(?store[0], at)::i32);
+    put32(0x5ac6);
+    if (bad) { ret 0; }
+
+    var path: [13]u8;
+    filename(slot, ?path[0]);
+    val wrote: err[fs.FsError] = fs.write_bytes(?path[0], ?store[0], at, 0o644);
+    ret !(sel wrote.err);
+}
+
+# the name a slot's file carries, for the menus; false when there is none
+pub fun peek(a: *allocator.Allocator, slot: i32, out: *u8) bool {
+    var path: [13]u8;
+    filename(slot, ?path[0]);
+    val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    if (sel bytes.err)                    { ret 0; }
+    if (bytes.ok.len < 4 + 4 + NAMESIZE)  { ret 0; }
+    val p: *u8 = bytes.ok.data;
+    if ((p[0]::u32 | (p[1]::u32 << 8) | (p[2]::u32 << 16) | (p[3]::u32 << 24)) != MAGIC) { ret 0; }
+    var k: usize = 0;
+    for (k < NAMESIZE - 1) {
+        out[k] = p[8 + k];
+        k      = k + 1;
+    }
+    out[NAMESIZE - 1] = 0;
+    ret 1;
+}
+
+# ------------------------------------------------------------ reading it
+
+# everything a fresh load spawned goes: the thinker ring is emptied, and
+# every sector's thing list and every blockmap cell's with it; the arena
+# memory itself is freed the next time the level changes
+fun clear_things(g: *defs.Game) {
+    world.init_thinkers(g);
+    var i: i32 = 0;
+    for (i < g.lv.numsectors) {
+        g.lv.sectors[i].thinglist = nil;
+        i                         = i + 1;
+    }
+    val cells: i32 = g.lv.bmapwidth * g.lv.bmapheight;
+    i = 0;
+    for (i < cells) {
+        g.blocklinks[i] = nil;
+        i               = i + 1;
+    }
+}
+
+fun get_thinkers(g: *defs.Game) {
+    nloaded = 0;
+    val count: i32 = get32();
+    var i:     i32 = 0;
+    for (i < count && !bad) {
+        val kind: i32 = get32();
+        if (kind == defs.TH_MOBJ::i32 && nloaded < 4096) {
+            val mo: *defs.Mobj = defs.alloc(g, $size_of(defs.Mobj)):~*defs.Mobj;
+            if (mo == nil) { bad = 1; ret; }
+            get_mobj(g, mo);
+            loaded[nloaded]     = mo;
+            nloaded             = nloaded + 1;
+            mo.thinker.kind     = defs.TH_MOBJ;
+            world.add_thinker(g, ?mo.thinker);
+            maputl.set_thing_position(g, mo);
+        }
+        or {
+            var th: *defs.Thinker = nil;
+            if (kind == defs.TH_DOOR::i32) {
+                val r: *movers.Door = defs.alloc(g, $size_of(movers.Door)):~*movers.Door;
+                if (r == nil) { bad = 1; ret; }
+                get_door(r);
+                if (r.sector >= 0 && r.sector < g.lv.numsectors) { g.lv.sectors[r.sector].specialdata = r:~ptr; }
+                th = ?r.thinker;
+            }
+            or (kind == defs.TH_FLOOR::i32) {
+                val r: *movers.FloorMove = defs.alloc(g, $size_of(movers.FloorMove)):~*movers.FloorMove;
+                if (r == nil) { bad = 1; ret; }
+                get_floormove(r);
+                if (r.sector >= 0 && r.sector < g.lv.numsectors) { g.lv.sectors[r.sector].specialdata = r:~ptr; }
+                th = ?r.thinker;
+            }
+            or (kind == defs.TH_CEILING::i32) {
+                val r: *movers.Ceiling = defs.alloc(g, $size_of(movers.Ceiling)):~*movers.Ceiling;
+                if (r == nil) { bad = 1; ret; }
+                get_ceiling(r);
+                if (r.sector >= 0 && r.sector < g.lv.numsectors) { g.lv.sectors[r.sector].specialdata = r:~ptr; }
+                var k: i32 = 0;
+                for (k < 30) {
+                    if (g.activeceilings[k] == nil) { g.activeceilings[k] = r:~ptr; brk; }
+                    k = k + 1;
+                }
+                th = ?r.thinker;
+            }
+            or (kind == defs.TH_PLAT::i32) {
+                val r: *movers.Plat = defs.alloc(g, $size_of(movers.Plat)):~*movers.Plat;
+                if (r == nil) { bad = 1; ret; }
+                get_plat(r);
+                if (r.sector >= 0 && r.sector < g.lv.numsectors) { g.lv.sectors[r.sector].specialdata = r:~ptr; }
+                var k: i32 = 0;
+                for (k < 30) {
+                    if (g.activeplats[k] == nil) { g.activeplats[k] = r:~ptr; brk; }
+                    k = k + 1;
+                }
+                th = ?r.thinker;
+            }
+            or (kind == defs.TH_FIREFLICKER::i32) {
+                val r: *movers.FireFlicker = defs.alloc(g, $size_of(movers.FireFlicker)):~*movers.FireFlicker;
+                if (r == nil) { bad = 1; ret; }
+                get_fireflicker(r);
+                th = ?r.thinker;
+            }
+            or (kind == defs.TH_LIGHTFLASH::i32) {
+                val r: *movers.LightFlash = defs.alloc(g, $size_of(movers.LightFlash)):~*movers.LightFlash;
+                if (r == nil) { bad = 1; ret; }
+                get_lightflash(r);
+                th = ?r.thinker;
+            }
+            or (kind == defs.TH_STROBE::i32) {
+                val r: *movers.Strobe = defs.alloc(g, $size_of(movers.Strobe)):~*movers.Strobe;
+                if (r == nil) { bad = 1; ret; }
+                get_strobe(r);
+                th = ?r.thinker;
+            }
+            or (kind == defs.TH_GLOW::i32) {
+                val r: *movers.Glow = defs.alloc(g, $size_of(movers.Glow)):~*movers.Glow;
+                if (r == nil) { bad = 1; ret; }
+                get_glow(r);
+                th = ?r.thinker;
+            }
+            or { bad = 1; ret; }
+            if (th == nil) { bad = 1; ret; }
+            th.kind = kind::u8;
+            world.add_thinker(g, th);
+        }
+        i = i + 1;
+    }
+}
+
+# put the numbers back as pointers: every mobj's target and tracer, which
+# player a body was, and the players' own bodies and attackers
+fun link_thinkers(g: *defs.Game) {
+    var i: i32 = 0;
+    for (i < nloaded) {
+        val mo: *defs.Mobj = loaded[i];
+        mo.target = nil;
+        if (wanttarget[i] >= 0 && wanttarget[i] < nloaded) { mo.target = loaded[wanttarget[i]]; }
+        mo.tracer = nil;
+        if (wanttracer[i] >= 0 && wanttracer[i] < nloaded) { mo.tracer = loaded[wanttracer[i]]; }
+        mo.player = nil;
+        if (wantplayer[i] >= 0 && wantplayer[i] < defs.MAXPLAYERS) { mo.player = ?g.players[wantplayer[i]]; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (wantmo[i] >= 0 && wantmo[i] < nloaded) { g.players[i].mo = loaded[wantmo[i]]; }
+        if (wantat[i] >= 0 && wantat[i] < nloaded) { g.players[i].attacker = loaded[wantat[i]]; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 32) {
+        if (wantbody[i] >= 0 && wantbody[i] < nloaded) { g.bodyque[i] = loaded[wantbody[i]]; }
+        i = i + 1;
+    }
+}
+
+fun get_world(g: *defs.Game) {
+    if (get32() != g.lv.numsectors) { bad = 1; ret; }
+    var i: i32 = 0;
+    for (i < g.lv.numsectors && !bad) {
+        val sec: *level.Sector = ?g.lv.sectors[i];
+        sec.floorheight   = get32()::Fixed;
+        sec.ceilingheight = get32()::Fixed;
+        sec.lightlevel    = get32()::i16;
+        sec.special       = get32()::i16;
+        sec.floorflat     = get32();
+        sec.ceilingflat   = get32();
+        get_name(?sec.floorpic[0], 9);
+        get_name(?sec.ceilingpic[0], 9);
+        sec.floorpic[8]   = 0;
+        sec.ceilingpic[8] = 0;
+        i = i + 1;
+    }
+
+    if (get32() != g.lv.numlines) { bad = 1; ret; }
+    i = 0;
+    for (i < g.lv.numlines && !bad) {
+        val line: *level.Line = ?g.lv.lines[i];
+        line.flags   = get32()::i16;
+        line.special = get32()::i16;
+        var k: i32 = 0;
+        for (k < 2) {
+            val have: i32 = get8();
+            val side: i32 = line.sidenum[k];
+            if (have == 0) {
+                if (side >= 0) { bad = 1; ret; }
+            }
+            or {
+                if (side < 0 || side >= g.lv.numsides) { bad = 1; ret; }
+                val sd: *level.Side = ?g.lv.sides[side];
+                sd.textureoffset = get32()::Fixed;
+                sd.rowoffset     = get32()::Fixed;
+                get_name(?sd.toptexture[0], 9);
+                get_name(?sd.midtexture[0], 9);
+                get_name(?sd.bottomtexture[0], 9);
+                sd.toptexture[8]    = 0;
+                sd.midtexture[8]    = 0;
+                sd.bottomtexture[8] = 0;
+                sd.toptex    = rdata.texture_num(g.d, ?sd.toptexture[0]);
+                sd.midtex    = rdata.texture_num(g.d, ?sd.midtexture[0]);
+                sd.bottomtex = rdata.texture_num(g.d, ?sd.bottomtexture[0]);
+                if (sd.toptex < 0)    { sd.toptex = 0; }
+                if (sd.midtex < 0)    { sd.midtex = 0; }
+                if (sd.bottomtex < 0) { sd.bottomtex = 0; }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun get_game(g: *defs.Game) {
+    g.gametic       = get32();
+    g.leveltime     = get32();
+    g.deathmatch    = get32();
+    g.consoleplayer = get32();
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        g.playeringame[i] = get32() != 0;
+        g.isbot[i]        = get32() != 0;
+        i                 = i + 1;
+    }
+    g.rnd.play    = get32()::u8;
+    g.rnd.misc    = get32()::u8;
+    g.totalkills  = get32();
+    g.totalitems  = get32();
+    g.totalsecret = get32();
+    g.iquehead    = get32();
+    g.iquetail    = get32();
+    g.bodyqueslot = get32();
+
+    i = 0;
+    for (i < 128) {
+        get_thing(?g.itemrespawnque[i]);
+        g.itemrespawntime[i] = get32();
+        i                    = i + 1;
+    }
+    i = 0;
+    for (i < 32) {
+        wantbody[i]    = get32();
+        g.bodyque[i]   = nil;
+        i              = i + 1;
+    }
+
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        val p: *defs.Player = ?g.players[i];
+        get_player(g, p);
+        wantmo[i]  = get32();
+        wantat[i]  = get32();
+        p.mo       = nil;
+        p.attacker = nil;
+        p.message  = nil;
+        i          = i + 1;
+    }
+}
+
+fun get_buttons(g: *defs.Game) {
+    var i: i32 = 0;
+    for (i < 16) {
+        g.buttonlist[i].line     = get32();
+        g.buttonlist[i].where    = get32();
+        g.buttonlist[i].btexture = get32();
+        g.buttonlist[i].btimer   = get32();
+        g.buttonlist[i].soundorg = get32();
+        i = i + 1;
+    }
+}
+
+# the numbers a save gives the simulation as indexes into its tables must be
+# in range, or the file is not a save of this game
+fun sane(g: *defs.Game) bool {
+    if (g.consoleplayer < 0 || g.consoleplayer >= defs.MAXPLAYERS)                  { ret 0; }
+    if (g.iquehead < 0 || g.iquehead >= 128 || g.iquetail < 0 || g.iquetail >= 128) { ret 0; }
+    if (g.bodyqueslot < 0 || g.bodyqueslot >= 32)                                  { ret 0; }
+    if (g.gametic < 0 || g.leveltime < 0)                                          { ret 0; }
+
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        val p: *defs.Player = ?g.players[i];
+        if (p.readyweapon < 0 || p.readyweapon >= defs.NUMWEAPONS)                          { ret 0; }
+        if (p.pendingweapon != defs.WP_NOCHANGE && (p.pendingweapon < 0 || p.pendingweapon >= defs.NUMWEAPONS)) { ret 0; }
+        if (p.psprites[0].state < 0 || p.psprites[0].state >= info.NUMSTATES)                        { ret 0; }
+        if (p.psprites[1].state < 0 || p.psprites[1].state >= info.NUMSTATES)                        { ret 0; }
+        if (g.playeringame[i] && p.playerstate == defs.PST_LIVE && p.mo == nil)              { ret 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < nloaded) {
+        val mo: *defs.Mobj = loaded[i];
+        if (mo.kind < 0 || mo.kind >= info.NUMMOBJTYPES) { ret 0; }
+        if (mo.state < 0 || mo.state >= info.NUMSTATES)  { ret 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < g.lv.numsectors) {
+        if (g.lv.sectors[i].floorflat < 0 || g.lv.sectors[i].floorflat >= g.d.numflats)     { ret 0; }
+        if (g.lv.sectors[i].ceilingflat < 0 || g.lv.sectors[i].ceilingflat >= g.d.numflats) { ret 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 16) {
+        if (g.buttonlist[i].btimer != 0 && (g.buttonlist[i].line < 0 || g.buttonlist[i].line >= g.lv.numlines)) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# put a slot's file back as the game in progress
+# ---
+# s:    the session
+# a:    owns the file's bytes while it is read
+# slot: 0 to SLOTS - 1
+# ret:  whether the file held a whole saved game
+pub fun read_game(s: *game.Session, a: *allocator.Allocator, slot: i32) bool {
+    var path: [13]u8;
+    filename(slot, ?path[0]);
+    val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    if (sel bytes.err) { ret 0; }
+
+    src = bytes.ok.data;
+    lim = bytes.ok.len;
+    at  = 0;
+    bad = 0;
+
+    # a save is refused whole or not at all: too short for a header, or
+    # without the trailer a written file always ends in, is no save — and
+    # nothing of the running game has been touched yet
+    if (lim < 64) { ret 0; }
+    if ((src[lim - 4]::u32 | (src[lim - 3]::u32 << 8) | (src[lim - 2]::u32 << 16) | (src[lim - 1]::u32 << 24)) != 0x5ac6) { ret 0; }
+    val want: u32 = src[lim - 8]::u32 | (src[lim - 7]::u32 << 8) | (src[lim - 6]::u32 << 16) | (src[lim - 5]::u32 << 24);
+    if (mix(src, lim - 8) != want) { ret 0; }
+    if (get32():~u32 != MAGIC || get32() != VERSION) { ret 0; }
+    var name: [NAMESIZE]u8;
+    get_name(?name[0], NAMESIZE);
+    val skill:   i32 = get32();
+    val episode: i32 = get32();
+    val map:     i32 = get32();
+    if (bad) { ret 0; }
+
+    # the saved map loaded over builds its fixed parts; everything that was
+    # saved then replaces the spawn
+    if (!game.load_game(s, skill, episode, map)) { ret 0; }
+    val g: *defs.Game = ?s.g;
+    clear_things(g);
+    get_game(g);
+    get_world(g);
+    get_thinkers(g);
+    get_buttons(g);
+    # the payload mix, already verified against the file above
+    get32();
+    if (bad || get32() != 0x5ac6) {
+        # the game is already replaced; leave a whole fresh level, not a
+        # half-read one
+        game.init_new(s, skill, episode, map);
+        ret 0;
+    }
+    link_thinkers(g);
+    if (!sane(g)) {
+        game.init_new(s, skill, episode, map);
+        ret 0;
+    }
+    ret 1;
+}
