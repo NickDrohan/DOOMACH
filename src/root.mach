@@ -669,13 +669,13 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
             }
         }
         or (joining < 0) {
-            var ja: i32 = append(?joinmsg[0], 0, "catching up with the co-op bots");
+            var ja: i32 = append(?joinmsg[0], 0, "catching up with the co-op bots...");
             if (join.target > 0) {
-                ja = append(?joinmsg[0], ja, ", ");
+                ja = append(?joinmsg[0], ja, "\n");
                 ja = append_number(?joinmsg[0], ja, (join.tic * 100 / join.target)::i64);
                 ja = append(?joinmsg[0], ja, "% of the way there");
             }
-            append(?joinmsg[0], ja, "...\n\n(escape gives up)");
+            append(?joinmsg[0], ja, "\n\n(escape gives up)");
             front.notice(?f, ?joinmsg[0]);
             val caught: i32 = join_slice(s, ?join, 50000);
             if (caught > 0) {
