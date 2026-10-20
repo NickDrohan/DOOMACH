@@ -513,8 +513,12 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     var lobby:      net.Lobby;
     # an update asked for: a moment for the screen to say so, then done
     var updating:   i32 = 0;
-    # joining the co-op league where it is: a frame or two to say so first
-    var joining:    i32 = 0;
+    # joining the co-op league where it is: a frame or two to say so first,
+    # then the joining a slice of tics a frame — a level deep in takes a
+    # while to catch up with, and the window must stay its own the while
+    var joining:   i32 = 0;
+    var join:      LeagueJoin;
+    var joinnames: [96]u8;
     tidy_update();
     # watching the bot league: a match being fetched, or one being played
     # again, and how long it runs
@@ -529,15 +533,15 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
         # keys that act once when pressed: the menus, and the weapon keys
         val key:     i32  = win.take_key();
         val stopped: bool = n != nil && (!netstarted || stalled || n.desync || n.quit);
-        if (fetching && key == front.KEY_ESCAPE) {
-            # give up on the league
-            net.watch_close(fetch);
-            fetching = 0;
+        if ((fetching || joining < 0) && key == front.KEY_ESCAPE) {
+            # give up on the league, being fetched or being joined
+            if (fetching)   { net.watch_close(fetch); fetching = 0; }
+            if (joining < 0) { join_abort(s, ?join); joining = 0; }
             front.to_title(?f);
             f.message = nil;
             cnt;
         }
-        if (key != 0 && !stopped && !fetching) {
+        if (key != 0 && !stopped && !fetching && joining >= 0) {
             val playing: bool = f.mode == front.MODE_LEVEL && !f.menuactive && f.message == nil;
             if (playing && f.watching && key >= '1' && key <= '4') {
                 # whose eyes to watch through
@@ -644,16 +648,16 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
         if (joining > 0) {
             joining = joining - 1;
             if (joining == 0) {
-                var names:  [96]u8;
-                val joined: i32 = join_league(?a, s, ?names[0]);
-                if (joined > 0) {
-                    front.start_watching(?f, s, ?names[0]);
+                val began: i32 = join_league_begin(?a, s, ?joinnames[0], ?join);
+                if (began > 0) {
+                    joining = -1;
+                    front.notice(?f, "catching up with the co-op bots,\nhowever far in they are...\n\n(escape gives up)");
                 }
-                or (joined == ANOTHER_SIMULATION) {
+                or (began == ANOTHER_SIMULATION) {
                     front.to_title(?f);
                     front.notice(?f, "the co-op bots are playing another\nversion of the game. options,\nupdate the game; if this is the\nnewest, the league will catch up\nwithin the hour.\n\n(press a key)");
                 }
-                or (joined == UNREACHED) {
+                or (began == UNREACHED) {
                     front.to_title(?f);
                     front.notice(?f, "the league could not be reached.\nis this computer online?\n\n(press a key)");
                 }
@@ -661,6 +665,18 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                     front.to_title(?f);
                     front.notice(?f, "the co-op bots have no campaign\nunder way just now.\n\n(press a key)");
                 }
+            }
+        }
+        or (joining < 0) {
+            val caught: i32 = join_slice(s, ?join, 20000);
+            if (caught > 0) {
+                joining = 0;
+                front.start_watching(?f, s, ?joinnames[0]);
+            }
+            or (caught < 0) {
+                joining = 0;
+                front.to_title(?f);
+                front.notice(?f, "the co-op bots have no campaign\nunder way just now.\n\n(press a key)");
             }
         }
         if (fetching) {
@@ -3194,6 +3210,14 @@ fun fetch_league(a: *allocator.Allocator, name: str, into: *u8, room: i32) i32 {
 # names: the four bots' names, 24 bytes each
 # ret:   the level joined, or 0 if there is no campaign to join,
 #        UNREACHED, or ANOTHER_SIMULATION
+fun join_league_begin(a: *allocator.Allocator, s: *game.Session, names: *u8, j: *LeagueJoin) i32 {
+    var now:  [4956]u8;
+    var tick: [16]u8;
+    val got:  i32 = fetch_league(a, "coopnow.bin", ?now[0], NOW_BYTES);
+    if (got < 0) { ret UNREACHED; }
+    ret join_setup(s, ?now[0], got, ?tick[0], fetch_league(a, "coopnow.tic", ?tick[0], 16), 0, names, j);
+}
+
 fun join_league(a: *allocator.Allocator, s: *game.Session, names: *u8) i32 {
     var now:  [4956]u8;
     var tick: [16]u8;
@@ -3202,12 +3226,28 @@ fun join_league(a: *allocator.Allocator, s: *game.Session, names: *u8) i32 {
     ret join_campaign(s, ?now[0], got, ?tick[0], fetch_league(a, "coopnow.tic", ?tick[0], 16), 0, names);
 }
 
-# join a campaign from what the league published, as join_league does
+# a joining of the co-op league's campaign, spread over frames: the level
+# set up as the league began it, then a slice of it played each frame
+# until it is as far in as the league said. A level deep in takes a while
+# to catch up with, and the window must stay its own the while — one long
+# joining froze it, once, for minutes.
+rec LeagueJoin {
+    target: i32;
+    map:    i32;
+    tic:    i32;
+    hook:   defs.SoundHook;
+    cmds:   [4]defs.Ticcmd;
+}
+
+# set a join up from what the league published: the campaign begun or
+# resumed with the level's four bots, ready to be played in by join_slice
 # ---
 # now:  coopnow.bin, so many bytes of it
 # tick: coopnow.tic, so many bytes of it (or -1 for none: the level from its start)
 # view: whose eyes
-fun join_campaign(s: *game.Session, now: *u8, nowlen: i32, tick: *u8, ticklen: i32, view: i32, names: *u8) i32 {
+# ret:  the level joined, or 0 if there is no campaign to join,
+#       UNREACHED, or ANOTHER_SIMULATION
+fun join_setup(s: *game.Session, now: *u8, nowlen: i32, tick: *u8, ticklen: i32, view: i32, names: *u8, j: *LeagueJoin) i32 {
     if (nowlen != NOW_BYTES || now[0] != 'M' || now[1] != 'D' || now[2] != 'N' || now[3] != '1' || now[4] != relayproto.RECIPE) { ret 0; }
     if (get32(now, 16) != our_fingerprint(s)) { ret ANOTHER_SIMULATION; }
     val skill:    i32 = now[5]::i32;
@@ -3235,22 +3275,54 @@ fun join_campaign(s: *game.Session, now: *u8, nowlen: i32, tick: *u8, ticklen: i
     game.campaign_bots(s);
 
     # as far in as the league has got, if it says so of this level
-    var target: i32 = 0;
+    j.target = 0;
     if (ticklen == 16 && tick[0] == 'M' && tick[1] == 'D' && tick[2] == 'P' && tick[3] == '1' && get32(tick, 4) == campaign && get32(tick, 8):~i32 == map) {
-        target = get32(tick, 12):~i32;
+        j.target = get32(tick, 12):~i32;
     }
-    if (target > cap - 35) { target = cap - 35; }
-    val hook: defs.SoundHook = s.g.start_sound;
+    if (j.target > cap - 35) { j.target = cap - 35; }
+    j.map  = map;
+    j.tic  = 0;
+    j.hook = s.g.start_sound;
     s.g.start_sound = nil;
-    var cmds: [4]defs.Ticcmd;
-    var tic:  i32 = 0;
-    for (tic < target && !s.completed && !s.broken) {
-        game.ticker_cmds(s, ?cmds[0]);
-        tic = tic + 1;
-    }
-    s.g.start_sound = hook;
-    if (s.broken) { ret 0; }
     ret map;
+}
+
+# play a joining's level on a slice more, for usecs at most, toward the
+# tic the league last said it had reached; then the sound hook back
+# ---
+# ret: 0 while there is more to play, the level joined once it is caught
+#      up, or -1 if the level broke
+fun join_slice(s: *game.Session, j: *LeagueJoin, usecs: i64) i32 {
+    val until: i64 = win.micros_now() + usecs;
+    for (j.tic < j.target && !s.completed && !s.broken && win.micros_now() < until) {
+        game.ticker_cmds(s, ?j.cmds[0]);
+        j.tic = j.tic + 1;
+    }
+    if (j.tic < j.target && !s.completed && !s.broken) { ret 0; }
+    s.g.start_sound = j.hook;
+    if (s.broken) { ret -1; }
+    ret j.map;
+}
+
+# give a joining up: the sound hook back, the level left as it is
+fun join_abort(s: *game.Session, j: *LeagueJoin) {
+    s.g.start_sound = j.hook;
+}
+
+# join a campaign from what the league published, in one piece, as
+# join_league does
+# ---
+# now:  coopnow.bin, so many bytes of it
+# tick: coopnow.tic, so many bytes of it (or -1 for none: the level from its start)
+# view: whose eyes
+fun join_campaign(s: *game.Session, now: *u8, nowlen: i32, tick: *u8, ticklen: i32, view: i32, names: *u8) i32 {
+    var j: LeagueJoin;
+    val map: i32 = join_setup(s, now, nowlen, tick, ticklen, view, names, ?j);
+    if (map <= 0) { ret map; }
+    var done: i32 = 0;
+    for (done == 0) { done = join_slice(s, ?j, 100000); }
+    if (done < 0) { ret 0; }
+    ret done;
 }
 
 # Join the co-op league where it is, play the level it is on to the end,

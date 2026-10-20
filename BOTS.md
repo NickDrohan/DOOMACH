@@ -452,8 +452,10 @@ the random table afresh and starts every bot afresh with a seed of the level's
 writes `coopnow.tic`, how far into the level it has got, playing a level in slices so its pace
 is even; and as a level ends, `coopdone.bin`, how it ended. hedge serves all three from the
 volume. "Watch the co-op bots" fetches the first two, begins the level as the league began it
-(`game.campaign_resume`), plays through to where the league had got without a sound, and from
-there goes on at the speed of a game, level after level, the same campaign the league is
+(`game.campaign_resume`), plays through to where the league had got without a sound — a slice
+of tics a frame, so the window stays its own however deep into the level the league is (a
+level far in can take minutes to catch up with; escape gives up) — and from there goes on at
+the speed of a game, level after level, the same campaign the league is
 playing; when the campaign ends it joins the league again wherever it has got to. Unwatched,
 the league plays at its own pace, about four times the speed of a game. `doom joinleague
 <wad>` does the same with no window and checks the level ends as the league's did, and
