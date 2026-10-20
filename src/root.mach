@@ -519,6 +519,7 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     var joining:   i32 = 0;
     var join:      LeagueJoin;
     var joinnames: [96]u8;
+    var joinmsg:   [96]u8;
     tidy_update();
     # watching the bot league: a match being fetched, or one being played
     # again, and how long it runs
@@ -668,7 +669,15 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
             }
         }
         or (joining < 0) {
-            val caught: i32 = join_slice(s, ?join, 20000);
+            var ja: i32 = append(?joinmsg[0], 0, "catching up with the co-op bots");
+            if (join.target > 0) {
+                ja = append(?joinmsg[0], ja, ", ");
+                ja = append_number(?joinmsg[0], ja, (join.tic * 100 / join.target)::i64);
+                ja = append(?joinmsg[0], ja, "% of the way there");
+            }
+            append(?joinmsg[0], ja, "...\n\n(escape gives up)");
+            front.notice(?f, ?joinmsg[0]);
+            val caught: i32 = join_slice(s, ?join, 50000);
             if (caught > 0) {
                 joining = 0;
                 front.start_watching(?f, s, ?joinnames[0]);
