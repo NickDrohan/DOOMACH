@@ -3348,6 +3348,9 @@ fun resumecheck(argv: **u8) i64 {
     var sums:  [9]u32;
     var ends:  [9]i32;
     var carry: [9 * 1040]u8;
+    # and the net each bot began each level with — learning in a level is
+    # carried into the next, so a level begun there wants the net it had
+    var nets:  [9 * 4 * 942]i8;
     var cmds:  [4]defs.Ticcmd;
     if (!game.campaign_game(s, 4, 0, defs.SK_NIGHTMARE, cap)) { ret EXIT_MAP; }
     var i: i32 = 0;
@@ -3358,6 +3361,15 @@ fun resumecheck(argv: **u8) i64 {
     var n: i32 = 0;
     for (n < levels) {
         maps[n] = s.g.gamemap;
+        i = 0;
+        for (i < 4) {
+            k = 0;
+            for (k < 942) {
+                nets[n * 4 * 942 + i * 942 + k] = s.bots[i].net[k];
+                k                               = k + 1;
+            }
+            i = i + 1;
+        }
         var tic: i32 = 0;
         for (!s.completed && !s.broken) {
             game.ticker_cmds(s, ?cmds[0]);
@@ -3377,7 +3389,7 @@ fun resumecheck(argv: **u8) i64 {
         if (!game.campaign_resume(s, 4, 0, defs.SK_NIGHTMARE, cap, maps[n], ?carry[(n - 1) * 1040])) { ret EXIT_MAP; }
         i = 0;
         for (i < 4) {
-            game.set_bot(s, i, kinds[i], ?net[0], (i * 7919 + 3)::u32);
+            game.set_bot(s, i, kinds[i], ?nets[n * 4 * 942 + i * 942], (i * 7919 + 3)::u32);
             i = i + 1;
         }
         game.campaign_bots(s);

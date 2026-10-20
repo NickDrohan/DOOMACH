@@ -53,10 +53,11 @@
 # coming back, and what they play is not a level but the episode: a
 # campaign, all nine levels in the order a player meets them (the secret
 # level after the third), the same four from the first to the last,
-# carrying forward what they hold as players do. A level is left when the
-# team finishes it or when eight minutes of it have gone. The bots play each
-# level through (bot.mach): into every secret, fighting until five minutes
-# are up, and only then out by the exit. A bot's score for the campaign is
+# carrying forward what they hold as players do. A level has no time limit:
+# it is left when the team finishes it or when it has stopped getting
+# anywhere (game.stalled). The bots play each level through (bot.mach):
+# into every secret they believe in, and only then out by the exit, however
+# long that takes. A bot's score for the campaign is
 # what it did to get the team on: secrets, keys, locked doors, switches,
 # the way it covered, a little for a kill and a little off for a death,
 # and nothing at all for standing still. It is rated against the other
@@ -101,9 +102,9 @@ val MATCH: i32 = 4200;
 # the maps the bots can find each other on
 val MAPS: [7]i32 = [7]i32{1, 2, 3, 4, 7, 8, 9};
 
-# the co-op league: a level of a campaign may take eight minutes, of which
-# the bots will not leave in the first five
-val COOPMATCH: i32 = 16800;
+# the co-op league: a level of a campaign has no time limit, only the
+# ceiling against what no one has thought of (game.stalled), an hour
+val COOPMATCH: i32 = 60 * 60 * 35;
 # the levels of a campaign
 val CAMPAIGN: i32 = 9;
 val COOP_NAMES: [11]str = [11]str{
@@ -296,10 +297,10 @@ fun fresh(l: *League, first: *i8) {
     }
 }
 
-fun mutate(m: *Member) {
+fun mutate(m: *Member, from: *i8) {
     var k: i32 = 0;
     for (k < NET) {
-        var w: i32 = m.net[k]::i32;
+        var w: i32 = from[k]::i32;
         if (below(100) < m.share) {
             # two throws, for small changes more often than large
             w = w + (below(2 * m.sigma + 1) + below(2 * m.sigma + 1)) / 2 - m.sigma;
@@ -566,7 +567,7 @@ fun relive(s: *game.Session, l: *League, picks: *i32, map: i32, was: *Tally, see
     for (i < 4) {
         val m: *Member = ?l.members[picks[i]];
         if (m.kind == KIND_LEARNS) {
-            mutate(m);
+            mutate(m, ?m.net[0]);
             m.phase = 1;
             any     = 1;
         }
@@ -768,6 +769,149 @@ fun watch_lines(s: *game.Session) {
     }
 }
 
+# What each of the four did in a level of a campaign, from a session whose
+# level has just ended, for comparing a bot with its mutant level by level.
+# The bots are started afresh at every level of a campaign, so what they
+# count (shots, uses, turning) is the level's. Locked doors and switches
+# are not counted here, the same for the bot and for its mutant.
+# ---
+# keys:   the most keys each held at once in the level
+# deaths: how often each died in it
+fun level_tally(s: *game.Session, keys: *i32, deaths: *i32, out: *Tally) {
+    var i: i32 = 0;
+    for (i < 4) {
+        val p: *defs.Player = ?s.g.players[i];
+        val b: *bot.Bot     = ?s.bots[i];
+        var blank: Tally;
+        out[i]         = blank;
+        out[i].frags   = p.killcount;
+        out[i].secrets = p.secretcount;
+        out[i].keys    = keys[i];
+        out[i].deaths  = deaths[i];
+        out[i].shots   = b.shots;
+        out[i].turned  = b.turned;
+        out[i].uses    = b.uses;
+        var way: i32 = 0;
+        if (b.goalserial == s.g.levelserial && b.goalstart > 1 && b.goalbest > 0) { way = (b.goalstart - b.goalbest) * 100 / (b.goalstart - 1); }
+        if (!s.capped) {
+            out[i].finished = 1;
+            if (way > 90) { way = 100; }
+        }
+        out[i].progress = way;
+        out[i].score    = out[i].frags + 25 * out[i].secrets + out[i].progress + 15 * out[i].keys - 3 * out[i].deaths;
+        i = i + 1;
+    }
+}
+
+# The co-op league learns level by level. Each level of a campaign depends
+# on nothing before it but what the players carried in (game.carry), so as
+# a level ends it is played again from where it began, in a session of its
+# own, with each learner replaced by a mutant of the net it began that
+# level with; a mutant that earned clearly more of what its style wants in
+# that level, in the very same level, takes the bot's place for the levels
+# to come. Nine chances a campaign for each bot, where a whole campaign
+# played again gave one, and a long campaign none.
+var trial_s: *game.Session;
+# the nets each level began with, kept for the mutants to be of: what the
+# bots learned in the level itself is a different matter, kept in theirs
+var lvstart: [4 * 942]i8;
+
+fun level_trial(s: *game.Session, l: *League, picks: *i32, seeds: *u32, map: i32, carried: *u8, was: *Tally) {
+    if (trial_s == nil) { ret; }
+    val t: *game.Session = trial_s;
+    var any: bool = 0;
+    var i:   i32  = 0;
+    for (i < 4) {
+        val m: *Member = ?l.members[picks[i]];
+        if (m.kind == KIND_LEARNS) {
+            mutate(m, ?lvstart[i * NET]);
+            any = 1;
+        }
+        i = i + 1;
+    }
+    if (!any) { ret; }
+    var ok: bool = 0;
+    if (map == 1) {
+        ok = game.campaign_game(t, 4, 0, defs.SK_NIGHTMARE, COOPMATCH);
+    }
+    or {
+        ok = game.campaign_resume(t, 4, 0, defs.SK_NIGHTMARE, COOPMATCH, map, carried);
+    }
+    if (!ok) { ret; }
+    i = 0;
+    for (i < 4) {
+        val m: *Member = ?l.members[picks[i]];
+        var used: *i8 = ?lvstart[i * NET];
+        if (m.kind == KIND_LEARNS) { used = ?m.trial[0]; }
+        game.set_bot(t, i, kinds[i], used, seeds[i]);
+        i = i + 1;
+    }
+    game.campaign_bots(t);
+
+    var cmds:  [4]defs.Ticcmd;
+    var dead:  [4]bool;
+    var died:  [4]i32;
+    var held:  [4]i32;
+    var began: i64 = millis();
+    var tic:   i32 = 0;
+    for (!t.completed && !t.broken) {
+        game.ticker_cmds(t, ?cmds[0]);
+        i = 0;
+        for (i < 4) {
+            val gone: bool = t.g.players[i].playerstate == defs.PST_DEAD;
+            if (gone && !dead[i]) { died[i] = died[i] + 1; }
+            dead[i] = gone;
+            var cards: i32 = 0;
+            var c:     i32 = 0;
+            for (c < 6) {
+                if (t.g.players[i].cards[c]) { cards = cards + 1; }
+                c = c + 1;
+            }
+            if (cards > held[i]) { held[i] = cards; }
+            i = i + 1;
+        }
+        tic = tic + 1;
+        if (tic % 350 == 0) {
+            beat();
+            rest(began, share);
+            began = millis();
+        }
+    }
+    if (t.broken) { ret; }
+    var now: [4]Tally;
+    level_tally(t, ?held[0], ?died[0], ?now[0]);
+    i = 0;
+    for (i < 4) {
+        val m: *Member = ?l.members[picks[i]];
+        if (m.kind == KIND_LEARNS) {
+            val before: i32 = reward(m.style, ?was[i]);
+            val after:  i32 = reward(m.style, ?now[i]);
+            # clearly more: by a twentieth and five, so that a coin's fall
+            # is less often taken for a lesson
+            var margin: i32 = before / 20;
+            if (margin < 0) { margin = -margin; }
+            tried = tried + 1;
+            if (after > before + margin + 5) {
+                m.generation = m.generation + 1;
+                kept         = kept + 1;
+                # and the bot itself goes on as the mutant — as the mutant
+                # ended the level, what it learned in the winning kept:
+                # the level it won is behind it either way. The change is
+                # made between levels, so a game that joined the campaign
+                # sees it in the next one published.
+                var k: i32 = 0;
+                for (k < NET) {
+                    m.net[k]         = t.bots[i].net[k];
+                    s.bots[i].net[k] = t.bots[i].net[k];
+                    k                = k + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    rest(began, share);
+}
+
 # a level of a campaign is over: add what each of the four did in it to
 # what they have done in the campaign so far
 # ---
@@ -848,11 +992,25 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
     # what the players carried out of the last level: nothing yet
     var carry_room: [1040]u8;
     val carried:    *u8 = ?carry_room[0];
+    # deaths counted before this level began, for the level's own
+    var diedbefore: [4]i32;
     var tic:   i32 = 0;
     # a deathmatch is this once round; a campaign, once a level
     for {
         var level_began: i64 = millis();
         var level_tic:   i32 = 0;
+        # the nets this level begins with: what the level's mutants are made
+        # of, and what a game joining at this level is given to play by
+        i = 0;
+        for (i < 4) {
+            var k: i32 = 0;
+            for (k < NET) {
+                lvstart[i * NET + k] = s.bots[i].net[k];
+                nets[i * NET + k]    = s.bots[i].net[k];
+                k                    = k + 1;
+            }
+            i = i + 1;
+        }
         # a campaign's level is published as it begins, for games to join
         if (coop && !again) { publish(s, l, picks, seeds, nets, carried); }
     for (!s.completed && !s.broken && (coop || tic < length)) {
@@ -950,6 +1108,17 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
         # of it, and go on to the next unless that was the last
         level_over(s, tally, ?held[0]);
         if (!again) { ended(s.g.gamemap, level_tic, game.checksum(s)); }
+        # the level played again with mutants, from where it began
+        var lived: [4]i32;
+        var mine:  [4]Tally;
+        i = 0;
+        for (i < 4) {
+            lived[i]       = died[i] - diedbefore[i];
+            diedbefore[i]  = died[i];
+            i              = i + 1;
+        }
+        level_tally(s, ?held[0], ?lived[0], ?mine[0]);
+        level_trial(s, l, picks, seeds, s.g.gamemap, carried, ?mine[0]);
         game.carry(s, carried);
         i = 0;
         for (i < 4) {
@@ -962,6 +1131,25 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
         game.world_done(s);
         if (s.broken) { brk; }
         watch_lines(s);
+    }
+
+    # and what the bots learned in the playing is kept in the members the
+    # league saves and seeds: each one's standing net ends the match as the
+    # net its bot ended it with — but the standing net only, the trial's
+    # being for the mutants
+    if (coop) {
+        i = 0;
+        for (i < 4) {
+            val m: *Member = ?l.members[picks[i]];
+            if (m.kind == KIND_LEARNS || m.kind == KIND_APPRENTICE) {
+                var k: i32 = 0;
+                for (k < NET) {
+                    m.net[k] = s.bots[i].net[k];
+                    k        = k + 1;
+                }
+            }
+            i = i + 1;
+        }
     }
 
     i = 0;
@@ -1652,6 +1840,13 @@ fun main(argc: i64, argv: **u8) i64 {
     if (sel sg.err) { ret 2; }
     val s: *game.Session = sg.ok;
     game.init(s, ?a, ?w, ?d);
+    # and a second session, for the co-op league's levels played again
+    if (coop) {
+        val tg: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+        if (sel tg.err) { ret 2; }
+        trial_s = tg.ok;
+        game.init(trial_s, ?a, ?w, ?d);
+    }
     # what this program makes of the probe, for every match it leaves to watch
     stamp = game.fingerprint(s):~i32;
     print.printlnf("arena: the simulation's fingerprint is {}", stamp:~u32);
@@ -1720,7 +1915,8 @@ fun main(argc: i64, argv: **u8) i64 {
         # the league learns from the match played again with mutants; and
         # then the four have their feelings about it
         val again_began: i64 = millis();
-        if (!relive(s, l, ?picks[0], map, ?tally[0], ?seeds[0], nb.ok:~*i8)) {
+        # (a campaign has had its trials level by level: level_trial)
+        if (!coop && !relive(s, l, ?picks[0], map, ?tally[0], ?seeds[0], nb.ok:~*i8)) {
             print.eprintln("arena: a map would not load");
             ret 3;
         }

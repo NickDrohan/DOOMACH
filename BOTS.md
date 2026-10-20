@@ -220,30 +220,38 @@ this port until the league needed them: `world.mach`, `fast`.)
 
 **A match is a campaign.** Not a level but the episode: all nine levels in the order a player
 meets them (the secret level after the third), the same four from the first to the last,
-carrying forward what they hold as players do (`game.campaign_game`). A level is left when the
-team finishes it or when eight minutes of it have gone. Every campaign is every level, so no
-bot is ever rated on a lucky draw of maps, and a bot's score for a campaign is added to its
-running total, which the standings show as its points. A campaign is about fifty seconds of a
-desktop processor; within the twentieth of a shared one the co-op league has on the server
-(`COOP_DUTY`) it is seventeen minutes, and as long again for the replay with mutants, so the
-league plays some forty campaigns a day.
+carrying forward what they hold as players do (`game.campaign_game`). A level has no time
+limit: it is left when the team finishes it, however long that takes, or when it has stopped
+getting anywhere — four minutes in which no bot came nearer the exit than any had, found a
+secret or picked up a key, counted only after the level's first five minutes, and an hour at
+the outside in case of something no one has thought of (`game.stalled`). Every campaign is
+every level, so no bot is ever rated on a lucky draw of maps, and a bot's score for a campaign
+is added to its running total, which the standings show as its points.
 
 **They play the level through; they do not race it.** A co-op bot with nobody to follow has
-three things to do, in order:
+two things to do, in order:
 
-1. **Every secret.** The level's secret sectors are found when it loads, with a place to stand
-   in each. Each bot starts from a different one, so the team spreads out. A bot gives a secret
-   up when it can find no walk to it that it can vouch for, or has spent 45 seconds getting no
-   nearer, and tries again a minute later or when it picks up a key.
-2. **Until five minutes are up, the monsters:** the nearest one alive. On Nightmare there is
-   always one. One it can find no walk to, or has made for for 45 seconds without getting 48
-   nearer, it gives up on for a while — the place remembered for ninety seconds, or until a
-   new key may have opened the way — and goes for the next thing instead.
-3. **Then, and not before, the exit.** Until 5:00 a bot will not press the exit switch, and
-   lines that end the level when walked over are walls to it. If the way out needs a key, it
-   goes for the nearest key it can find a sure walk to (keys stay where they are in co-op, so
-   each bot fetches its own), a key it cannot get to given up the same way. The exit itself it
-   never gives up: it is the only way the level ends.
+1. **Every secret it believes in.** The level's secret sectors are found when it loads, with a
+   place to stand in each. Each bot starts from a different one, so the team spreads out. A
+   bot gives a secret up when it can find no walk to it that it can vouch for, or has spent 45
+   seconds getting no nearer, and tries again a minute later or when it picks up a key — but a
+   secret given up on four times is counted out of reach for good, a new key aside: a key may
+   open the way there. Monsters on the way are fought as they come; there is no time in it.
+2. **Then, and not before, the exit.** While a secret is still believed in, a bot will not
+   press the exit switch, and lines that end the level when walked over are walls to it. Once
+   none is, if the way out needs a key it goes for the nearest key it can find a sure walk to
+   (keys stay where they are in co-op, so each bot fetches its own), a key it cannot get to
+   given up the same way. The exit itself it never gives up: it is the only way the level ends.
+
+**They learn as they go.** A net keeps the last eight things it decided — the senses it had
+and what it made of them — and what the world does to it next is laid at their door. A secret
+found, a key picked up, a kill, ground made toward the exit: the decisions nearest in time are
+reinforced, the newest counting most. A wound is held against them a little, a death a lot —
+the deepest cut falling on what it did nearest the end. Only the output layer moves, and all
+in the integers everything here is done in, over what the bot itself sensed and decided:
+nothing outside the game is read, so every machine computes the same learning and the game
+stays in step (`bot.learn`). The net a bot ends a level with is the net it begins the next
+with, and what it learned in a campaign is kept in its member when the campaign ends.
 
 **Slime, pits and friends.** Three things every co-op bot does whatever decided, because a net
 that never learned them is a danger to itself and to its team:
@@ -333,44 +341,43 @@ weapons stay for the others) a shotgun it already had, and stood on it. Now an i
 only if the bot would pick it up and can walk straight to it. On the deathmatch measure, four
 hand-written bots for two minutes on each of the seven maps, that took frags from 81 to 102.
 
-**Where it stands.** Measured with four hand-written bots, one run a map, eight minutes.
+**Where it stands.** Measured with four hand-written bots, one run a map, thirty minutes
+allowed (no level has a limit — they take what they take).
 "Calm" is the same level with the monsters taken out (`coopmatch ... calm`), which shows the
 route-finding apart from the fighting.
 
 | Map | Calm: secrets, exit |
 |---|---|
-| E1M1 | 3 of 3, out at 5:00 |
-| E1M2 | 3 of 6, out at 5:01 |
-| E1M3 | 1 of 7, out at 5:00 |
-| E1M4 | 2 of 3, out at 5:01 |
-| E1M5 | 9 of 9, out at 5:00 |
-| E1M6 | 4 of 4, not out |
-| E1M7 | 1 of 4, out at 5:06 |
-| E1M9 | 1 of 2, not out |
+| E1M1 | 3 of 3, out at 1:25 |
+| E1M2 | 3 of 6, out at 4:23 |
+| E1M3 | 1 of 7, out at 4:59 |
+| E1M4 | 2 of 3, out at 3:59 |
+| E1M5 | 9 of 9, out at 2:49 |
+| E1M6 | 4 of 4, out at 15:28 |
+| E1M7 | 1 of 4, out at 3:59 |
+| E1M9 | 2 of 2, out at 4:29 |
 
-On Nightmare the same four finish E1M1 with two or three of its secrets, and in a campaign
-(two, from the net the league begins as) a team finished one level of the nine and found ten
-of the episode's 39 secrets.
+On Nightmare the same four finish E1M1 with all three of its secrets at 1:23.
 
-So: with the monsters out, six maps of eight finished, two of them with every secret; on
-Nightmare, one. What is left is of three kinds, all measured on E1M6 and E1M9, the two calm
-maps still not finished. One: a bot can circle a goal it believes in and cannot reach —
-45 seconds without getting nearer now gives it up, for secrets, monsters, keys and the
-friend it follows alike, though the exit is never given up. Two: a place can be walked into
-but never back out of — E1M6's nukage trenches are one-way drops, and everything left inside
-one (secrets, keys, items, a monster, a friend) is now left alone; what enters anyway, roaming
-or pushed, does not come back. Three: a way believed can hinge on what is not working —
-E1M6's door pocket opens on a one-shot switch half the map away and shuts again on a timer,
-and on E1M9 the courtyard the bots file into wants the yellow key, and no bot found a walk
-to it. Where Nightmare falls short of calm (E1M5:
-nine secrets to two), the bots die, about once a minute each, and a death puts a bot back at
+So: with the monsters out, every level that can end is finished — E1M8 alone cannot, having no
+exit line (below) — six of them with every secret, and all of them as soon as the secrets are
+done with rather than when a clock ran out. E1M6 took the quarter of an hour it needed: its
+secrets are found, and then it is out. The secrets not found are of three kinds. One: a bot
+can circle a goal it believes in and cannot reach — 45 seconds without getting nearer now
+gives it up, and a secret given up four times is counted out of reach, for monsters, keys and
+the friend it follows alike, though the exit is never given up. Two: a place can be walked
+into but never back out of — E1M6's nukage trenches are one-way drops, and everything left
+inside one (secrets, keys, items, a monster, a friend) is now left alone; what enters anyway,
+roaming or pushed, does not come back. Three: a way believed can hinge on what is not
+working — E1M6's door pocket opens on a one-shot switch half the map away and shuts again on
+a timer. Where Nightmare falls short of calm the bots die, and a death puts a bot back at
 the start. That part is the fighting, which is what the nets are there to learn. E1M8 is
 different from the rest: it has no exit line at all. The level ends on a floor that hurts to
 death, past walls that fall when the last bruiser dies and a teleporter inside them — so the
 grid marks the 666-tagged walls as movers it trusts, takes the teleport as the way out, and
-holds it shut to the bots until five minutes like any other way across the level's end. They
-still have to kill the bruisers to open it, and on Nightmare dead monsters come back; a calm
-E1M8 cannot end.
+holds it shut to the bots until the secrets are done like any other way across the level's
+end. They still have to kill the bruisers to open it, and on Nightmare dead monsters come
+back; a calm E1M8 cannot end.
 
 **How a league learns.** Both leagues once learned by blocks: six games as a bot is against
 six as a mutant of itself, on whatever maps and against whomever the draw gave. That cannot
@@ -381,9 +388,15 @@ as get nine or ten a match between them: they had drifted *down*. So now every m
 leagues is played twice. The second time is the same map, the same seeds and the same four,
 but each learner is replaced by a mutant of itself; a mutant that earned clearly more of what
 its style wants than the bot did in the very same match (a quarter more, and ten) takes its
-place. That is four trials a match. A match is still chaos, so some mutants are kept by luck;
+place. In the co-op league, where a match is nine levels, the trial is level by level instead:
+as each level ends it is played again from where it began, each learner a mutant of the net
+it began that level with, and a mutant that clearly outdid it there goes on as the bot —
+as the mutant ended the level, what it learned in the winning kept — for the levels to come.
+A deathmatch is still chaos, so some mutants are kept by luck;
 what sorts those out is the rating, and inheritance: every fifth match, in one style, the
-lowest-rated learner takes the net of the highest-rated if they are sixty points apart.
+lowest-rated learner takes the net of the highest-rated if they are sixty points apart. And
+underneath both, in co-op, the nets learn as they go (above): what befalls a bot in the level
+nudges the weights it decided by, and is carried into the next.
 
 **What co-op pays for.** Twice the league has done exactly what it was paid to and not what
 was wanted. Paid two a kill and five off a death, its top bots came to kill half as much again

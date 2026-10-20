@@ -82,11 +82,18 @@ pub rec Session {
 
     # A campaign: the whole episode in the order a player meets it, the
     # secret level after the third, each level left when it is finished or
-    # when levelcap tics of it have gone, whichever is first. capped says
-    # the level just left was left for the clock.
+    # when the team has stopped getting anywhere in it (stalled). capped
+    # says the level just left was not finished.
     campaign: bool;
     levelcap: i32;
     capped:   bool;
+    # how the team is getting on in the level: the nearest any of them has
+    # been to the exit, the secrets found, the keys held, and the tic any of
+    # those last got better
+    gainnear:    i32;
+    gainsecrets: i32;
+    gainkeys:    i32;
+    lastgain:    i32;
     # each bot as it was set, so that a campaign can start it afresh at
     # every level: its kind as told, and its seed
     botkind: [4]i32;
@@ -475,6 +482,7 @@ pub fun campaign_resume(s: *Session, players: i32, me: i32, skill: i32, cap: i32
     s.completed = 0;
     g.exited    = 0;
     g.gamemap   = map;
+    gain_reset(s);
     random.clear(?g.rnd);
     ret load_level(s);
 }
@@ -618,7 +626,54 @@ pub fun campaign_game(s: *Session, players: i32, me: i32, skill: i32, cap: i32) 
     s.campaign = 1;
     s.levelcap = cap;
     s.capped   = 0;
+    gain_reset(s);
     ret 1;
+}
+
+# A campaign's level has no time limit: a team plays it until it is out,
+# however long that takes. It is moved on only when it has stopped getting
+# anywhere: when for STALL tics none of the four has come nearer the exit
+# than any of them had, found a secret or picked up a key, not counting the
+# level's grace at its start. And, in case of something no one has thought
+# of, at levelcap tics whatever it is doing. Every machine works this out
+# the same: it is part of the game.
+pub val STALL: i32 = 4 * 60 * 35;
+
+fun gain_reset(s: *Session) {
+    s.gainnear    = 0;
+    s.gainsecrets = 0;
+    s.gainkeys    = 0;
+    s.lastgain    = 0;
+}
+
+fun stalled(s: *Session) bool {
+    val g: *Game = ?s.g;
+    var near:    i32 = 0;
+    var secrets: i32 = 0;
+    var keys:    i32 = 0;
+    var i:       i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (g.playeringame[i]) {
+            val b: *bot.Bot = ?s.bots[i];
+            if (b.active && b.goalserial == g.levelserial && b.goalbest > 0 && (near == 0 || b.goalbest < near)) { near = b.goalbest; }
+            secrets = secrets + g.players[i].secretcount;
+            var k: i32 = 0;
+            for (k < 6) {
+                if (g.players[i].cards[k]) { keys = keys + 1; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if ((near > 0 && (s.gainnear == 0 || near < s.gainnear)) || secrets > s.gainsecrets || keys > s.gainkeys) {
+        if (near > 0 && (s.gainnear == 0 || near < s.gainnear)) { s.gainnear = near; }
+        if (secrets > s.gainsecrets) { s.gainsecrets = secrets; }
+        if (keys > s.gainkeys)       { s.gainkeys = keys; }
+        s.lastgain = g.leveltime;
+    }
+    var since: i32 = s.lastgain;
+    if (since < bot.GRACE) { since = bot.GRACE; }
+    ret g.leveltime - since > STALL || (s.levelcap > 0 && g.leveltime >= s.levelcap);
 }
 
 # start a deathmatch: every machine in the game calls this with the same
@@ -858,7 +913,10 @@ pub fun world_done(s: *Session) {
     s.capped    = 0;
     s.g.gamemap = s.wi.next;
     # a campaign's level begins as if the campaign began there
-    if (s.campaign) { random.clear(?s.g.rnd); }
+    if (s.campaign) {
+        random.clear(?s.g.rnd);
+        gain_reset(s);
+    }
     load_level(s);
     if (s.campaign) { campaign_bots(s); }
 }
@@ -1032,8 +1090,8 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
         i = i + 1;
     }
 
-    # a campaign's level has had its time
-    if (s.campaign && s.levelcap > 0 && g.leveltime >= s.levelcap && g.exited == 0) {
+    # a campaign's team that has stopped getting anywhere is moved on
+    if (s.campaign && g.exited == 0 && stalled(s)) {
         g.exited = 1;
         s.capped = 1;
     }
@@ -1090,8 +1148,10 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
 # player. two runs that agree here tic after tic are in sync.
 # The simulation's fingerprint: what this program makes of a fixed probe.
 # Four bots (two nets with fixed weights, a brawler and the hand-written
-# bot) play a co-op level on Nightmare, then a deathmatch, 350 tics each,
-# and the two checksums are the fingerprint. Whatever changes the simulation
+# bot) play a co-op level on Nightmare, then a deathmatch, 350 tics each;
+# then the first two levels of a campaign with a ceiling of 350 tics, which
+# takes them through a campaign's passing from one level to the next. The
+# checksums are the fingerprint. Whatever changes the simulation
 # or the bots in any way the probe reaches changes it: the monsters, the
 # moving sectors, the senses, the nets, the route-finding, the reflexes.
 # Every program computes it the same on every machine, as it computes every
@@ -1107,13 +1167,16 @@ pub fun fingerprint(s: *Session) u32 {
     }
     var sum: u32 = 0;
     var round: i32 = 0;
-    for (round < 2) {
+    for (round < 3) {
         var ok: bool = 0;
         if (round == 0) {
             ok = coop_game(s, 4, 0, defs.SK_NIGHTMARE, 1);
         }
-        or {
+        or (round == 1) {
             ok = deathmatch_game(s, 4, 0, defs.SK_MEDIUM, 1, 1, 1);
+        }
+        or {
+            ok = campaign_game(s, 4, 0, defs.SK_NIGHTMARE, 350);
         }
         if (!ok) { ret 0; }
         set_bot(s, 0, bot.KIND_NET, ?net[0], 11);
@@ -1125,6 +1188,16 @@ pub fun fingerprint(s: *Session) u32 {
         for (tic < 350 && !s.completed && !s.broken) {
             ticker_cmds(s, ?cmds[0]);
             tic = tic + 1;
+        }
+        if (round == 2) {
+            # on into the campaign's second level, and through its 350
+            for (!s.completed && !s.broken) { ticker_cmds(s, ?cmds[0]); }
+            if (s.completed) { world_done(s); }
+            tic = 0;
+            for (tic < 350 && !s.completed && !s.broken) {
+                ticker_cmds(s, ?cmds[0]);
+                tic = tic + 1;
+            }
         }
         sum   = sum * 2654435761 ^ checksum(s);
         round = round + 1;

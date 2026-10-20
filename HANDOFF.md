@@ -146,22 +146,30 @@ check `https://mach-doom-relay.fly.dev/doom.exe.sha256` equals the hash of the e
 
 Both: 100 members (98 nets, the hand-written "Teacher", a net of noise), Elo rating, eleven
 styles each with its own reward, five "Apprentices" that learn from opted-in human play. Both
-learn by **replaying each match with mutants** in the learners' seats (`arena.mach`, `relive`)
-and by within-style inheritance. Every bot has a quirk and slow feelings about the others.
+learn by **replaying with mutants** — deathmatch replays the whole match (`arena.mach`,
+`relive`), co-op replays each level from where it began (`level_trial`) — by within-style
+inheritance, and, in co-op, by **learning in the level itself**: each net keeps the last eight
+decisions it made and what befalls it next (a kill, a secret, a key, ground gained, a wound,
+a death) nudges the weights those decisions came from (`bot.learn`). Every bot has a quirk
+and slow feelings about the others.
 
 - **Deathmatch:** four bots, two minutes, one of seven maps. Scored on frags then accuracy.
   No friends; a feeling only falls; under 25 a bot hunts that opponent.
 - **Co-op:** a **campaign**. The same four play all nine levels in order on Nightmare, carrying
-  inventory forward; a level ends on exit or at eight minutes. Bots go for every secret, fight
-  until 5:00, then exit. Score is objectives (keys, locked doors, one-time switches, secrets,
-  distance to exit, levels finished), +1 a kill, -3 a death, added to a running Points total.
+  inventory forward. A level has no time limit: it ends on exit, or when the team has stopped
+  getting anywhere — four minutes with no new nearest-to-exit, secret or key, after a
+  five-minute grace (`game.stalled`), an hour at the outside. Bots go for every secret they
+  believe in — one given up on four times is counted out of reach — then the exit. Score is
+  objectives (keys, locked doors, one-time switches, secrets, distance to exit, levels
+  finished), +1 a kill, -3 a death, added to a running Points total.
 
 Measured where it stands (hand-written bots, one run a map, not statistics):
 
-- With monsters removed, four bots finish five of eight maps and take every secret on two.
-- On Nightmare they finish E1M1 with two or three of its three secrets, and little else. In
-  two test campaigns from the starting net a team finished one level of nine and found 10 of
-  39 secrets.
+- With monsters removed, four bots finish every level that can end — all but E1M8, which has
+  no exit line — six of them with every secret: E1M1 3/3 out 1:25, E1M2 3/6 out 4:23,
+  E1M3 1/7 out 4:59, E1M4 2/3 out 3:59, E1M5 9/9 out 2:49, E1M6 4/4 out 15:28, E1M7 1/4 out
+  3:59, E1M9 2/2 out 4:29.
+- On Nightmare they finish E1M1 with all three secrets at 1:23.
 - About 40 co-op campaigns a day on the server, so each bot plays roughly every 15 hours.
   Learning there is slow by design of the budget, not by accident.
 
@@ -195,18 +203,14 @@ Measured where it stands (hand-written bots, one run a map, not statistics):
 
 Bots and leagues:
 
-- Route-finding gaps: E1M6 and E1M9's exits are reached by the grid, so their "not out" is
-  circling, not topology. (E1M8's end is now in the grid too: it has no exit line — the level
-  ends on a special-11 floor past the star walls — so tag-666 sectors count as movers and a
-  teleport landing on the ending floor counts as the exit, held shut to the bots until five
-  minutes. Whether the team ever takes it still rests on killing every bruiser at once, which
-  Nightmare's respawning makes rare.) (Give-up is now general, not secrets-only: a monster, key or followed friend the
-  bot spends 45 s getting no nearer is given up for 90 s, re-armed by a new key or a minute.)
-  (E1M3's exit island was fixed the same day: a stair trigger's tag names only the flight's first
-  step — line 967 builds ten steps from sector 16 through 13 — and the untagged steps' walks were
-  never trusted, sealing the exit room. `mark_stairs` in bot.mach follows the chain the engine's
-  `build_stairs` would raise; calm bots finish E1M3 at 5:00.)
-  The calm sweep after that: six of eight finish. What is left is diagnosed, not fixed:
+- Route-finding: every calm level that can end is finished (the table in BOTS.md). A secret
+  a bot has given up on four times is counted out of reach for good — that, not a clock, is
+  what ends the secret hunt and opens the way out. (E1M8's end is in the grid: it has no exit
+  line — the level ends on a special-11 floor past the star walls — so tag-666 sectors count
+  as movers and a teleport landing on the ending floor counts as the exit, held shut to the
+  bots until the secrets are done. Whether the team ever takes it still rests on killing
+  every bruiser at once, which Nightmare's respawning makes rare.)
+  The secrets not found are diagnosed, not fixed:
   - E1M6 strands bots in the nukage trenches — one-way drops in, no way back. Goals standing
     in cells the exit cannot be walked to from are now never taken up (`lost` in bot.mach:
     secrets, keys, monsters, a followed friend, and items that can be seen); a bot that ends
@@ -214,12 +218,8 @@ Bots and leagues:
     exit approach passes a door pocket (sector 37, tags 4) whose only trigger is a one-shot
     open-wait-close switch (line 438) half the map away: pressed, it shuts again before the
     walk back. Remote timed doors like it are unsolved.
-  - E1M9 pens the team in sector 132's courtyard: every way out is a yellow door and the key
-    they are missing is the goal they circle (1856,-1088, a structure inside the courtyard).
-    Reaching it is the open problem there.
-  Calm table (one run a map, not statistics): E1M1 3/3 out 5:00; E1M2 3/6 out 5:00; E1M3 1/7
-  out 5:00; E1M4 2/3 out 5:00; E1M5 9/9 out 5:00 (was 7:36); E1M6 4/4 not out; E1M7 1/4 out
-  5:04; E1M8 1/1 not out (no exit to reach); E1M9 1/2 not out.
+  - E1M2, E1M3, E1M4 and E1M7 still leave secrets unfound — mostly the same kinds: switches
+    whose work is elsewhere, and ways the grid cannot vouch for.
 - On Nightmare the bots die about once a minute each and respawn at the level start, which is
   most of why they do not finish levels. This is what the nets are meant to learn.
 - Apprentices do nothing until 5,000 samples of human play exist for their game type (about

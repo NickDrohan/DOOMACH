@@ -516,12 +516,12 @@ fi
 
 # The co-op league: the same arena, told "coop", plays a team of four
 # through the whole episode on Nightmare, a campaign, and keeps other
-# files. One campaign, played again with mutants, which is how it learns; its
-# standings count them; its bots get somewhere and kill something; and a
-# match fetched through the relay, asked for as the co-op league's, replays
-# here to the kills and deaths the arena recorded. Started again without
-# "coop" in the same folder, the deathmatch league is where it was: the two
-# do not touch each other's files.
+# files. Every level of the campaign is played again with mutants, which is
+# how it learns; its standings count them; its bots get somewhere and kill
+# something; and a match fetched through the relay, asked for as the co-op
+# league's, replays here to the kills and deaths the arena recorded.
+# Started again without "coop" in the same folder, the deathmatch league is
+# where it was: the two do not touch each other's files.
 coop_runs() { ARENA_DUTY=100 "$arena_exe" "$wad" "$here/fixtures/bot0.net" "$work/league" "$1" coop >"$work/arena-coop.log" 2>&1; }
 gate "the arena plays a co-op campaign on Nightmare, and plays it again with mutants" 0 coop_runs 1
 if [[ -n "$python" ]]; then
@@ -592,11 +592,13 @@ if [[ -n "$python" ]]; then
     gate "a game joins the co-op league's campaign where it is" 0 grep -q "^joined E1M" "$work/join.out"
     gate "and ends the level where the league did" 0 grep -q "came out as the league's did" "$work/join.out"
 fi
-# Four hand-written bots play a level through: into every secret, not out
-# before five minutes are up, then out. On Nightmare they do all of that on
-# E1M1. With the monsters taken out, which shows the finding of the way
-# apart from the fighting, they do it on E1M5, whose nine secrets and its
-# exit lie behind doors worked by switches behind doors that need keys.
+# Four hand-written bots play a level through: into every secret they can
+# reach, then out — as soon as the secrets are done with, however early or
+# late that is; no clock holds them and none hurries them. On Nightmare
+# they do all of that on E1M1, whose three secrets they have long had. With
+# the monsters taken out, which shows the finding of the way apart from the
+# fighting, they do it on E1M5, whose nine secrets and its exit lie behind
+# doors worked by switches behind doors that need keys.
 "$release" coopmatch "$wad" 1 16800 >"$work/coopmatch.out" 2>/dev/null
 finds_and_finishes() { awk '/^end tic/ { exit !($5 == 1 && $7 >= 2 && $9 == 3) }' "$work/coopmatch.out"; }
 gate "four bots find at least two of E1M1's three secrets on Nightmare and finish it" 0 finds_and_finishes
@@ -606,13 +608,16 @@ gate "four bots find at least two of E1M1's three secrets on Nightmare and finis
 # bot's eyes never stopped shaking.
 steady_hand() { awk '/^bot/ { s += $26 } /^end tic/ { exit !(s / 4 / ($3 / 2100) < 120) }' "$work/coopmatch.out"; }
 gate "a bot's view does not shake" 0 steady_hand
-not_before_five() { awk '/^end tic/ { exit !($3 > 10500) }' "$1"; }
-gate "and are not out of it before five minutes are up" 0 not_before_five "$work/coopmatch.out"
+# And with every secret of E1M1's found they are out before five minutes,
+# where before the clock held them in the level until then: secrets first,
+# then the exit, is the whole rule now.
+out_when_done() { awk '/^end tic/ { exit !($3 < 10500) }' "$1"; }
+gate "and are out as soon as the secrets are done with" 0 out_when_done "$work/coopmatch.out"
 "$debug" coopmatch "$wad" 1 16800 >"$work/coopmatch.debug" 2>/dev/null
 same "and debug plays the same match" "$work/coopmatch.debug" "$work/coopmatch.out"
 "$release" coopmatch "$wad" 5 16800 calm >"$work/coopcalm.out" 2>/dev/null
 gate "with no monsters, they find E1M5's nine secrets, its keys and its exit" 0 grep -q "finished 1 secrets 9 of 9 " "$work/coopcalm.out"
-gate "and are not out of that before five minutes either" 0 not_before_five "$work/coopcalm.out"
+gate "and are out of that as soon as the ninth is found" 0 out_when_done "$work/coopcalm.out"
 
 # With a person in the game the level is the person's. One bot stands in
 # for a person who plays E1M4 through, opening it as they go; the other

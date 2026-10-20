@@ -175,6 +175,9 @@ pub rec Bot {
     wantsince: i32;
     gaveup:    u32;
     gavekeys:  i32;
+    # and how often each has had to be given up: SECRET_TRIES of those and
+    # the secret counts as out of reach, until a new key may open the way
+    struck:    [32]u8;
     # the nearest it has been to the secret it is making for
     wantbest: i32;
     # the key it has set out for, by where it lies, and until when it keeps
@@ -202,9 +205,9 @@ pub rec Bot {
     # its way was found only by going through what hurts or what there is
     # no way back out of: it has chosen to wade, and is not held back
     wades: bool;
-    # for whoever is watching it think: what it is after (1 a secret, 2 a
-    # monster, 3 the exit, 4 a key), the place it is going for that, and how
-    # many things it must work first to get there
+    # for whoever is watching it think: what it is after (1 a secret, 3
+    # the exit, 4 a key, 5 a friend), the place it is going for that, and
+    # how many things it must work first to get there
     after:  i32;
     afterx: Fixed;
     aftery: Fixed;
@@ -221,6 +224,21 @@ pub rec Bot {
     # watching through its eyes is like
     wasturn: i32;
     swings:  i32;
+
+    # what a net learns by: the last eight things it decided (the senses it
+    # had and what it made of them), the newest where tpos less one says,
+    # so that what happens to it next can be laid at their door; and the
+    # numbers a tic ago said the world gave it, for what has changed since
+    tfeat:   [256]i32;
+    tout:    [48]i32;
+    tpos:    i32;
+    tn:      i32;
+    wstate:  i32;
+    whealth: i32;
+    wkills:  i32;
+    wsecret: i32;
+    wkeys:   i32;
+    primed:  bool;
 }
 
 fun clamp(v: i32, lo: i32, hi: i32) i32 {
@@ -553,13 +571,23 @@ val KEY_RED:    i32 = 4;
 val KEY_EXIT: i32 = 8;
 val KEY_ALL:  i32 = 15;
 
-# A team of bots plays a level through: they are not out of it before five
-# minutes are up, and not before they have been in every secret they can
-# find a way into.
-pub val LEAVE: i32 = 5 * 60 * 35;
+# A team of bots plays a level through, however long that takes: the
+# secrets first, until it has been in every one it can reach or counted
+# every one out of reach, and then the exit. There is no clock in it; a
+# level ends when the team is out or, in the league's game, when it has
+# stopped getting anywhere at all (game.stalled). This is the grace a
+# stalled level is measured after: the tics a team may spend getting
+# nowhere before it counts as stopped for good.
+pub val GRACE: i32 = 5 * 60 * 35;
 # how long a bot makes for one secret without getting any nearer it before
 # giving it up for another
 val SECRET_PATIENCE: i32 = 45 * 35;
+# and how often a bot may set out for a secret and have to give it up
+# before the secret counts as out of reach for good, a new key aside: a
+# key may open the way there. Without a last call a team that had found
+# every secret it could went on circling one it could not, and the
+# league's teams finished the first level of the nine and no other.
+val SECRET_TRIES: i32 = 4;
 # how long a bot keeps after a goal it has made no progress toward, and how
 # near a place the one it has given up on
 val GOAL_PATIENCE: i32 = 45 * 35;
@@ -1522,10 +1550,24 @@ fun given_up(g: *Game, b: *Bot, x: Fixed, y: Fixed) bool {
     ret dx + dy <= GAVE_RADIUS;
 }
 
+# whether the level still holds a secret this bot has not counted out of
+# reach: what the way out stays shut to it for. A secret given up on only
+# for the moment still counts — it will be tried again.
+fun secrets_left(g: *Game, b: *Bot) bool {
+    if (g.navserial != g.levelserial) { build_grid(g); }
+    if (g.navgrid == nil || g.navsecrets == 0) { ret 0; }
+    var i: i32 = 0;
+    for (i < g.navsecrets) {
+        if (g.lv.sectors[g.navsecret[i]].special == 9 && b.struck[i]::i32 < SECRET_TRIES && !lost(g, g.navsecretx[i], g.navsecrety[i])) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 # the way for a co-op bot that follows nobody, which plays the level: to
-# each secret nobody has been in; then, until five minutes are up, to the
-# nearest monster; then to the exit, or to a key the way there needs; 0 if
-# there is nowhere to go
+# each secret nobody has been in, for as long as one is left it believes
+# in; then to the exit, or to a key the way there needs; 0 if there is
+# nowhere to go
 fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     val me: *Mobj = g.players[playernum].mo;
     if (g.navserial != g.levelserial) { build_grid(g); }
@@ -1540,9 +1582,10 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         b.gavekeys   = had;
         b.keyuntil   = 0;
     }
-    # until it is time to leave, the lines that end the level are walls
+    # until the secrets are done with, the lines that end the level are
+    # walls to it
     var have: i32 = had;
-    if (g.leveltime < LEAVE) { have = have & (KEY_ALL ^ KEY_EXIT); }
+    if (secrets_left(g, b)) { have = have & (KEY_ALL ^ KEY_EXIT); }
     walkhave = have;
 
     # how far it has come toward the exit, for whoever scores it: by the
@@ -1562,17 +1605,30 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         }
         if (near != 0) {
             if (b.goalstart == 0)                     { b.goalstart = near; }
-            if (b.goalbest == 0 || near < b.goalbest) { b.goalbest = near; }
+            if (b.goalbest == 0 || near < b.goalbest) {
+                b.goalbest = near;
+                learn(g, b, 1);
+            }
         }
     }
 
     # First, the secrets: the ones nobody has been in yet and this bot has
     # not given up on, each bot starting from a different one so that the
     # team spreads out. A secret it cannot find a way into, or has made for
-    # for too long without getting there, it gives up, until it finds a key,
-    # which may open the way.
+    # for too long without getting there, it gives up for a while; a key it
+    # finds opens everything again, and a minute gone by arms them all for
+    # one more try — but a secret struck SECRET_TRIES times is out of reach
+    # for good, and when none is left to try the secrets are done and the
+    # way out opens.
+    if (b.gavekeys != had) {
+        var z: i32 = 0;
+        for (z < 32) {
+            b.struck[z] = 0;
+            z           = z + 1;
+        }
+    }
     if (b.gavekeys != had || (g.leveltime + playernum * 16) % (60 * 35) < 16) {
-        # or a minute has gone by: a door may have been opened since
+        # a door may have been opened since
         b.gavekeys = had;
         b.gaveup   = 0;
         b.gavetill = 0;
@@ -1581,11 +1637,11 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     for (tries < 4 && g.navsecrets > 0) {
         tries = tries + 1;
         var pick: i32 = -1;
-        if (b.want >= 0 && g.lv.sectors[g.navsecret[b.want]].special == 9 && (b.gaveup & (1 << b.want:~u32)) == 0 && !lost(g, g.navsecretx[b.want], g.navsecrety[b.want])) { pick = b.want; }
+        if (b.want >= 0 && g.lv.sectors[g.navsecret[b.want]].special == 9 && (b.gaveup & (1 << b.want:~u32)) == 0 && b.struck[b.want]::i32 < SECRET_TRIES && !lost(g, g.navsecretx[b.want], g.navsecrety[b.want])) { pick = b.want; }
         var k: i32 = 0;
         for (k < g.navsecrets && pick < 0) {
             val at: i32 = (k + playernum * 5) % g.navsecrets;
-            if (g.lv.sectors[g.navsecret[at]].special == 9 && (b.gaveup & (1 << at:~u32)) == 0 && !lost(g, g.navsecretx[at], g.navsecrety[at])) { pick = at; }
+            if (g.lv.sectors[g.navsecret[at]].special == 9 && (b.gaveup & (1 << at:~u32)) == 0 && b.struck[at]::i32 < SECRET_TRIES && !lost(g, g.navsecretx[at], g.navsecrety[at])) { pick = at; }
             k = k + 1;
         }
         if (pick < 0) { brk; }
@@ -1601,6 +1657,7 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
             val to: i32 = solve_to(g, me, b, g.navsecretx[pick], g.navsecrety[pick], g.navsecretx[pick], g.navsecrety[pick], have);
             if (b.haveway && !unsure) { ret to; }
         }
+        if ((b.gaveup & (1 << pick:~u32)) == 0 && b.struck[pick] < 255) { b.struck[pick] = (b.struck[pick]::i32 + 1)::u8; }
         b.gaveup = b.gaveup | (1 << pick:~u32);
     }
 
@@ -1625,37 +1682,6 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
                 if (stalling(g, b, me, friend.x, friend.y)) { give_up(g, b, friend.x, friend.y); }
                 or { ret to; }
             }
-        }
-    }
-
-    # Then, until it is time to leave, the monsters: the nearest one alive
-    # it has not given up on, one it has circled without ever reaching
-    # counted given up
-    if (g.leveltime < LEAVE) {
-        var prey:     *Mobj = nil;
-        var bestdist: i32   = 0x7fffffff;
-        var th: *defs.Thinker = g.thinkercap.next;
-        for (th != ?g.thinkercap) {
-            if (th.kind == defs.TH_MOBJ) {
-                val mo: *Mobj = th:~*Mobj;
-                if ((mo.flags & defs.MF_COUNTKILL) != 0 && mo.health > 0 && !given_up(g, b, mo.x, mo.y) && !lost(g, mo.x, mo.y)) {
-                    val dist: i32 = distance(me, mo.x, mo.y);
-                    if (dist < bestdist) {
-                        prey     = mo;
-                        bestdist = dist;
-                    }
-                }
-            }
-            th = th.next;
-        }
-        if (prey != nil) {
-            b.after = 2;
-            val to: i32 = solve_to(g, me, b, prey.x, prey.y, prey.x, prey.y, have);
-            if (b.haveway) {
-                if (stalling(g, b, me, prey.x, prey.y)) { give_up(g, b, prey.x, prey.y); }
-                or { ret to; }
-            }
-            or { give_up(g, b, prey.x, prey.y); }
         }
     }
 
@@ -1744,7 +1770,13 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     }
     # none: the exit anyway, on trust
     b.after = 3;
-    ret solve_to(g, me, b, x, y, fx, fy, have);
+    val trusted: i32 = solve_to(g, me, b, x, y, fx, fy, have);
+    if (b.haveway || n == 0) { ret trusted; }
+    # And when not even trust finds a way out, for the way out is behind a
+    # door its key opens, the nearest key, on trust, given up on or not. A
+    # team without it once wandered the last two minutes of every E1M2.
+    b.after = 4;
+    ret solve_to(g, me, b, keys[0].x, keys[0].y, keys[0].x, keys[0].y, have);
 }
 
 # the bearing of a place a few cells along the shortest walk to a place,
@@ -2205,6 +2237,79 @@ fun shy(g: *Game, playernum: i32, b: *Bot) {
 
 # ------------------------------------------------------------------ thinking
 
+# A net learns as it goes. The last eight things it decided are kept, and
+# what happens to it is laid at their door: a secret, a key, a kill, ground
+# made toward the exit, a wound, a death — each nudges the weights from the
+# hidden units to the outputs it chose, so that given the same senses it
+# would say the same louder or softer, and often enough the other way. A
+# death is the deepest cut, and it falls on what it did nearest the end.
+#
+# Only the output layer moves. The features the hidden units learned by
+# imitation are worth keeping whatever a match turns out to reward, and a
+# change there is a change everywhere; the outputs are what the features
+# mean to do. And all of it is the integers everything here is done in,
+# over what the bot itself sensed and decided — nothing outside the game
+# is read, so every machine computes the same learning.
+#
+# r: what the thing that happened was worth, positive or negative
+val LEARN_SHIFT: i32 = 12;
+
+fun learn(g: *Game, b: *Bot, r: i32) {
+    if (r == 0 || b.kind != KIND_NET || b.shy || g.deathmatch != 0 || b.tn == 0) { ret; }
+    # the change to make is gathered over every decision remembered before
+    # any of it is made: the newest counts most, the oldest a ninth of it
+    var acc: [150]i32;
+    var s:   i32 = 0;
+    for (s < b.tn) {
+        val at: i32 = (b.tpos + 7 - s) % 8;
+        val w:  i32 = b.tn - s;
+        var hid: [24]i32;
+        var j:   i32 = 0;
+        for (j < HIDDEN) {
+            var sum: i32 = b.net[INPUTS * HIDDEN + j]::i32 * 64;
+            var i:   i32 = 0;
+            for (i < INPUTS) {
+                sum = sum + b.net[j * INPUTS + i]::i32 * b.tfeat[at * INPUTS + i];
+                i   = i + 1;
+            }
+            hid[j] = clamp(sum >> 6, 0, 127);
+            j      = j + 1;
+        }
+        var k: i32 = 0;
+        for (k < OUTPUTS) {
+            val o: i32 = b.tout[at * OUTPUTS + k];
+            if (o != 0) {
+                var sgn: i32 = 1;
+                if (o < 0) { sgn = -1; }
+                val push: i32 = r * w * sgn;
+                j = 0;
+                for (j < HIDDEN) {
+                    acc[k * HIDDEN + j] = acc[k * HIDDEN + j] + push * hid[j];
+                    j                   = j + 1;
+                }
+                # a bias is a weight on an input of 64
+                acc[HIDDEN * OUTPUTS + k] = acc[HIDDEN * OUTPUTS + k] + push * 64;
+            }
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+    val base: i32 = INPUTS * HIDDEN + HIDDEN;
+    var k:    i32 = 0;
+    for (k < HIDDEN * OUTPUTS + OUTPUTS) {
+        var d: i32 = acc[k];
+        if (d >= 0) { d = (d + 2048) >> LEARN_SHIFT; }
+        or          { d = -((2048 - d) >> LEARN_SHIFT); }
+        if (d != 0) {
+            var v: i32 = b.net[base + k]::i32 + d;
+            if (v > 127)  { v = 127; }
+            if (v < -128) { v = -128; }
+            b.net[base + k] = v::i8;
+        }
+        k = k + 1;
+    }
+}
+
 # one tic of a bot: its command
 # ---
 # g:         the game
@@ -2215,6 +2320,44 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     var blank: Ticcmd;
     @cmd = blank;
     val p: *Player = ?g.players[playernum];
+
+    # what it learns by, in co-op, before anything: what the world did to
+    # it since it last thought — a death, a wound, a kill, a secret, a key
+    if (b.kind == KIND_NET && g.deathmatch == 0) {
+        if (b.primed) {
+            if (p.playerstate == defs.PST_DEAD && b.wstate != defs.PST_DEAD) { learn(g, b, -8); }
+            val hurt: i32 = b.whealth - p.health;
+            if (hurt > 0) {
+                var r: i32 = 0 - (hurt + 19) / 20;
+                if (r < -4) { r = -4; }
+                learn(g, b, r);
+            }
+            if (p.killcount > b.wkills)    { learn(g, b, 3 * (p.killcount - b.wkills)); }
+            if (p.secretcount > b.wsecret) { learn(g, b, 10 * (p.secretcount - b.wsecret)); }
+            var cards: i32 = 0;
+            var c:     i32 = 0;
+            for (c < 6) {
+                if (p.cards[c]) { cards = cards + 1; }
+                c = c + 1;
+            }
+            if (cards > b.wkeys) { learn(g, b, 5 * (cards - b.wkeys)); }
+            b.wkeys = cards;
+        }
+        or {
+            var cards: i32 = 0;
+            var c:     i32 = 0;
+            for (c < 6) {
+                if (p.cards[c]) { cards = cards + 1; }
+                c = c + 1;
+            }
+            b.wkeys  = cards;
+            b.primed = 1;
+        }
+        b.wstate  = p.playerstate;
+        b.whealth = p.health;
+        b.wkills  = p.killcount;
+        b.wsecret = p.secretcount;
+    }
     if (p.mo == nil) { ret; }
 
     # dead: press use, off and on, to come back
@@ -2233,6 +2376,19 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         }
         or (b.kind == KIND_NET) {
             forward(?b.net[0], ?b.feat[0], ?b.out[0]);
+            # and remember it, for what happens next to be laid at its door
+            var r: i32 = 0;
+            for (r < INPUTS) {
+                b.tfeat[b.tpos * INPUTS + r] = b.feat[r];
+                r                            = r + 1;
+            }
+            r = 0;
+            for (r < OUTPUTS) {
+                b.tout[b.tpos * OUTPUTS + r] = b.out[r];
+                r                            = r + 1;
+            }
+            b.tpos = (b.tpos + 1) % 8;
+            if (b.tn < 8) { b.tn = b.tn + 1; }
         }
         or {
             script(?b.feat[0], ?b.out[0]);
@@ -2380,12 +2536,13 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     # passed.
     if (b.usewait > 0) { b.usewait = b.usewait - 1; }
     # and a bot playing the level does not throw the switch that ends it
-    # before it is time, nor ever the one to the secret level
+    # while it still believes in a secret, nor ever the one to the secret
+    # level
     # A bot following a person never throws either: when the level ends is
     # the person's to say.
     var hold: bool = 0;
     if (b.alone && b.useexit) {
-        hold = g.leveltime < LEAVE || g.lv.lines[rayline_of(g, p.mo)].special == 51;
+        hold = secrets_left(g, b) || g.lv.lines[rayline_of(g, p.mo)].special == 51;
     }
     if (b.led && b.useexit) { hold = 1; }
     if (b.out[O_USE] > 0 && looking && b.usewait == 0 && b.usable && !hold) {
