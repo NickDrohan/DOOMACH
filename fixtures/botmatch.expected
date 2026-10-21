@@ -1,12 +1,12 @@
-bot 1 frags 1 deaths 2 suicides 0 shots 488 uses 3 health 95
-bot 2 frags 1 deaths 2 suicides 0 shots 492 uses 2 health 102
-bot 3 frags 3 deaths 2 suicides 1 shots 553 uses 0 health 53
-bot 4 frags 1 deaths 1 suicides 0 shots 409 uses 4 health 50
+bot 1 frags 1 deaths 2 suicides 0 shots 519 uses 1 health 18
+bot 2 frags 3 deaths 3 suicides 0 shots 633 uses 2 health 40
+bot 3 frags 1 deaths 2 suicides 0 shots 467 uses 0 health 10
+bot 4 frags 3 deaths 1 suicides 0 shots 711 uses 0 health 27
 announcer: first blood 1 quick kills 0 sprees 0
-end tic 2100 sum 358546084 map E1M1
-bot 1 frags 3 deaths 4 suicides 0 shots 521 uses 1 health 70
-bot 2 frags 4 deaths 3 suicides 0 shots 485 uses 2 health 25
-bot 3 frags 4 deaths 2 suicides 0 shots 532 uses 4 health 60
-bot 4 frags 1 deaths 3 suicides 0 shots 335 uses 2 health 100
-announcer: first blood 1 quick kills 2 sprees 0
-end tic 2100 sum 2883018268 map E1M8
+end tic 2100 sum 2214297763 map E1M1
+bot 1 frags 3 deaths 2 suicides 0 shots 458 uses 2 health 20
+bot 2 frags 3 deaths 3 suicides 0 shots 369 uses 3 health 100
+bot 3 frags 4 deaths 2 suicides 0 shots 385 uses 2 health 95
+bot 4 frags 0 deaths 4 suicides 1 shots 368 uses 1 health 100
+announcer: first blood 1 quick kills 1 sprees 0
+end tic 2100 sum 2952234348 map E1M8

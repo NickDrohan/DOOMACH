@@ -154,6 +154,10 @@ pub rec Bot {
     haveway:  bool;
     wayx:     Fixed;
     wayy:     Fixed;
+    # whether it has closed with the enemy in sight: what it has closed
+    # with it fights out to the end of sight, what it is passing by stays
+    # passed — the line between fighting and passing must not flutter
+    engaged:  bool;
 
     # tics until it may press use again, and whether there is something
     # within reach ahead to use
@@ -238,6 +242,7 @@ pub rec Bot {
     wkills:  i32;
     wsecret: i32;
     wkeys:   i32;
+    warmed:  i32;
     primed:  bool;
 }
 
@@ -458,21 +463,47 @@ fun takes(g: *Game, p: *Player, mo: *Mobj) bool {
     ret 1;
 }
 
-# the nearest thing to pick up within reach that it would take, can see and
-# can walk to
+# what a thing on the floor is worth going for, beside how far off it is.
+# A weapon it does not have outbids everything but a hurt worse; then a
+# powerup, and the spheres that heal over the top; then health, the more
+# the worse it is hurt; then armour; then ammunition; and whatever else
+# is picked up is picked up on the way, not gone out of the way for.
+fun worth(g: *Game, p: *Player, mo: *Mobj) i32 {
+    val sprite: i32 = mo.sprite;
+    if (g.netgame && g.deathmatch != 2) {
+        if (sprite == info.SPR_SHOT || sprite == info.SPR_MGUN || sprite == info.SPR_LAUN ||
+            sprite == info.SPR_CSAW || sprite == info.SPR_PLAS || sprite == info.SPR_BFUG) { ret 300; }
+    }
+    if (sprite == info.SPR_STIM || sprite == info.SPR_MEDI || sprite == info.SPR_BON1) {
+        if (p.health < 40) { ret 290; }
+        if (p.health < 75) { ret 160; }
+        ret 70;
+    }
+    if (sprite == info.SPR_SOUL || sprite == info.SPR_MEGA || sprite == info.SPR_PINV ||
+        sprite == info.SPR_PINS || sprite == info.SPR_PSTR || sprite == info.SPR_SUIT ||
+        sprite == info.SPR_PMAP || sprite == info.SPR_PVIS) { ret 260; }
+    if (sprite == info.SPR_ARM1 || sprite == info.SPR_ARM2 || sprite == info.SPR_BON2) { ret 140; }
+    if (sprite == info.SPR_CLIP || sprite == info.SPR_AMMO || sprite == info.SPR_SHEL ||
+        sprite == info.SPR_SBOX || sprite == info.SPR_ROCK || sprite == info.SPR_BROK) { ret 110; }
+    ret 90;
+}
+
+# the best thing to pick up it would take, can see and can walk to: the
+# most it is worth less the walk, not merely the nearest — a clip at its
+# feet does not beat the shotgun across the room
 fun find_item(g: *Game, p: *Player) *Mobj {
     val me: *Mobj = p.mo;
-    var best:     *Mobj = nil;
-    var bestdist: i32   = 768;
+    var best:      *Mobj = nil;
+    var bestscore: i32   = 0;
     var th: *defs.Thinker = g.thinkercap.next;
     for (th != ?g.thinkercap) {
         if (th.kind == defs.TH_MOBJ) {
             val mo: *Mobj = th:~*Mobj;
             if ((mo.flags & defs.MF_SPECIAL) != 0) {
-                val d: i32 = distance(me, mo.x, mo.y);
-                if (d < bestdist && takes(g, p, mo) && !lost(g, mo.x, mo.y)) {
-                    best     = mo;
-                    bestdist = d;
+                val score: i32 = worth(g, p, mo) * 8 - distance(me, mo.x, mo.y);
+                if (score > bestscore && takes(g, p, mo) && !lost(g, mo.x, mo.y)) {
+                    best      = mo;
+                    bestscore = score;
                 }
             }
         }
@@ -2332,7 +2363,9 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
                 if (r < -4) { r = -4; }
                 learn(g, b, r);
             }
-            if (p.killcount > b.wkills)    { learn(g, b, 3 * (p.killcount - b.wkills)); }
+            # a kill is worth a little; on Nightmare the dead rise again
+            # and a level is won by the way out of it, not by the body count
+            if (p.killcount > b.wkills)    { learn(g, b, p.killcount - b.wkills); }
             if (p.secretcount > b.wsecret) { learn(g, b, 10 * (p.secretcount - b.wsecret)); }
             var cards: i32 = 0;
             var c:     i32 = 0;
@@ -2342,6 +2375,16 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
             }
             if (cards > b.wkeys) { learn(g, b, 5 * (cards - b.wkeys)); }
             b.wkeys = cards;
+            # an arm it did not have before, and health when it was hurt
+            var armed: i32 = 0;
+            var w:     i32 = 0;
+            for (w < 8) {
+                if (p.weaponowned[w]) { armed = armed + 1; }
+                w = w + 1;
+            }
+            if (armed > b.warmed) { learn(g, b, 4 * (armed - b.warmed)); }
+            b.warmed = armed;
+            if (p.health > b.whealth && b.whealth < 60) { learn(g, b, 2); }
         }
         or {
             var cards: i32 = 0;
@@ -2350,7 +2393,14 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
                 if (p.cards[c]) { cards = cards + 1; }
                 c = c + 1;
             }
-            b.wkeys  = cards;
+            b.wkeys = cards;
+            var armed: i32 = 0;
+            var w:     i32 = 0;
+            for (w < 8) {
+                if (p.weaponowned[w]) { armed = armed + 1; }
+                w = w + 1;
+            }
+            b.warmed = armed;
             b.primed = 1;
         }
         b.wstate  = p.playerstate;
@@ -2428,6 +2478,25 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         fire    = b.feat[F_CLOSE] >= MELEE_CLOSE && b.feat[F_BEARING] > -10 && b.feat[F_BEARING] < 10;
     }
 
+    # And in co-op a monster only far off is not a reason to stand: with a
+    # way to walk it walks it, shooting when its sights happen across what
+    # is out there. What is near is fought; what is far is walked past —
+    # on Nightmare the dead rise again, and the way out is the win, not
+    # the body count. It closes when the enemy is about a thousand units
+    # off and walks on again only well past that, so it does not flutter
+    # between the two on every look.
+    if (g.deathmatch == 0) {
+        if (b.feat[F_SEEN] == 0 || b.feat[F_CLOSE] < 40) { b.engaged = 0; }
+        or (b.feat[F_CLOSE] >= 64) { b.engaged = 1; }
+    }
+    if (g.deathmatch == 0 && !b.shy && b.haveway && !b.engaged && b.feat[F_SEEN] > 0 && p.readyweapon != defs.WP_FIST && p.readyweapon != defs.WP_CHAINSAW) {
+        forward = 100;
+        side    = 0;
+        turn    = clamp(b.feat[F_PATH] * 6, -127, 127);
+        if (b.feat[F_PATH] > -8 && b.feat[F_PATH] < 8) { turn = 0; }
+        if (b.feat[F_PATH] > 32 || b.feat[F_PATH] < -32) { forward = 40; }
+    }
+
     # In co-op, whatever decided: not into slime and not into a pit, unless
     # the way it has chosen goes there or it is standing in one already.
     # Sidestepping in a fight and backing off a wall walked bots into acid,
@@ -2464,6 +2533,10 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         # and none at all at nothing: with no enemy in sight a shot only
         # ever meets a wall or a friend, and friends crowd a respawn room
         if (b.feat[F_SEEN] == 0) { fire = 0; }
+        # and none aimed wide of one: a shot beside the mark is ammunition
+        # spent on a wall, or worse on a friend — the arm aims before it
+        # fires, fists and the saw excepted, which want a swing not a sight
+        if (b.feat[F_SEEN] > 0 && (b.feat[F_BEARING] > 12 || b.feat[F_BEARING] < -12) && p.readyweapon != defs.WP_FIST && p.readyweapon != defs.WP_CHAINSAW) { fire = 0; }
         var foe: i32 = 0x7fffffff;
         if (b.feat[F_SEEN] > 0) { foe = (127 - b.feat[F_CLOSE]) * 16; }
         var i: i32 = 0;

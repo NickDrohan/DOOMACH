@@ -246,15 +246,17 @@ two things to do, in order:
 
 **They learn as they go.** A net keeps the last eight things it decided — the senses it had
 and what it made of them — and what the world does to it next is laid at their door. A secret
-found, a key picked up, a kill, ground made toward the exit: the decisions nearest in time are
-reinforced, the newest counting most. A wound is held against them a little, a death a lot —
-the deepest cut falling on what it did nearest the end. Only the output layer moves, and all
-in the integers everything here is done in, over what the bot itself sensed and decided:
-nothing outside the game is read, so every machine computes the same learning and the game
-stays in step (`bot.learn`). The net a bot ends a level with is the net it begins the next
-with, and what it learned in a campaign is kept in its member when the campaign ends.
+found, a key picked up, an arm it did not have, health when it was hurt, ground made toward
+the exit: the decisions nearest in time are reinforced, the newest counting most. A kill is
+worth a little — on Nightmare the dead rise again, and the way out is the win, not the body
+count — a wound is held against them a little, a death a lot, the deepest cut falling on what
+it did nearest the end. Only the output layer moves, and all in the integers everything here
+is done in, over what the bot itself sensed and decided: nothing outside the game is read, so
+every machine computes the same learning and the game stays in step (`bot.learn`). The net a
+bot ends a level with is the net it begins the next with, and what it learned in a campaign
+is kept in its member when the campaign ends.
 
-**Slime, pits, doors and friends.** Four things every co-op bot does whatever decided, because
+**Slime, pits, doors and friends.** Five things every co-op bot does whatever decided, because
 a net that never learned them is a danger to itself and to its team:
 
 - *It keeps out of slime.* Cells whose floor hurts are marked on the walk grid, and so are
@@ -276,6 +278,14 @@ a net that never learned them is a danger to itself and to its team:
   line, looking and moving that way, presses use on it — where before only the script did,
   and a net bot waited on its net to think of it on a looking tic, and so circled a door
   it knew how to open. It still leaves the level's own exits alone where it should.
+- *It walks past what is merely far.* A monster near enough is fought; one only far off is
+  walked past on the way it was already going, shot when the sights happen across it — and
+  shots are taken only in the sights: nothing fired wide of the mark at a wall, or worse at
+  a friend. What it has closed with it fights out to the end of sight, and what it is
+  passing stays passed until near, so the line between the two does not flutter.
+- *It goes for what it needs.* Whatever is nearest is not what is worth most: an arm it does
+  not have outbids everything but a worse hurt, a powerup next, health the worse it is hurt,
+  armour, then ammunition — a clip at its feet does not beat the shotgun across the room.
 - *It leaves the exit to a person*, as below.
 
 **A steady hand.** A bot decides every fourth tic and holds what it decided. The script asks

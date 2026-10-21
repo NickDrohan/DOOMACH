@@ -1289,7 +1289,7 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
             # Co-op is rated on what a bot did to get the team on: see
             # coop_reward. The levels finished are the same for all four,
             # so they do not tell them apart and are left out here.
-            tally[i].score = tally[i].frags + 25 * tally[i].secrets + tally[i].progress + 15 * tally[i].keys + 30 * tally[i].doors + 8 * tally[i].worked - 3 * tally[i].deaths;
+            tally[i].score = tally[i].frags / 2 + 25 * tally[i].secrets + 2 * tally[i].progress + 15 * tally[i].keys + 30 * tally[i].doors + 8 * tally[i].worked - 3 * tally[i].deaths;
         }
         i = i + 1;
     }
