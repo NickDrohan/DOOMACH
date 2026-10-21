@@ -254,8 +254,8 @@ nothing outside the game is read, so every machine computes the same learning an
 stays in step (`bot.learn`). The net a bot ends a level with is the net it begins the next
 with, and what it learned in a campaign is kept in its member when the campaign ends.
 
-**Slime, pits and friends.** Three things every co-op bot does whatever decided, because a net
-that never learned them is a danger to itself and to its team:
+**Slime, pits, doors and friends.** Four things every co-op bot does whatever decided, because
+a net that never learned them is a danger to itself and to its team:
 
 - *It keeps out of slime.* Cells whose floor hurts are marked on the walk grid, and so are
   pits: cells the level's exit cannot be walked to from. A way is looked for first that never
@@ -267,8 +267,15 @@ that never learned them is a danger to itself and to its team:
   the slime 257 times in eight minutes; now 17.
 - *It does not shoot through a friend.* Fire is held while another player stands in the line
   of it, nearer than the target or not much farther; the nearer the friend, the wider they
-  stand. Four bots hit each other 17, 23 and 50 times a match on E1M1, E1M2 and E1M5 before;
-  7, 7 and 5 now. What is left is mostly shots already in the air when a friend steps in.
+  stand. And with no enemy in sight at all it does not fire: a wandering shot in a sealed
+  room finds a friend more often than not. Four bots hit each other 17, 23 and 50 times a
+  match on E1M1, E1M2 and E1M5 before; 7, 7 and 5 now, and a net bot half that again. What
+  is left is mostly shots already in the air when a friend steps in.
+- *A door it can open, it opens.* The walk grid routes a bot to the face of a door or a
+  switch it can use; whatever decided where to walk, a bot standing in reach of such a
+  line, looking and moving that way, presses use on it — where before only the script did,
+  and a net bot waited on its net to think of it on a looking tic, and so circled a door
+  it knew how to open. It still leaves the level's own exits alone where it should.
 - *It leaves the exit to a person*, as below.
 
 **A steady hand.** A bot decides every fourth tic and holds what it decided. The script asks

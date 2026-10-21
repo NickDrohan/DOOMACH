@@ -2461,6 +2461,9 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     # player stands in the line of it, nearer than whatever is being shot at
     # or not much farther. The nearer the friend, the wider they stand.
     if (g.deathmatch == 0 && fire) {
+        # and none at all at nothing: with no enemy in sight a shot only
+        # ever meets a wall or a friend, and friends crowd a respawn room
+        if (b.feat[F_SEEN] == 0) { fire = 0; }
         var foe: i32 = 0x7fffffff;
         if (b.feat[F_SEEN] > 0) { foe = (127 - b.feat[F_CLOSE]) * 16; }
         var i: i32 = 0;
@@ -2545,7 +2548,14 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         hold = secrets_left(g, b) || g.lv.lines[rayline_of(g, p.mo)].special == 51;
     }
     if (b.led && b.useexit) { hold = 1; }
-    if (b.out[O_USE] > 0 && looking && b.usewait == 0 && b.usable && !hold) {
+    # Whatever decided, a usable line within reach dead ahead — a shut door,
+    # a switch, a lift — is meant to be worked, and moving with it in its
+    # face is asking it to open. Left to the decision alone a net that never
+    # learned the press circles the room until chance presses it instead.
+    # The exit switch is excepted for a bot not playing the level itself:
+    # when the level ends is the person's to say, or the decision's.
+    var press: bool = b.out[O_USE] > 0 || ((forward != 0 || side != 0) && (b.alone || !b.useexit));
+    if (press && looking && b.usewait == 0 && b.usable && !hold) {
         buttons   = buttons | defs.BT_USE;
         b.uses    = b.uses + 1;
         b.usewait = USE_WAIT;
