@@ -393,6 +393,10 @@ place. In the co-op league, where a match is nine levels, the trial is level by 
 as each level ends it is played again from where it began, each learner a mutant of the net
 it began that level with, and a mutant that clearly outdid it there goes on as the bot —
 as the mutant ended the level, what it learned in the winning kept — for the levels to come.
+The replay does not hold the campaign up: it is played a slice at a time beside the level
+that follows, and a kept mutant takes its seat as the level after that begins — a bot's net
+is never changed in the middle of a level, where a game that joined the campaign would see
+a different bot from the one published.
 A deathmatch is still chaos, so some mutants are kept by luck;
 what sorts those out is the rating, and inheritance: every fifth match, in one style, the
 lowest-rated learner takes the net of the highest-rated if they are sixty points apart. And

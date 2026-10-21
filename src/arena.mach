@@ -103,11 +103,14 @@ val MATCH: i32 = 4200;
 val MAPS: [7]i32 = [7]i32{1, 2, 3, 4, 7, 8, 9};
 
 # the co-op league: a level of a campaign has no time limit, only the
-# ceiling against what no one has thought of (game.stalled), an hour
+# ceiling against what no one has thought of (game.stalled), half an hour
 val COOPMATCH: i32 = 30 * 60 * 35;
-# the trial between a campaign's levels is a replay of a level just done,
-# run hotter than the league's share so the next level is published soon
+# the trial between a campaign's levels is a replay of the level just
+# done, played beside the next level a slice at a time at a hotter share,
+# so the next level is published at once instead of after the replay
 val TRIAL_DUTY: i64 = 50;
+# the trial's tics played for each of the level's own, beside it
+val TRIAL_TICS: i32 = 8;
 # the levels of a campaign
 val CAMPAIGN: i32 = 9;
 val COOP_NAMES: [11]str = [11]str{
@@ -814,12 +817,33 @@ fun level_tally(s: *game.Session, keys: *i32, deaths: *i32, out: *Tally) {
 # that level, in the very same level, takes the bot's place for the levels
 # to come. Nine chances a campaign for each bot, where a whole campaign
 # played again gave one, and a long campaign none.
+#
+# The replay does not hold the campaign up: it is set going as its level
+# ends (trial_setup) and played a slice at a time beside the level that
+# follows it (trial_slice), scored when it finishes (trial_over). What it
+# keeps is seated only as a level begins (trial_apply), never in the
+# middle of one — a game that joined the campaign replays each level with
+# the nets it was published with, and a bot's net changed mid-level would
+# be a different game from the one published.
 var trial_s: *game.Session;
 # the nets each level began with, kept for the mutants to be of: what the
 # bots learned in the level itself is a different matter, kept in theirs
 var lvstart: [4 * 942]i8;
+# the trial under way, if there is one: its session is trial_s, its deaths
+# and keys counted as the level's own are
+var trial_on: bool;
+var tbegan:   i64;
+var tdead:    [4]bool;
+var tdied:    [4]i32;
+var theld:    [4]i32;
+var twas:     [4]Tally;
+# kept mutants not yet seated: they take their seats at the next level's
+# beginning (trial_apply), a level later than the level that won them
+var tkeep:    [4 * 942]i8;
+var tkeep_on: [4]bool;
 
-fun level_trial(s: *game.Session, l: *League, picks: *i32, seeds: *u32, map: i32, carried: *u8, was: *Tally) {
+fun trial_setup(l: *League, picks: *i32, seeds: *u32, map: i32, carried: *u8, was: *Tally) {
+    trial_on = 0;
     if (trial_s == nil) { ret; }
     val t: *game.Session = trial_s;
     var any: bool = 0;
@@ -850,44 +874,64 @@ fun level_trial(s: *game.Session, l: *League, picks: *i32, seeds: *u32, map: i32
         i = i + 1;
     }
     game.campaign_bots(t);
+    i = 0;
+    for (i < 4) {
+        tdead[i] = 0;
+        tdied[i] = 0;
+        theld[i] = 0;
+        twas[i]  = was[i];
+        i        = i + 1;
+    }
+    tbegan   = millis();
+    trial_on = 1;
+}
 
-    var cmds:  [4]defs.Ticcmd;
-    var dead:  [4]bool;
-    var died:  [4]i32;
-    var held:  [4]i32;
-    var began: i64 = millis();
-    var tic:   i32 = 0;
-    for (!t.completed && !t.broken) {
+# n of the trial's tics, or fewer if it ends first; hot is set when the
+# trial is being waited on rather than played beside a level, and paces
+# the work itself
+fun trial_slice(n: i32, hot: bool) {
+    val t: *game.Session = trial_s;
+    var cmds: [4]defs.Ticcmd;
+    var k:    i32 = 0;
+    for (k < n && trial_on && !t.completed && !t.broken) {
         game.ticker_cmds(t, ?cmds[0]);
-        i = 0;
+        var i: i32 = 0;
         for (i < 4) {
             val gone: bool = t.g.players[i].playerstate == defs.PST_DEAD;
-            if (gone && !dead[i]) { died[i] = died[i] + 1; }
-            dead[i] = gone;
+            if (gone && !tdead[i]) { tdied[i] = tdied[i] + 1; }
+            tdead[i] = gone;
             var cards: i32 = 0;
             var c:     i32 = 0;
             for (c < 6) {
                 if (t.g.players[i].cards[c]) { cards = cards + 1; }
                 c = c + 1;
             }
-            if (cards > held[i]) { held[i] = cards; }
+            if (cards > theld[i]) { theld[i] = cards; }
             i = i + 1;
         }
-        tic = tic + 1;
-        if (tic % 350 == 0) {
-            beat();
-            rest(began, TRIAL_DUTY);
-            began = millis();
-        }
+        k = k + 1;
     }
+    if (t.completed || t.broken) { trial_on = 0; }
+    if (hot) {
+        beat();
+        rest(tbegan, TRIAL_DUTY);
+        tbegan = millis();
+    }
+}
+
+# the trial is over: a mutant that earned clearly more of what its style
+# wants, in the very same level, is kept to take the bot's place — as a
+# level begins (trial_apply), not in the middle of one
+fun trial_over(l: *League, picks: *i32) {
+    val t: *game.Session = trial_s;
     if (t.broken) { ret; }
     var now: [4]Tally;
-    level_tally(t, ?held[0], ?died[0], ?now[0]);
-    i = 0;
+    level_tally(t, ?theld[0], ?tdied[0], ?now[0]);
+    var i: i32 = 0;
     for (i < 4) {
         val m: *Member = ?l.members[picks[i]];
         if (m.kind == KIND_LEARNS) {
-            val before: i32 = reward(m.style, ?was[i]);
+            val before: i32 = reward(m.style, ?twas[i]);
             val after:  i32 = reward(m.style, ?now[i]);
             # clearly more: by a twentieth and five, so that a coin's fall
             # is less often taken for a lesson
@@ -899,20 +943,45 @@ fun level_trial(s: *game.Session, l: *League, picks: *i32, seeds: *u32, map: i32
                 kept         = kept + 1;
                 # and the bot itself goes on as the mutant — as the mutant
                 # ended the level, what it learned in the winning kept:
-                # the level it won is behind it either way. The change is
-                # made between levels, so a game that joined the campaign
-                # sees it in the next one published.
+                # the level it won is behind it either way
                 var k: i32 = 0;
                 for (k < NET) {
-                    m.net[k]         = t.bots[i].net[k];
-                    s.bots[i].net[k] = t.bots[i].net[k];
-                    k                = k + 1;
+                    tkeep[i * NET + k] = t.bots[i].net[k];
+                    k                  = k + 1;
                 }
+                tkeep_on[i] = 1;
             }
         }
         i = i + 1;
     }
-    rest(began, TRIAL_DUTY);
+}
+
+# kept mutants take their seats: between levels only, so a game that
+# joined the campaign sees the change in the next level published
+fun trial_apply(s: *game.Session, l: *League, picks: *i32) {
+    var i: i32 = 0;
+    for (i < 4) {
+        if (tkeep_on[i]) {
+            val m: *Member = ?l.members[picks[i]];
+            var k: i32 = 0;
+            for (k < NET) {
+                m.net[k]         = tkeep[i * NET + k];
+                s.bots[i].net[k] = tkeep[i * NET + k];
+                k                = k + 1;
+            }
+            tkeep_on[i] = 0;
+        }
+        i = i + 1;
+    }
+}
+
+# wait on a trial still playing: the level that followed it is over, or
+# the campaign is, and it cannot take longer than the level it replays
+fun trial_wait(l: *League, picks: *i32) {
+    for (trial_on) {
+        trial_slice(350, 1);
+        if (!trial_on) { trial_over(l, picks); }
+    }
 }
 
 # a level of a campaign is over: add what each of the four did in it to
@@ -981,6 +1050,13 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
         tally[i] = blank;
         i        = i + 1;
     }
+    # no trial carries into a match from the match before
+    trial_on = 0;
+    i        = 0;
+    for (i < 4) {
+        tkeep_on[i] = 0;
+        i           = i + 1;
+    }
 
     if (coop) { watch_lines(s); }
 
@@ -1018,6 +1094,12 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
         if (coop && !again) { publish(s, l, picks, seeds, nets, carried); }
     for (!s.completed && !s.broken && (coop || tic < length)) {
         game.ticker_cmds(s, ?cmds[0]);
+        # the level before's trial, playing on beside this one; what it
+        # keeps is seated when this level ends
+        if (trial_on) {
+            trial_slice(TRIAL_TICS, 0);
+            if (!trial_on) { trial_over(l, picks); }
+        }
         # A campaign is played a slice of ten seconds at a time, with its
         # rest after each, so that it goes through a level at an even pace
         # and can say at any moment how far it has got; a game joining it
@@ -1026,7 +1108,10 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
         if (coop && level_tic % 350 == 0) {
             if (!again) { progress(s.g.gamemap, level_tic); }
             beat();
-            rest(level_began, share);
+            # the work's share rises while a trial plays beside the level
+            var pacing: i64 = share;
+            if (trial_on) { pacing = TRIAL_DUTY; }
+            rest(level_began, pacing);
             level_began = millis();
         }
         # a locked door that has opened, or a line that has done its one
@@ -1121,7 +1206,12 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
             i              = i + 1;
         }
         level_tally(s, ?held[0], ?lived[0], ?mine[0]);
-        level_trial(s, l, picks, seeds, s.g.gamemap, carried, ?mine[0]);
+        # the trial that played beside this level is finished if it has
+        # not finished already, its kept mutants take their seats, and
+        # this level's own trial is set going to play beside the next
+        trial_wait(l, picks);
+        trial_apply(s, l, picks);
+        trial_setup(l, picks, seeds, s.g.gamemap, carried, ?mine[0]);
         game.carry(s, carried);
         i = 0;
         for (i < 4) {
@@ -1136,6 +1226,10 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
         watch_lines(s);
     }
 
+    # a campaign's last level has its trial too — waited on here, where
+    # the others were waited on by the levels that followed theirs
+    trial_wait(l, picks);
+    trial_apply(s, l, picks);
     # and what the bots learned in the playing is kept in the members the
     # league saves and seeds: each one's standing net ends the match as the
     # net its bot ended it with — but the standing net only, the trial's
@@ -1918,7 +2012,8 @@ fun main(argc: i64, argv: **u8) i64 {
         # the league learns from the match played again with mutants; and
         # then the four have their feelings about it
         val again_began: i64 = millis();
-        # (a campaign has had its trials level by level: level_trial)
+        # (a campaign has had its trials level by level, each beside the
+        # level that followed its own: trial_setup and the rest)
         if (!coop && !relive(s, l, ?picks[0], map, ?tally[0], ?seeds[0], nb.ok:~*i8)) {
             print.eprintln("arena: a map would not load");
             ret 3;

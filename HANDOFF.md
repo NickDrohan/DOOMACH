@@ -147,7 +147,9 @@ check `https://mach-doom-relay.fly.dev/doom.exe.sha256` equals the hash of the e
 Both: 100 members (98 nets, the hand-written "Teacher", a net of noise), Elo rating, eleven
 styles each with its own reward, five "Apprentices" that learn from opted-in human play. Both
 learn by **replaying with mutants** — deathmatch replays the whole match (`arena.mach`,
-`relive`), co-op replays each level from where it began (`level_trial`) — by within-style
+`relive`), co-op replays each level from where it began, played a slice at a time beside
+the level that follows it (`trial_setup`/`trial_slice`/`trial_over`, its kept mutants
+seated as the next level begins, `trial_apply`) — by within-style
 inheritance, and, in co-op, by **learning in the level itself**: each net keeps the last eight
 decisions it made and what befalls it next (a kill, a secret, a key, ground gained, a wound,
 a death) nudges the weights those decisions came from (`bot.learn`). Every bot has a quirk
