@@ -159,8 +159,9 @@
       players.appendChild(span);
     });
     document.getElementById("lastmap").textContent = "on " + board.last.map +
-      (coop ? ": " + board.last.finished + " of 9 levels finished, " + board.last.secrets + " of " +
-        board.last.of + " secrets" : "");
+      (coop ? ": " + board.last.finished + " of 9 levels finished" +
+        ((board.last.gaveup || 0) > 0 ? ", " + board.last.gaveup + " given up on" : "") +
+        ", " + board.last.secrets + " of " + board.last.of + " secrets" : "");
     document.getElementById("meta").textContent =
       board.matches.toLocaleString() + (coop ? " campaigns played · " : " matches played · ") +
       (coop ? board.finished.toLocaleString() + " levels finished · " : "") + "standings updated " +

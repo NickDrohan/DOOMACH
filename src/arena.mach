@@ -207,6 +207,8 @@ rec Tally {
     progress: i32;
     keys:     i32;
     finished: i32;
+    # and the levels the team was moved on from without getting out
+    gaveup:   i32;
     # the secrets this bot was first into, and the team's and the level's
     secrets:  i32;
     found:    i32;
@@ -1012,6 +1014,7 @@ fun level_over(s: *game.Session, tally: *Tally, keys: *i32) {
             tally[i].finished = tally[i].finished + 1;
             if (way > 90) { way = 100; }
         }
+        or { tally[i].gaveup = tally[i].gaveup + 1; }
         tally[i].progress = tally[i].progress + way;
         i                 = i + 1;
     }
@@ -1077,6 +1080,7 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
     # a deathmatch is this once round; a campaign, once a level
     for {
         var level_began: i64 = millis();
+        var level_wall:  i64 = millis();
         var level_tic:   i32 = 0;
         # the nets this level begins with: what the level's mutants are made
         # of, and what a game joining at this level is given to play by
@@ -1219,6 +1223,10 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
             i       = i + 1;
         }
         beat();
+        # and the standings: a campaign is long enough that without a word
+        # at each level's end the page would show a finished one for all of
+        # the next
+        if (coop && keepa != nil) { keep(l, keepa, beatdir, keepfb, keepjb, keeppb, picks, tally, map, millis() - level_wall, 0); }
         rest(level_began, share);
         if (s.wi.finale) { brk; }
         game.world_done(s);
@@ -1710,6 +1718,8 @@ fun board(l: *League, dir: str, buf: *u8, picks: *i32, tally: *Tally, map: i32, 
     }
     at = join(buf, at, "],\"finished\":");
     at = join_number(buf, at, tally[0].finished::i64);
+    at = join(buf, at, ",\"gaveup\":");
+    at = join_number(buf, at, tally[0].gaveup::i64);
     at = join(buf, at, ",\"secrets\":");
     at = join_number(buf, at, tally[0].found::i64);
     at = join(buf, at, ",\"of\":");
@@ -1818,6 +1828,12 @@ fun keep(l: *League, a: *allocator.Allocator, dir: str, fb: *u8, jb: *u8, pb: *u
 # campaign is longer than that, so it is asked after every level.
 var beatdir:  str;
 var lastbeat: i64;
+# what keep() writes with, kept for the calls a campaign makes between its
+# levels: without them the standings would say nothing until it was over
+var keepa:  *allocator.Allocator;
+var keepfb: *u8;
+var keepjb: *u8;
+var keeppb: *u8;
 # the share of a processor this process may use, as a percentage
 var share: i64;
 
@@ -1966,6 +1982,10 @@ fun main(argc: i64, argv: **u8) i64 {
     print.printlnf("arena: playing within {}% of a processor", duty);
     saved   = millis();
     beatdir = dir;
+    keepa   = ?a;
+    keepfb  = fb.ok;
+    keepjb  = jb.ok;
+    keeppb  = pb.ok;
     share   = duty;
     var shown:  bool = 0;
     var played: i64 = 0;
