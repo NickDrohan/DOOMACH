@@ -104,7 +104,10 @@ val MAPS: [7]i32 = [7]i32{1, 2, 3, 4, 7, 8, 9};
 
 # the co-op league: a level of a campaign has no time limit, only the
 # ceiling against what no one has thought of (game.stalled), an hour
-val COOPMATCH: i32 = 60 * 60 * 35;
+val COOPMATCH: i32 = 30 * 60 * 35;
+# the trial between a campaign's levels is a replay of a level just done,
+# run hotter than the league's share so the next level is published soon
+val TRIAL_DUTY: i64 = 50;
 # the levels of a campaign
 val CAMPAIGN: i32 = 9;
 val COOP_NAMES: [11]str = [11]str{
@@ -873,7 +876,7 @@ fun level_trial(s: *game.Session, l: *League, picks: *i32, seeds: *u32, map: i32
         tic = tic + 1;
         if (tic % 350 == 0) {
             beat();
-            rest(began, share);
+            rest(began, TRIAL_DUTY);
             began = millis();
         }
     }
@@ -909,7 +912,7 @@ fun level_trial(s: *game.Session, l: *League, picks: *i32, seeds: *u32, map: i32
         }
         i = i + 1;
     }
-    rest(began, share);
+    rest(began, TRIAL_DUTY);
 }
 
 # a level of a campaign is over: add what each of the four did in it to

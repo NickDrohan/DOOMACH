@@ -633,11 +633,14 @@ pub fun campaign_game(s: *Session, players: i32, me: i32, skill: i32, cap: i32) 
 # A campaign's level has no time limit: a team plays it until it is out,
 # however long that takes. It is moved on only when it has stopped getting
 # anywhere: when for STALL tics none of the four has come nearer the exit
-# than any of them had, found a secret or picked up a key, not counting the
-# level's grace at its start. And, in case of something no one has thought
-# of, at levelcap tics whatever it is doing. Every machine works this out
-# the same: it is part of the game.
-pub val STALL: i32 = 4 * 60 * 35;
+# than any of them had by four cells (a hair's breadth does not count),
+# found a secret or picked up a key, not counting the level's grace at its
+# start. And, in case of something no one has thought of, at levelcap tics
+# whatever it is doing. Every machine works this out the same: it is part
+# of the game.
+pub val STALL: i32 = 3 * 60 * 35;
+# a nearer-the-exit gain worth the name, in walk cells
+val GAIN_CELLS: i32 = 4;
 
 fun gain_reset(s: *Session) {
     s.gainnear    = 0;
@@ -665,8 +668,9 @@ fun stalled(s: *Session) bool {
         }
         i = i + 1;
     }
-    if ((near > 0 && (s.gainnear == 0 || near < s.gainnear)) || secrets > s.gainsecrets || keys > s.gainkeys) {
-        if (near > 0 && (s.gainnear == 0 || near < s.gainnear)) { s.gainnear = near; }
+    val closer: bool = near > 0 && (s.gainnear == 0 || near + GAIN_CELLS <= s.gainnear);
+    if (closer || secrets > s.gainsecrets || keys > s.gainkeys) {
+        if (closer)                    { s.gainnear = near; }
         if (secrets > s.gainsecrets) { s.gainsecrets = secrets; }
         if (keys > s.gainkeys)       { s.gainkeys = keys; }
         s.lastgain = g.leveltime;

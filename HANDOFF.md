@@ -157,8 +157,9 @@ and slow feelings about the others.
   No friends; a feeling only falls; under 25 a bot hunts that opponent.
 - **Co-op:** a **campaign**. The same four play all nine levels in order on Nightmare, carrying
   inventory forward. A level has no time limit: it ends on exit, or when the team has stopped
-  getting anywhere — four minutes with no new nearest-to-exit, secret or key, after a
-  five-minute grace (`game.stalled`), an hour at the outside. Bots go for every secret they
+  getting anywhere — three minutes with no new nearest-to-exit by four cells, secret or key,
+  after a
+  five-minute grace (`game.stalled`), half an hour at the outside. Bots go for every secret they
   believe in — one given up on four times is counted out of reach — then the exit. Score is
   objectives (keys, locked doors, one-time switches, secrets, distance to exit, levels
   finished), +1 a kill, -3 a death, added to a running Points total.

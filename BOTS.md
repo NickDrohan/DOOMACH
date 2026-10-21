@@ -222,8 +222,9 @@ this port until the league needed them: `world.mach`, `fast`.)
 meets them (the secret level after the third), the same four from the first to the last,
 carrying forward what they hold as players do (`game.campaign_game`). A level has no time
 limit: it is left when the team finishes it, however long that takes, or when it has stopped
-getting anywhere — four minutes in which no bot came nearer the exit than any had, found a
-secret or picked up a key, counted only after the level's first five minutes, and an hour at
+getting anywhere — three minutes in which no bot came nearer the exit than any had by four
+cells, found a secret or picked up a key, counted only after the level's first five minutes,
+and half an hour at
 the outside in case of something no one has thought of (`game.stalled`). Every campaign is
 every level, so no bot is ever rated on a lucky draw of maps, and a bot's score for a campaign
 is added to its running total, which the standings show as its points.
