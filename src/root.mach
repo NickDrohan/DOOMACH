@@ -520,6 +520,7 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     var join:      LeagueJoin;
     var joinnames: [96]u8;
     var joinmsg:   [96]u8;
+    var joinretry: i64 = 0;
     tidy_update();
     # watching the bot league: a match being fetched, or one being played
     # again, and how long it runs
@@ -535,9 +536,10 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
         val key:     i32  = win.take_key();
         val stopped: bool = n != nil && (!netstarted || stalled || n.desync || n.quit);
         if ((fetching || joining < 0) && key == front.KEY_ESCAPE) {
-            # give up on the league, being fetched or being joined
-            if (fetching)   { net.watch_close(fetch); fetching = 0; }
-            if (joining < 0) { join_abort(s, ?join); joining = 0; }
+            # give up on the league, being fetched, joined or waited for
+            if (fetching)      { net.watch_close(fetch); fetching = 0; }
+            if (joining == -1) { join_abort(s, ?join); }
+            joining = 0;
             front.to_title(?f);
             f.message = nil;
             cnt;
@@ -662,9 +664,38 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                     front.to_title(?f);
                     front.notice(?f, "the league could not be reached.\nis this computer online?\n\n(press a key)");
                 }
+                or (began == BETWEEN) {
+                    joining   = -2;
+                    joinretry = win.micros_now() + 10000000;
+                    front.notice(?f, "the league is between its levels.\nwatching for the next one...\n\n(escape gives up)");
+                }
                 or {
+                    joining   = -2;
+                    joinretry = win.micros_now() + 10000000;
+                    front.notice(?f, "the co-op bots have no campaign\nunder way just now. watching\nfor the next...\n\n(escape gives up)");
+                }
+            }
+        }
+        or (joining == -2) {
+            # between the league's levels: ask again every ten seconds
+            if (win.micros_now() >= joinretry) {
+                val began: i32 = join_league_begin(?a, s, ?joinnames[0], ?join);
+                if (began > 0) {
+                    joining = -1;
+                    front.notice(?f, "catching up with the co-op bots\nwhere they are...");
+                }
+                or (began == ANOTHER_SIMULATION) {
+                    joining = 0;
                     front.to_title(?f);
-                    front.notice(?f, "the co-op bots have no campaign\nunder way just now.\n\n(press a key)");
+                    front.notice(?f, "the co-op bots are playing another\nversion of the game. options,\nupdate the game; if this is the\nnewest, the league will catch up\nwithin the hour.\n\n(press a key)");
+                }
+                or (began == UNREACHED) {
+                    joining = 0;
+                    front.to_title(?f);
+                    front.notice(?f, "the league could not be reached.\nis this computer online?\n\n(press a key)");
+                }
+                or {
+                    joinretry = win.micros_now() + 10000000;
                 }
             }
         }
@@ -3158,6 +3189,7 @@ fun watched_out(f: *front.Front, s: *game.Session, tics: i32) bool {
 
 val ANOTHER_SIMULATION: i32 = -1;
 val UNREACHED:          i32 = -2;
+val BETWEEN:            i32 = -3;
 
 # ------------------------------------------------- joining the co-op league
 
@@ -3222,8 +3254,17 @@ fun fetch_league(a: *allocator.Allocator, name: str, into: *u8, room: i32) i32 {
 fun join_league_begin(a: *allocator.Allocator, s: *game.Session, names: *u8, j: *LeagueJoin) i32 {
     var now:  [4956]u8;
     var tick: [16]u8;
+    var done: [20]u8;
     val got:  i32 = fetch_league(a, "coopnow.bin", ?now[0], NOW_BYTES);
     if (got < 0) { ret UNREACHED; }
+    # the level the files set out may have ended while the league plays its
+    # trial between levels: joining it would only reach the finale and ask
+    # again, every time, however long its replay takes. coopdone.bin says
+    # so — the league will say where it has got to when it has got somewhere
+    val dlen: i32 = fetch_league(a, "coopdone.bin", ?done[0], 20);
+    if (got == NOW_BYTES && dlen == 20 && done[0] == 'M' && done[1] == 'D' && done[2] == 'E' && done[3] == '1' && get32(?done[0], 4) == get32(?now[0], 12) && get32(?done[0], 8):~i32 == now[6]::i32) {
+        ret BETWEEN;
+    }
     ret join_setup(s, ?now[0], got, ?tick[0], fetch_league(a, "coopnow.tic", ?tick[0], 16), 0, names, j);
 }
 
