@@ -1,6 +1,6 @@
 # Handoff: DOOMACH
 
-Originally written 2026-10-13; refreshed for the local bot triage after `659f41d`.
+Originally written 2026-10-13; refreshed for the completion-first cohort release.
 It says where the project stands, how to work on it without breaking it, and what is unfinished. The detailed accounts are in
 [README.md](README.md) (the port), [MULTIPLAYER.md](MULTIPLAYER.md) (netcode),
 [RELAY.md](RELAY.md) (the server) and [BOTS.md](BOTS.md) (bots and leagues); this file is the
@@ -18,11 +18,11 @@ platform layer and no C. On top of the port:
 - an in-game update, an observer mode, a deathmatch announcer, opt-in training from human play.
 
 Owner: Nick Drohan (`NickDrohan` on GitHub). Repo: <https://github.com/NickDrohan/DOOMACH>,
-Git baseline `main` at `659f41d`, matching GitHub. The latest published release is `v0.3.0`,
-twelve commits behind that baseline; the current workspace also contains unreleased local fixes.
+GitHub `main` includes code release `acc2408`; the older `v0.3.0` tag is historical.
+Unqualified per-level experiments are preserved separately on the local WIP branch.
 Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
 
-## Incremental release candidate
+## Released completion-first cohort
 
 The owner approved shipping the smaller completion-first policy now, concentrating co-op
 self-training in four learners, and learning from consenting human playthroughs. Full-episode
@@ -58,10 +58,25 @@ release. Keep later route/controller changes separate until they qualify.
   `deploy.sh --stage` passes its real-exit smoke gate and retains the previous staging directory.
   The original ignored `out/windows-x86_64/release/bin/doom-desync.txt` predates this work
   (2026-10-14); it was inspected, not deleted or produced by these passing checks.
-- GitHub push and Fly deployment are pending final publication. Fly SSH access has been
-  restored after a token error; both persisted epoch files were verified as 2. Back up the
-  league, check for active rooms, and verify the live hash and cohort after deployment.
-  No league reset is authorized or required.
+- Code release `acc2408` is pushed to GitHub `main` and deployed as Fly machine version 36,
+  image `registry.fly.io/mach-doom-relay:acc2408`, on the existing `83d165ea4ded48` machine.
+  The image digest is `sha256:b94bdc719719a8425760e2e8461e53d8aaa9a170740cbe8487b211185abf8b89`.
+  The public executable and its published hash match the staged game above. Relay, Hedge,
+  and both arenas are running; Fly health checks pass.
+- Deployment checked a seven-second-old relay occupancy report: zero open rooms. Both
+  persisted epochs remain 2. All 100 co-op members and kinds/styles remain present; all 96
+  paused member records are byte-identical to the pre-release backup. Only the four active
+  members changed as training resumed. The human dataset and epoch files also match the
+  backup byte for byte. The leagues resumed from 288 co-op campaigns and 56,751 deathmatches.
+- Backups are `/data/league-before-acc2408.tar` on Fly and ignored
+  `out/triage/league-before-acc2408.tar` locally, SHA-256
+  `58e13aed802d94e7feb0778a1c56455e02f2787d4c6d860ef3ff5fc64a3c955c`.
+  The release does not reset either league, and no reset is authorized.
+- The live recipe and standings show the four selected identities and `active_count: 4`.
+  At initial verification the cohort had proposed four human-guided candidates and retained
+  two through its level trials. All 6,312 existing human samples were from E1M1; later-level
+  demonstrations are especially needed. The first live campaign was still unfinished, so
+  these acceptance counts are not evidence of full-episode competence.
 - The original untracked `coop.json`, `d.bin`, `n.bin`, `n.tic`, and `nowc.tic` remain untouched.
   `package.sh` now includes only tracked source, excluding private captures and tool metadata;
   new implementation files must be added before packaging. Staging preserves the old directory
@@ -333,8 +348,8 @@ Other:
   archive's exclusions and contents before publishing; packaging was not run in this triage.
 - No native Mac or Linux game. Linux runs it under Wine (`package/doom.sh`); Mac under Wine is
   untried. The platform layer is `win.mach` alone.
-- Published tag `v0.3.0` is twelve commits behind the `659f41d` Git baseline, and the local
-  fixes are newer still. Cut a new tag and release only when the owner wants one.
+- Published tag `v0.3.0` predates code release `acc2408`, now on GitHub and Fly. No new
+  GitHub tag/release was created; the live download is updated independently.
 - An old copy of this project still sits in the owner's `mach-portfolio` repo
   (`products/doom`, branch `doom`), stale since the split. Deleting it was offered and not
   answered. Do not work there.
