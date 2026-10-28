@@ -18,6 +18,10 @@
 # packets between a player and the relay can read the token and act as that
 # player. That is the accepted cost of a first version without HTTPS.
 
+use std.allocator;
+use std.allocator.page;
+use std.types.error.err;
+use std.types.result.res;
 use std.types.bool.bool;
 use std.types.string.str;
 
@@ -163,6 +167,7 @@ pub rec Relay {
     # waits before bots take its empty seats, in milliseconds, 0 for never
     bots:     *Bots;
     fillwait: i64;
+    cohort: bool;
     # what people have sent for the bots to learn from, if the process keeps it
     train: *Train;
     # one game in this many that bots join has the shy bot among them; 0
@@ -380,6 +385,7 @@ fun fill(r: *Relay, room: *Room, now: i64) {
 
     val index: i32 = room_index(r, room);
     var drawn: [4]i32 = [4]i32{-1, -1, -1, -1};
+    val focused: bool = r.cohort && !room.deathmatch;
     # which league: a co-op game's bots are the co-op league's, if there is one
     var league:    *u8 = nil;
     var leaguelen: i32 = 0;
@@ -393,7 +399,8 @@ fun fill(r: *Relay, room: *Room, now: i64) {
     }
     # now and then, one of them is the shy bot, which is in no league and
     # joins only games with people in them
-    var shy: bool = r.shyin > 0 && r.bots != nil && (r.random() % r.shyin::u64) == 0;
+    if (focused && (r.bots == nil || !lf.valid(?r.bots.coop[0], r.bots.cooplen))) { league = nil; leaguelen = 0; }
+    var shy: bool = !focused && r.shyin > 0 && r.bots != nil && (r.random() % r.shyin::u64) == 0;
     i = 0;
     for (i < room.players) {
         if ((mask & (1 << i)) != 0 && r.bots != nil) {
@@ -416,14 +423,15 @@ fun fill(r: *Relay, room: *Room, now: i64) {
                 # a member not already drawn for this room
                 var who: i32 = 0;
                 for {
-                    who = (r.random() % lf.MEMBERS::u64)::i32;
+                    if (focused) { who = lf.COHORT[(r.random() % 4)::i32]; }
+                    or { who = (r.random() % lf.MEMBERS::u64)::i32; }
                     if (who != drawn[0] && who != drawn[1] && who != drawn[2] && who != drawn[3]) { brk; }
                 }
                 drawn[i] = who;
                 val at: i32 = lf.HEAD + who * lf.MEMBER_BYTES;
                 if (p.get32(league, at + lf.AT_KIND) != lf.KIND_SCRIPT::u32) {
                     b.kind = lf.SEAT_NET;
-                    if (p.get32(league, at + lf.AT_STYLE) == lf.STYLE_BRAWLER::u32) { b.kind = b.kind | lf.TRAIT_FISTS; }
+                    if (!focused && p.get32(league, at + lf.AT_STYLE) == lf.STYLE_BRAWLER::u32) { b.kind = b.kind | lf.TRAIT_FISTS; }
                 }
                 for (k < lf.NET) {
                     b.net[k] = league[at + lf.AT_NET + k]:~i8;
@@ -431,7 +439,7 @@ fun fill(r: *Relay, room: *Room, now: i64) {
                 }
                 # and its quirk goes with it; its feelings about the league's
                 # other bots do not, into a game with people in it
-                b.kind = b.kind | (lf.quirk_of(who) << lf.QUIRK_SHIFT);
+                if (!focused) { b.kind = b.kind | (lf.quirk_of(who) << lf.QUIRK_SHIFT); }
                 lf.name_of(who, ?b.name[0]);
             }
             or {
@@ -1337,5 +1345,47 @@ test relay__rate_limit {
     }
     # the 25th guess within the window is turned away as busy, not checked
     if (r.out[0].data[16] != p.BUSY) { ret 1; }
+    ret 0;
+}
+
+test relay__coop_seats_the_active_cohort_without_shy_bots {
+    var a: allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret 10; }
+    val room: res[*Bots, allocator.Error] = allocator.zallocate[Bots](?a, 1);
+    if (sel room.err) { ret 11; }
+    var r: Relay;
+    fresh(?r);
+    r.bots = room.ok;
+    r.cohort = 1;
+    r.shyin = 1;
+    r.bots.cooplen = lf.FILE_BYTES;
+    r.bots.coop[0] = 'M'; r.bots.coop[1] = 'D';
+    r.bots.coop[2] = 'L'; r.bots.coop[3] = '1';
+    p.put32(?r.bots.coop[0], 4, lf.MEMBERS::u32);
+    var i: i32 = 0;
+    for (i < lf.MEMBERS) {
+        r.bots.coop[lf.HEAD + i * lf.MEMBER_BYTES + lf.AT_NET] = i::u8;
+        i = i + 1;
+    }
+    var buf: [64]u8;
+    var host: Addr = Addr{ip: 1, port: 1};
+    handle(?r, ?buf[0], create_req(?buf[0], 4, 5, 1), ?host, 0);
+    val token: u64 = p.get64(?r.out[0].data[0], 8);
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 0, 0, token), ?host, 100);
+    r.nout = 0;
+    handle(?r, ?buf[0], request(?buf[0], p.FILL, 0, 0, token), ?host, 200);
+    if (!r.rooms[0].started || r.rooms[0].botmask != 14) { ret 1; }
+    i = 1;
+    for (i < 4) {
+        val b: *Seated = ?r.bots.seated[i];
+        if (b.kind != lf.SEAT_NET || !lf.cohort_member(b.net[0]::i32)) { ret 2; }
+        var j: i32 = 1;
+        for (j < i) {
+            if (b.net[0] == r.bots.seated[j].net[0]) { ret 3; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
     ret 0;
 }

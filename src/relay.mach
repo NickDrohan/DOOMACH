@@ -328,6 +328,11 @@ fun main(argc: i64, argv: **u8) i64 {
     var shyin:  i64 = 10;
     val shyenv: str = setting("RELAY_SHY_ONE_IN", ?shybuf[0], 32);
     if (shyenv != nil) { shyin = number(shyenv, 10); }
+    var cohortbuf: [16]u8;
+    var cohort: i64 = 0;
+    val cohortenv: str = setting("COOP_COHORT", ?cohortbuf[0], 16);
+    if (cohortenv != nil) { cohort = number(cohortenv, -1); }
+    if (cohort != 0 && cohort != 4) { print.eprintln("relay: COOP_COHORT must be 0 or 4"); ret 1; }
     var watchbuf:  [512]u8;
     val watchfile: str = setting("RELAY_WATCH_FILE", ?watchbuf[0], 512);
     var coopbuf:     [512]u8;
@@ -397,6 +402,7 @@ fun main(argc: i64, argv: **u8) i64 {
     r.random   = random;
     r.fillwait = fillwait * 1000;
     r.shyin    = shyin::i32;
+    r.cohort   = cohort == 4;
 
     # the bots' room: too big for the stack
     var a:    allocator.Allocator;

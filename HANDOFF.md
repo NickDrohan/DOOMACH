@@ -1,7 +1,7 @@
 # Handoff: DOOMACH
 
-Written 2026-10-13 for whoever picks this up next. It says where the project stands, how to
-work on it without breaking it, and what is unfinished. The detailed accounts are in
+Originally written 2026-10-13; refreshed for the local bot triage after `659f41d`.
+It says where the project stands, how to work on it without breaking it, and what is unfinished. The detailed accounts are in
 [README.md](README.md) (the port), [MULTIPLAYER.md](MULTIPLAYER.md) (netcode),
 [RELAY.md](RELAY.md) (the server) and [BOTS.md](BOTS.md) (bots and leagues); this file is the
 map and the state, not a replacement for them.
@@ -14,21 +14,60 @@ platform layer and no C. On top of the port:
 
 - lockstep co-op and deathmatch for two to four over a UDP relay;
 - bots that are players inside the simulation (a hand-written script, or a 942-byte net);
-- two leagues of a hundred bots each that play around the clock on the server and learn;
+- a hundred-member deathmatch league and a retained co-op roster with four active learners;
 - an in-game update, an observer mode, a deathmatch announcer, opt-in training from human play.
 
 Owner: Nick Drohan (`NickDrohan` on GitHub). Repo: <https://github.com/NickDrohan/DOOMACH>,
-branch `main`, last code commit at handoff `cc4d44e`, last tag `v0.2.0` (one commit behind `main`).
+Git baseline `main` at `659f41d`, matching GitHub. The latest published release is `v0.3.0`,
+twelve commits behind that baseline; the current workspace also contains unreleased local fixes.
 Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
 
-## State at handoff
+## Incremental release candidate
 
-- Working tree clean, everything pushed. 154 acceptance gates pass (`bash check.sh`).
-- What is deployed is `main` at `bb95b65`, tagged `v0.3.0`. Nothing is built but undeployed.
-- No local processes belong to this project. The owner's PC is dedicated to another project
-  (a chess engine) for now: **do not run long Doom jobs on it**; short test runs are fine.
-- The co-op league was reset on 2026-10-13 and is starting from the untrained net on purpose:
-  the owner wants to watch the learning arc. The deathmatch league was reset on 2026-10-09.
+The owner approved shipping the smaller completion-first policy now, concentrating co-op
+self-training in four learners, and learning from consenting human playthroughs. Full-episode
+Nightmare qualification is not claimed and is no longer a prerequisite for this incremental
+release. Keep later route/controller changes separate until they qualify.
+
+- The experimental work is preserved locally as `wip/coop-level-controller` at `30957c8`.
+  It is not part of this release: its per-level controller failed E1M5/6/7 and regressed the
+  human-following gate. Do not merge it wholesale. Its raw diagnostic reports remain under
+  ignored `out/triage/`.
+- This branch restores the small policy with simulation fingerprint `747135875`. The starting
+  net completes E1M1 on Nightmare at tic 11933 (5:40.9), checksum `3899426304`. E1M4 calm human
+  following is back to 68% and finishes; the experimental policy measured only 29%.
+- Added four-member cohort selection, matching online bot selection, and human-guided proposals
+  that must pass completion-first level trials before installation. The active IDs are 5, 23,
+  41 and 64. Other saved records are retained and paused, not reset. Both epoch settings stay 2.
+- The relay already had 6,312 co-op samples when inspected. Collection remains opt-in, online
+  only, 32 observation bytes plus six command bytes every fourth tic, with mode/map context.
+  The retained sample format and binary league layout are unchanged. For teaching runs, use
+  online co-op, opt in under Options, host a four-player room, and press Enter in the lobby to
+  fill its other seats with the cohort. Offline games do not upload samples.
+- Release checks pass: 53 native tests in debug and release, six Python harness tests, Windows
+  game/arena/relay and Linux arena/relay builds, pinned demos, two/four-player co-op and deathmatch
+  fixtures, viewpoints, demo shots, co-op inset and consent screens. E1M1 starting-net output
+  matches between builds; E1M1/5/7 calm completion, human following/exit ownership, and nine-level
+  350-tic resumption pass. The full `check.sh` suite and longer 2,100-tic episode resumption were
+  not rerun; full Nightmare episode qualification remains unfinished.
+- A local relay integration kept 168 samples from the opted-in host of a 700-tic game, not the
+  non-opted-in joiner; both simulations stayed synchronized. A native arena startup published
+  exactly the four selected identities as normal neural bots. The page's active/paused rendering,
+  legacy JSON fallback, JavaScript syntax, and archive exclusions also pass.
+- The staged game SHA-256 is `218ae8a75e5609edbada23d63f741698d7d18c815f378813ee18c172b456138f`.
+  `deploy.sh --stage` passes its real-exit smoke gate and retains the previous staging directory.
+  The original ignored `out/windows-x86_64/release/bin/doom-desync.txt` predates this work
+  (2026-10-14); it was inspected, not deleted or produced by these passing checks.
+- GitHub push and Fly deployment are pending final publication. Fly SSH access has been
+  restored after a token error; both persisted epoch files were verified as 2. Back up the
+  league, check for active rooms, and verify the live hash and cohort after deployment.
+  No league reset is authorized or required.
+- The original untracked `coop.json`, `d.bin`, `n.bin`, `n.tic`, and `nowc.tic` remain untouched.
+  `package.sh` now includes only tracked source, excluding private captures and tool metadata;
+  new implementation files must be added before packaging. Staging preserves the old directory
+  instead of deleting it. The release smoke gate requires a real starting-net E1M1 exit.
+- The owner's PC is dedicated to a chess-engine project: do not run long Doom jobs on it;
+  use short, bounded diagnostics and arrange a spare host for extended training/qualification.
 
 ## Working on it
 
@@ -37,21 +76,30 @@ bash bootstrap.sh          # fetches the pinned compiler into tools/, the WAD in
 scripts/mach build . --profile release --quiet            # the game: out/windows-x86_64/release/bin/doom.exe
 scripts/mach build . --artifact relay --profile release   # the relay (also --target linux-x86_64)
 scripts/mach build . --artifact arena --profile release   # the league runner
-scripts/mach test .                                        # unit tests
+scripts/mach test . --artifact doom --artifact arena --jobs 2 --timeout 30s  # unit tests
 bash check.sh                                              # all gates: 15 to 20 minutes
-bash deploy.sh --stage                                     # build what the server runs, do not deploy
+python -m unittest discover -s harness -p test_coopcheck.py  # diagnostic parser tests
+bash deploy.sh --stage                                     # build and smoke-check the release; no deployment
 bash deploy.sh                                             # ...and deploy to Fly
 ```
 
-The machine is Windows 10 with Git Bash. The owner's own terminal is PowerShell, where the
-deploy is `cd D:\Dev\Claude\DOOMACH; bash deploy.sh` (`&&` and `/d/...` paths do not work there).
+The machine is Windows with Git Bash; the owner's terminal is PowerShell. Run the pinned
+compiler there with `& '.\tools\mach-6.9.0\mach.exe'`, followed by the command and arguments.
+Invoke Git Bash explicitly, for example `& 'C:\Program Files\Git\bin\bash.exe' check.sh`:
+plain `bash` in this terminal resolves to the Windows WSL launcher. The owner approved this
+incremental release; back up the league, check active player rooms, and verify the live result.
+Never raise either epoch or reset the league without separate explicit approval.
 
 Things that have bitten:
 
 - **Do not edit `check.sh` while it is running** (bash reads it as it goes), and do not rebuild
   while a windowed test is up.
-- Bash heredocs mangle backslash escapes. For any edit containing `\n`, `\r` or quotes inside
-  Mach strings, write a small Python script to a file and run that, or use an editor tool.
+- Write source changes through Qark: read first, then use guarded edits or replacement.
+  Qark is the file writer, not the Mach compiler; run the pinned `mach check` and relevant
+  tests after Mach edits. The active Qark server also reports its Bash checker unavailable;
+  explicitly check shell syntax with `& 'C:\Program Files\Git\bin\bash.exe' -n check.sh`.
+- Include `--artifact arena` when running unit tests: default-artifact tests alone do not
+  exercise the league's scoring and partial-reporting tests.
 - Mach 6.9: no type inference, `if`/`or` (no `else`), `for (cond) {}`, `ret`/`cnt`/`brk`,
   `x::T` converts, `x:~T` reinterprets, `?x` address-of, `@p` dereference, `sel` needs a named
   place. Only one artifact may be `default`; build the others by `--artifact`. The upstream
@@ -83,8 +131,10 @@ simulation from the same commands. A bot is part of the simulation, not a client
   by whatever program fetches it, which may be older or newer than the arena that played it.
   The file carries `RECIPE` (its layout and the meaning of its fields; raise it by hand in
   `relayproto.mach` whenever either changes, and update `fixtures/recipe.expected`) and the
-  simulation's fingerprint (`game.fingerprint`, which changes by itself when the simulation or
-  the bots do). A game refuses a file that does not match both. The co-op league's
+  simulation's fingerprint (`game.fingerprint`, a fixed behavioural probe, not a source hash).
+  Verify that a behaviour change changes this fingerprint before deploying; changes outside
+  the probe's coverage need an extended probe or deliberate compatibility versioning.
+  A game refuses a file that does not match both. The co-op league's
   `coopnow.bin`, which a game joins a campaign from, carries the same two. If you add anything
   else that one build writes and another reads, give it the same two guards.
 
@@ -131,9 +181,11 @@ One machine runs four programs under `site/start.sh`:
   leagues' matches to watch, keeps opted-in training samples in `/data/league/train.bin`.
 - **hedge** (8080 behind Fly TLS): the download page, `league.html`, `doom.exe` and its hash
   for the in-game update, and `/league/*.json` from the volume.
-- **arena** twice: the deathmatch league and the co-op league, at `ARENA_DUTY` 1% and
-  `COOP_DUTY` 5% of the CPU (kept under what a shared CPU may use continuously). Each writes a
-  heartbeat file; the supervisor restarts one that has not written for ten minutes.
+- **arena** twice: the deathmatch league and the co-op league, with steady pacing at
+  `ARENA_DUTY` 1% and `COOP_DUTY` 5%. Co-op temporarily uses `TRIAL_DUTY` 50% while replaying
+  mutants, so the Dockerfile's 5% is not its only pacing setting. Each writes a heartbeat;
+  the supervisor restarts one that has not written for ten minutes. Actual CPU throttling
+  has not been checked without Fly authentication.
 
 Settings are `ENV` in the `Dockerfile`. To begin a league again from the starting net, raise
 `LEAGUE_EPOCH` or `COOP_EPOCH` there and deploy.
@@ -161,20 +213,30 @@ and slow feelings about the others.
   inventory forward. A level has no time limit: it ends on exit, or when the team has stopped
   getting anywhere — three minutes with no new nearest-to-exit by four cells, secret or key,
   after a
-  five-minute grace (`game.stalled`), half an hour at the outside. Bots go for every secret they
-  believe in — one given up on four times is counted out of reach — then the exit. Score is
+  five-minute grace (`game.stalled`), half an hour at the outside. Bot-only teams now seek a
+  verified exit/key/switch route first. Secrets and loyal-following are optional fallbacks,
+  never prerequisites for leaving. Completion wins over style reward in a co-op trial;
+  equal completion outcomes retain the style's reward margin. Campaign points still use
   objectives (keys, locked doors, one-time switches, secrets, distance to exit, levels
-  finished), +1 a kill, -3 a death, added to a running Points total.
+  finished), half a point per kill (rounded down per tally), -3 per death and two points
+  per hundredth of exit progress, added to a running Points total.
 
-Measured where it stands (hand-written bots, one run a map, not statistics):
+Current measurements are fixed-seed runs, not statistics; see BOTS.md for the calm table.
 
-- With monsters removed, four bots finish every level that can end — all but E1M8, which has
-  no exit line — six of them with every secret: E1M1 3/3 out 1:25, E1M2 3/6 out 4:23,
-  E1M3 1/7 out 4:59, E1M4 2/3 out 3:59, E1M5 9/9 out 2:49, E1M6 4/4 out 15:28, E1M7 1/4 out
-  3:59, E1M9 2/2 out 4:29.
-- On Nightmare they finish E1M1 with all three secrets at 1:23.
-- About 40 co-op campaigns a day on the server, so each bot plays roughly every 15 hours.
-  Learning there is slow by design of the budget, not by accident.
+- Four unchanged copies of `fixtures/bot0.net` now finish Nightmare E1M1 at tic 11,933
+  (5:40.9) with one of three secrets, versus no exit within 16,800 tics in the preceding
+  local build. The prior eight-map benchmark was 0/8; the whole episode is not yet qualified.
+  Wider bounded exit-first runs did not establish other clears, and E1M6 timed out. Do not
+  mistake this single-seed milestone for successful retraining of all live personalities.
+- Hand-written bots finish Nightmare E1M1 with 0/3 secrets at 0:45.4 instead of 3/3 at 1:36.3.
+  Calm E1M5 finishes with 3/9 at 2:20.9 and E1M7 with 0/4 at 3:19.3. The E1M5 check caught
+  the difference between a speculative mission path and a verified one: only the latter
+  can suppress fallback exploration. E1M7 still needs the raised-key pickup approach.
+- At the latest live inspection, counters were 283 campaigns and 203 clears. Compared with
+  the saved October 20 snapshot, that is ten additional clears across 89 campaigns in 8.31
+  days, about eleven campaigns a day and 0.43 appearances per bot per day. The co-op process
+  had averaged about 6% of a core, without recent memory pressure or a restart loop. These
+  are observations of the old deployed policy, not results of the new local one.
 
 ## Lessons paid for (please do not relearn them)
 
@@ -206,13 +268,11 @@ Measured where it stands (hand-written bots, one run a map, not statistics):
 
 Bots and leagues:
 
-- Route-finding: every calm level that can end is finished (the table in BOTS.md). A secret
-  a bot has given up on four times is counted out of reach for good — that, not a clock, is
-  what ends the secret hunt and opens the way out. (E1M8's end is in the grid: it has no exit
-  line — the level ends on a special-11 floor past the star walls — so tag-666 sectors count
-  as movers and a teleport landing on the ending floor counts as the exit, held shut to the
-  bots until the secrets are done. Whether the team ever takes it still rests on killing
-  every bruiser at once, which Nightmare's respawning makes rare.)
+- Route-finding is not considered solved; use the bounded measurements in BOTS.md. Secret
+  patience and retry limits now govern optional exploration only, never permission to exit.
+  The mission is retried before any optional secret or friend. E1M8 still ends on a special-11
+  floor beyond its tag-666 walls and teleporter: the secret requirement is gone, but both
+  bruisers must be dead before either respawns to open the actual boss barrier.
   The secrets not found are diagnosed, not fixed:
   - E1M6 strands bots in the nukage trenches — one-way drops in, no way back. Goals standing
     in cells the exit cannot be walked to from are now never taken up (`lost` in bot.mach:
@@ -223,11 +283,20 @@ Bots and leagues:
     walk back. Remote timed doors like it are unsolved.
   - E1M2, E1M3, E1M4 and E1M7 still leave secrets unfound — mostly the same kinds: switches
     whose work is elsewhere, and ways the grid cannot vouch for.
-- On Nightmare the bots die about once a minute each and respawn at the level start, which is
-  most of why they do not finish levels. This is what the nets are meant to learn.
-- Apprentices do nothing until 5,000 samples of human play exist for their game type (about
-  1,900 co-op samples at handoff). The relay cannot tell real play from made-up samples sent by
-  someone in a game; it only steers five bots a league.
+- The starting nets now have a verified E1M1 clear, not qualification across Nightmare.
+  Further work should isolate the base policy and online learning and establish a shared
+  competent squad before increasing divergence. No new base checkpoint has been trained;
+  keep the current league and its learned weights intact.
+- Long route/replay runs still need performance investigation. `resumecheck` with nine
+  levels and 2,100 tics per level matched through E1M7 but exceeded a 120-second wall limit
+  before the final E1M8 comparison. The shorter all-map test passes; do not claim the longer
+  test or the full acceptance suite passes until they actually finish.
+- `find_item` ranks candidates before its final visibility/direct-walk checks. Investigate
+  whether an unreachable high-value item suppresses reachable alternatives before changing
+  rewards further; this selection policy was not changed in the current fixes.
+- Apprentices need 5,000 samples of human play for their game type; the latest public co-op
+  board inspected had 6,312, above that threshold. The relay cannot tell real play from made-up
+  samples sent by someone in a game; it only steers five bots a league.
 - The steady-hand turn limiter was tuned by counting view reversals, not by eye. The owner
   asked for it; ask them whether it now looks right.
 - Co-op feelings move one point a campaign and will take months to mean anything; deathmatch
@@ -259,10 +328,13 @@ found alone.)
 
 Other:
 
+- `package.sh` archives the working tree recursively, not just Git-tracked source. Its
+  current exclusions omit `.qark` and the root's diagnostic captures. Review the source
+  archive's exclusions and contents before publishing; packaging was not run in this triage.
 - No native Mac or Linux game. Linux runs it under Wine (`package/doom.sh`); Mac under Wine is
   untried. The platform layer is `win.mach` alone.
-- Tag `v0.2.0` is one commit behind `main` (campaigns and the steady hand came after). Cut a
-  new tag and release when the owner wants one.
+- Published tag `v0.3.0` is twelve commits behind the `659f41d` Git baseline, and the local
+  fixes are newer still. Cut a new tag and release only when the owner wants one.
 - An old copy of this project still sits in the owner's `mach-portfolio` repo
   (`products/doom`, branch `doom`), stale since the split. Deleting it was offered and not
   answered. Do not work there.

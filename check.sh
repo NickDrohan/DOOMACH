@@ -366,6 +366,7 @@ gate "the first net takes frags off the hand-written bot" 0 nets_fight
 # and leaves the league and its standings; started again, it goes on from
 # there rather than from the beginning.
 arena_exe="$here/out/windows-x86_64/release/bin/arena.exe"
+gate "the arena's scoring and reporting unit tests pass" 0 "$mach" test "$here" --artifact arena --target windows-x86_64 --quiet
 gate "the arena builds (release, Windows)" 0 "$mach" build "$here" --artifact arena --profile release --quiet
 gate "the arena builds (release, Linux, as Fly runs it)" 0 "$mach" build "$here" --artifact arena --target linux-x86_64 --profile release --quiet
 mkdir -p "$work/league"
@@ -592,32 +593,41 @@ if [[ -n "$python" ]]; then
     gate "a game joins the co-op league's campaign where it is" 0 grep -q "^joined E1M" "$work/join.out"
     gate "and ends the level where the league did" 0 grep -q "came out as the league's did" "$work/join.out"
 fi
-# Four hand-written bots play a level through: into every secret they can
-# reach, then out — as soon as the secrets are done with, however early or
-# late that is; no clock holds them and none hurries them. On Nightmare
-# they do all of that on E1M1, whose three secrets they have long had. With
-# the monsters taken out, which shows the finding of the way apart from the
-# fighting, they do it on E1M5, whose nine secrets and its exit lie behind
-# doors worked by switches behind doors that need keys.
+# Four hand-written bots play for completion, using keys and switches
+# on the route to the exit. Secrets may be taken along the way, but
+# they never hold the team in a level. Nightmare E1M1 must still end;
+# with its monsters removed, it must end without collecting every
+# secret. E1M5 checks the chain of switches and key-locked doors,
+# and E1M7 checks approaching a raised key within pickup reach.
+# Neither map requires a secret sweep before the team is allowed out.
 "$release" coopmatch "$wad" 1 16800 >"$work/coopmatch.out" 2>/dev/null
-finds_and_finishes() { awk '/^end tic/ { exit !($5 == 1 && $7 >= 2 && $9 == 3) }' "$work/coopmatch.out"; }
-gate "four bots find at least two of E1M1's three secrets on Nightmare and finish it" 0 finds_and_finishes
+finishes_level() { awk '/^end tic/ { done = ($5 == 1 && $9 == 3) } END { exit !done }' "$work/coopmatch.out"; }
+gate "four bots finish E1M1 on Nightmare without a secret requirement" 0 finishes_level
+"$release" coopmatch "$wad" 1 16800 calm >"$work/coopoptional.out" 2>/dev/null
+secrets_optional() { awk '/^end tic/ { done = ($5 == 1 && $7 < $9 && $9 == 3) } END { exit !done }' "$work/coopoptional.out"; }
+gate "bot-only teams can exit with secrets still unfound" 0 secrets_optional
+"$release" coopmatch "$wad" 1 16800 "$here/fixtures/bot0.net" >"$work/coopnet.out" 2>/dev/null
+gate "four starting neural nets finish E1M1 on Nightmare" 0 grep -q "finished 1 " "$work/coopnet.out"
 # A steady hand: a bot's turning changes sides fewer than 120 times a minute
 # (of the 525 times a minute it decides). Before its turns were kept to
 # what reaches what it is turning to, it was 300, and the view through a
 # bot's eyes never stopped shaking.
 steady_hand() { awk '/^bot/ { s += $26 } /^end tic/ { exit !(s / 4 / ($3 / 2100) < 120) }' "$work/coopmatch.out"; }
 gate "a bot's view does not shake" 0 steady_hand
-# And with every secret of E1M1's found they are out before five minutes,
-# where before the clock held them in the level until then: secrets first,
-# then the exit, is the whole rule now.
+# A team with an open mission route should leave promptly rather than
+# spend minutes circling optional secrets. Keep an upper bound on
+# this simple map's completion time without requiring a secret count.
 out_when_done() { awk '/^end tic/ { exit !($3 < 10500) }' "$1"; }
-gate "and are out as soon as the secrets are done with" 0 out_when_done "$work/coopmatch.out"
+gate "and leave E1M1 within five minutes" 0 out_when_done "$work/coopmatch.out"
 "$debug" coopmatch "$wad" 1 16800 >"$work/coopmatch.debug" 2>/dev/null
 same "and debug plays the same match" "$work/coopmatch.debug" "$work/coopmatch.out"
+"$debug" coopmatch "$wad" 1 16800 "$here/fixtures/bot0.net" >"$work/coopnet.debug" 2>/dev/null
+same "and debug plays the same neural-net completion" "$work/coopnet.debug" "$work/coopnet.out"
 "$release" coopmatch "$wad" 5 16800 calm >"$work/coopcalm.out" 2>/dev/null
-gate "with no monsters, they find E1M5's nine secrets, its keys and its exit" 0 grep -q "finished 1 secrets 9 of 9 " "$work/coopcalm.out"
-gate "and are out of that as soon as the ninth is found" 0 out_when_done "$work/coopcalm.out"
+gate "with no monsters, they work E1M5's keys and switches and finish" 0 grep -q "finished 1 " "$work/coopcalm.out"
+gate "and leave E1M5 within five minutes" 0 out_when_done "$work/coopcalm.out"
+"$release" coopmatch "$wad" 7 16800 calm >"$work/coopkey.out" 2>/dev/null
+gate "bots collect E1M7's raised blue key and finish without monsters" 0 grep -q "finished 1 " "$work/coopkey.out"
 
 # With a person in the game the level is the person's. One bot stands in
 # for a person who plays E1M4 through, opening it as they go; the other

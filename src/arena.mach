@@ -55,9 +55,9 @@
 # level after the third), the same four from the first to the last,
 # carrying forward what they hold as players do. A level has no time limit:
 # it is left when the team finishes it or when it has stopped getting
-# anywhere (game.stalled). The bots play each level through (bot.mach):
-# into every secret they believe in, and only then out by the exit, however
-# long that takes. A bot's score for the campaign is
+# anywhere (game.stalled). The bots seek the exit and its required keys
+# and switches first; secrets are optional fallbacks. Completion outranks
+# style reward in a replay. A bot's score for the campaign is
 # what it did to get the team on: secrets, keys, locked doors, switches,
 # the way it covered, a little for a kill and a little off for a death,
 # and nothing at all for standing still. It is rated against the other
@@ -119,6 +119,7 @@ val COOP_NAMES: [11]str = [11]str{
 };
 # which league this process runs
 var coop: bool;
+var cohort: bool;
 # the match about to be played is one played before, with the seeds it had
 var again: bool;
 # how many mutants have been tried since the process started, and how many kept
@@ -244,6 +245,9 @@ var pooled: i32;
 val QUIRK_NAMES: [5]str = [5]str{"Steady", "Cautious", "Reckless", "Loyal", "Grudge-bearer"};
 # how many moments of people's play of this league's kind the relay holds
 var taught: i32;
+var taughtmaps: [9]i32;
+var human_proposed: i64;
+var human_kept: i64;
 
 fun random() u32 {
     seed = seed ^ (seed << 13);
@@ -318,6 +322,10 @@ fun mutate(m: *Member, from: *i8) {
         m.trial[k] = w::i8;
         k          = k + 1;
     }
+}
+
+fun coop_score(t: *Tally) i32 {
+    ret t.frags / 2 + 25 * t.secrets + 2 * t.progress + 15 * t.keys + 30 * t.doors + 8 * t.worked - 3 * t.deaths;
 }
 
 # what a co-op match was worth to a bot of a style
@@ -418,12 +426,28 @@ fun unlike(net: *i8, pool: *u8, picks: *i32, n: i32) i64 {
 # ret:  how far from the people the apprentice now is, a moment, or -1 if
 #       there was not enough to learn from
 fun lesson(m: *Member, pool: *u8, n: i32) i32 {
+    ret lesson_with(m, pool, n, 0);
+}
+
+fun lesson_with(m: *Member, pool: *u8, n: i32, interactions: bool) i32 {
     var mode: u8 = 2;
     if (coop) { mode = 1; }
     # a lesson's worth of moments of the right kind, looked for at random
     var picks: [300]i32;
     var have:  i32 = 0;
     var looks: i32 = 0;
+    if (interactions) {
+        for (have < LESSON / 5 && looks < LESSON * 4 && n > 0) {
+            val at: i32 = below(n);
+            val record: *u8 = ?pool[POOL_HEAD + at * POOL_RECORD];
+            if (record[0] == mode && ((record[38]:~i8) > 0 || (record[39]:~i8) > 0)) {
+                picks[have] = at;
+                have = have + 1;
+            }
+            looks = looks + 1;
+        }
+        looks = 0;
+    }
     for (have < LESSON && looks < LESSON * 12 && n > 0) {
         val at: i32 = below(n);
         if (pool[POOL_HEAD + at * POOL_RECORD] == mode) {
@@ -463,12 +487,18 @@ fun lesson(m: *Member, pool: *u8, n: i32) i32 {
 
 # how many of the pool's moments are from this league's kind of game
 fun of_this_kind(pool: *u8, n: i32) i32 {
+    var i: i32 = 0;
+    for (i < 9) { taughtmaps[i] = 0; i = i + 1; }
     var mode: u8 = 2;
     if (coop) { mode = 1; }
     var count: i32 = 0;
     var q:     i32 = 0;
     for (q < n) {
-        if (pool[POOL_HEAD + q * POOL_RECORD] == mode) { count = count + 1; }
+        if (pool[POOL_HEAD + q * POOL_RECORD] == mode) {
+            count = count + 1;
+            val map: i32 = pool[POOL_HEAD + q * POOL_RECORD + 1]::i32;
+            if (map >= 1 && map <= 9) { taughtmaps[map - 1] = taughtmaps[map - 1] + 1; }
+        }
         q = q + 1;
     }
     ret count;
@@ -615,14 +645,36 @@ fun relive(s: *game.Session, l: *League, picks: *i32, map: i32, was: *Tally, see
 # takes the net of the highest rated, if the gap between them is wide. Each
 # style keeps its own wants, so the league keeps its variety; what spreads
 # is whatever serves a want best.
+fun active_member(who: i32) bool {
+    ret !cohort || lf.cohort_member(who);
+}
+
+fun choose_members(picks: *i32) {
+    var size: i32 = MEMBERS;
+    if (cohort) { size = 4; }
+    var i: i32 = 0;
+    for (i < 4) {
+        picks[i] = below(size);
+        if (cohort) { picks[i] = lf.COHORT[picks[i]]; }
+        var duplicate: bool = 0;
+        var k: i32 = 0;
+        for (k < i) {
+            if (picks[k] == picks[i]) { duplicate = 1; }
+            k = k + 1;
+        }
+        if (!duplicate) { i = i + 1; }
+    }
+}
+
 fun inherit(l: *League) {
-    val style: i32 = below(STYLES);
+    var style: i32 = below(STYLES);
+    if (cohort) { style = 0; }
     var best:  i32 = -1;
     var worst: i32 = -1;
     var i:     i32 = 0;
     for (i < MEMBERS) {
         val m: *Member = ?l.members[i];
-        if (m.kind == KIND_LEARNS && m.style == style && m.games >= 8) {
+        if (active_member(i) && m.kind == KIND_LEARNS && m.style == style && m.games >= 8) {
             if (best < 0 || m.rating > l.members[best].rating)   { best = i; }
             if (worst < 0 || m.rating < l.members[worst].rating) { worst = i; }
         }
@@ -646,6 +698,7 @@ fun kind_of(m: *Member) i32 {
 # a seat's kind as the game is told it: how the member plays, its quirk,
 # and how it feels about the members in the other three seats
 fun kind_for(l: *League, picks: *i32, seat: i32) i32 {
+    if (cohort && lf.cohort_member(picks[seat])) { ret bot.KIND_NET; }
     var kind: i32 = kind_of(?l.members[picks[seat]]) | (lf.quirk_of(picks[seat]) << bot.QUIRK_SHIFT);
     var nth:  i32 = 0;
     var j:    i32 = 0;
@@ -806,7 +859,7 @@ fun level_tally(s: *game.Session, keys: *i32, deaths: *i32, out: *Tally) {
             if (way > 90) { way = 100; }
         }
         out[i].progress = way;
-        out[i].score    = out[i].frags + 25 * out[i].secrets + out[i].progress + 15 * out[i].keys - 3 * out[i].deaths;
+        out[i].score    = coop_score(?out[i]);
         i = i + 1;
     }
 }
@@ -843,6 +896,22 @@ var twas:     [4]Tally;
 # beginning (trial_apply), a level later than the level that won them
 var tkeep:    [4 * 942]i8;
 var tkeep_on: [4]bool;
+var thuman: [4]bool;
+
+fun propose(m: *Member, from: *i8, human: bool) bool {
+    if (human && coop && cohort && taught >= ENOUGH && pooled > 0 && keeppb != nil) {
+        var student: Member;
+        var i: i32 = 0;
+        for (i < NET) { student.net[i] = from[i]; i = i + 1; }
+        if (lesson_with(?student, keeppb, pooled, 1) >= 0 && student.generation > 0) {
+            m.trial = student.net;
+            human_proposed = human_proposed + 1;
+            ret 1;
+        }
+    }
+    mutate(m, from);
+    ret 0;
+}
 
 fun trial_setup(l: *League, picks: *i32, seeds: *u32, map: i32, carried: *u8, was: *Tally) {
     trial_on = 0;
@@ -852,8 +921,9 @@ fun trial_setup(l: *League, picks: *i32, seeds: *u32, map: i32, carried: *u8, wa
     var i:   i32  = 0;
     for (i < 4) {
         val m: *Member = ?l.members[picks[i]];
+        thuman[i] = 0;
         if (m.kind == KIND_LEARNS) {
-            mutate(m, ?lvstart[i * NET]);
+            thuman[i] = propose(m, ?lvstart[i * NET], (l.matches + map::i64 + i::i64) % 2 == 0);
             any = 1;
         }
         i = i + 1;
@@ -935,14 +1005,17 @@ fun trial_over(l: *League, picks: *i32) {
         if (m.kind == KIND_LEARNS) {
             val before: i32 = reward(m.style, ?twas[i]);
             val after:  i32 = reward(m.style, ?now[i]);
-            # clearly more: by a twentieth and five, so that a coin's fall
-            # is less often taken for a lesson
+            # completion comes first; equal completion outcomes need a
+            # style improvement of a twentieth and five to count
             var margin: i32 = before / 20;
             if (margin < 0) { margin = -margin; }
             tried = tried + 1;
-            if (after > before + margin + 5) {
+            var better: bool = after > before + margin + 5;
+            if (now[i].finished != twas[i].finished) { better = now[i].finished > twas[i].finished; }
+            if (better) {
                 m.generation = m.generation + 1;
                 kept         = kept + 1;
+                if (thuman[i]) { human_kept = human_kept + 1; }
                 # and the bot itself goes on as the mutant — as the mutant
                 # ended the level, what it learned in the winning kept:
                 # the level it won is behind it either way
@@ -1016,6 +1089,7 @@ fun level_over(s: *game.Session, tally: *Tally, keys: *i32) {
         }
         or { tally[i].gaveup = tally[i].gaveup + 1; }
         tally[i].progress = tally[i].progress + way;
+        tally[i].score    = coop_score(?tally[i]);
         i                 = i + 1;
     }
 }
@@ -1180,7 +1254,10 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
             }
             # and how often each died, which in co-op nothing else counts
             val gone: bool = s.g.players[i].playerstate == defs.PST_DEAD;
-            if (gone && !dead[i]) { died[i] = died[i] + 1; }
+            if (gone && !dead[i]) {
+                died[i] = died[i] + 1;
+                if (coop) { tally[i].deaths = died[i]; }
+            }
             dead[i] = gone;
             # and the most keys it has held at once this level
             var cards: i32 = 0;
@@ -1289,7 +1366,7 @@ fun play(s: *game.Session, l: *League, picks: *i32, map: i32, tally: *Tally, see
             # Co-op is rated on what a bot did to get the team on: see
             # coop_reward. The levels finished are the same for all four,
             # so they do not tell them apart and are left out here.
-            tally[i].score = tally[i].frags / 2 + 25 * tally[i].secrets + 2 * tally[i].progress + 15 * tally[i].keys + 30 * tally[i].doors + 8 * tally[i].worked - 3 * tally[i].deaths;
+            tally[i].score = coop_score(?tally[i]);
         }
         i = i + 1;
     }
@@ -1681,8 +1758,25 @@ fun board(l: *League, dir: str, buf: *u8, picks: *i32, tally: *Tally, map: i32, 
     or {
         at = join(buf, at, "deathmatch\"");
     }
+    at = join(buf, at, ",\"active_count\":");
+    var active: i32 = MEMBERS;
+    if (cohort) { active = 4; }
+    at = join_number(buf, at, active::i64);
     at = join(buf, at, ",\"taught\":");
     at = join_number(buf, at, taught::i64);
+    if (coop) {
+        at = join(buf, at, ",\"taught_maps\":[");
+        var map: i32 = 0;
+        for (map < 9) {
+            if (map > 0) { at = join(buf, at, ","); }
+            at = join_number(buf, at, taughtmaps[map]::i64);
+            map = map + 1;
+        }
+        at = join(buf, at, "],\"human_proposed_session\":");
+        at = join_number(buf, at, human_proposed);
+        at = join(buf, at, ",\"human_kept_session\":");
+        at = join_number(buf, at, human_kept);
+    }
     at = join(buf, at, ",\"matches\":");
     at = join_number(buf, at, l.matches);
     at = join(buf, at, ",\"updated\":");
@@ -1748,7 +1842,12 @@ fun board(l: *League, dir: str, buf: *u8, picks: *i32, tally: *Tally, map: i32, 
         or {
             at = join(buf, at, STYLE_NAMES[m.style]);
         }
-        at = join(buf, at, "\",\"rating\":");
+        at = join(buf, at, "\",\"active\":");
+        if (active_member(order[i])) { at = join(buf, at, "true"); }
+        or { at = join(buf, at, "false"); }
+        at = join(buf, at, ",\"id\":");
+        at = join_number(buf, at, order[i]::i64);
+        at = join(buf, at, ",\"rating\":");
         at = join_number(buf, at, (m.rating / 100)::i64);
         at = join(buf, at, ",\"games\":");
         at = join_number(buf, at, m.games::i64);
@@ -1905,6 +2004,18 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc >= 5) { limit = number(argv[4], 0); }
     if (argc >= 6) { coop = argv[5][0] == 'c' && argv[5][1] == 'o' && argv[5][2] == 'o' && argv[5][3] == 'p' && argv[5][4] == 0; }
 
+    var cohortbuf: [16]u8;
+    val cohortenv: res[opt[usize], env.EnvError] = env.get("COOP_COHORT", ?cohortbuf[0], 16);
+    if (sel cohortenv.ok) {
+        if (sel cohortenv.ok.some) {
+            if (coop) {
+                val requested: i64 = number(?cohortbuf[0], -1);
+                if (requested != 0 && requested != 4) { print.eprintln("arena: COOP_COHORT must be 0 or 4"); ret 2; }
+                cohort = requested == 4;
+            }
+        }
+    }
+
     # the share of the processor to use, as a percentage
     var duty:    i64 = 5;
     var dutybuf: [16]u8;
@@ -1941,11 +2052,20 @@ fun main(argc: i64, argv: **u8) i64 {
         print.println("arena: a new league of 100");
     }
     if (coop) { print.println("arena: the co-op league, on Nightmare"); }
+    if (cohort) {
+        var i: i32 = 0;
+        for (i < 4) {
+            val member: *Member = ?l.members[lf.COHORT[i]];
+            if (member.kind != KIND_LEARNS || member.style != 0) { print.eprintln("arena: the saved cohort is not four Crusader learners"); ret 2; }
+            i = i + 1;
+        }
+        print.printlnf("arena: four active co-op learners: {} {} {} {}; the other records are retained", lf.COHORT[0], lf.COHORT[1], lf.COHORT[2], lf.COHORT[3]);
+    }
     # nobody is half way through a block of games as a mutant, as a league
     # kept from before this one learned by replays may say
     var q: i32 = 0;
     for (q < MEMBERS) {
-        l.members[q].phase = 0;
+        if (active_member(q)) { l.members[q].phase = 0; }
         q                  = q + 1;
     }
 
@@ -1994,17 +2114,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
         # four different members, and a map
         var picks: [4]i32;
-        var i:     i32 = 0;
-        for (i < 4) {
-            picks[i] = below(MEMBERS);
-            var again: bool = 0;
-            var k:     i32  = 0;
-            for (k < i) {
-                if (picks[k] == picks[i]) { again = 1; }
-                k = k + 1;
-            }
-            if (!again) { i = i + 1; }
-        }
+        choose_members(?picks[0]);
         # a deathmatch is on one map; a campaign is on all of them, and
         # says so with a 1 where the map would be
         var map: i32 = MAPS[below(7)];
@@ -2045,7 +2155,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
         # one apprentice's lesson, each in its turn; with too little to learn
         # from, an apprentice is as the league began
-        if (taught < ENOUGH) {
+        if (!cohort && taught < ENOUGH) {
             var k: i32 = 0;
             for (k < MEMBERS) {
                 val m: *Member = ?l.members[k];
@@ -2060,7 +2170,7 @@ fun main(argc: i64, argv: **u8) i64 {
                 k = k + 1;
             }
         }
-        or (pooled > 0) {
+        or (!cohort && pooled > 0) {
             var who: i32 = -1;
             var k:   i32 = 0;
             for (k < MEMBERS && who < 0) {
@@ -2077,5 +2187,212 @@ fun main(argc: i64, argv: **u8) i64 {
         keep(l, ?a, dir, fb.ok, jb.ok, pb.ok, ?picks[0], ?tally[0], map, millis() - again_began, limit != 0 && played == limit);
         if (!coop) { rest(again_began, duty); }
     }
+    ret 0;
+}
+
+test level_tally__uses_campaign_score_weights {
+    var s: game.Session;
+    var keys: [4]i32;
+    var deaths: [4]i32;
+    var tally: [4]Tally;
+    s.g.levelserial = 1;
+    s.capped = 1;
+    s.g.players[0].killcount = 20;
+    s.g.players[0].secretcount = 1;
+    s.bots[0].goalserial = 1;
+    s.bots[0].goalstart = 101;
+    s.bots[0].goalbest = 51;
+    keys[0] = 1;
+    deaths[0] = 2;
+    level_tally(?s, ?keys[0], ?deaths[0], ?tally[0]);
+    if (tally[0].progress != 50 || tally[0].score != 144) { ret 1; }
+    if (tally[0].finished != 0 || tally[0].deaths != 2) { ret 2; }
+    ret 0;
+}
+
+test level_over__refreshes_midcampaign_score {
+    var s: game.Session;
+    var keys: [4]i32;
+    var tally: [4]Tally;
+    s.g.levelserial = 1;
+    s.capped = 1;
+    s.g.players[0].killcount = 20;
+    s.g.players[0].secretcount = 1;
+    s.bots[0].goalserial = 1;
+    s.bots[0].goalstart = 101;
+    s.bots[0].goalbest = 51;
+    keys[0] = 1;
+    tally[0].deaths = 7;
+    tally[0].doors = 2;
+    tally[0].worked = 1;
+    level_over(?s, ?tally[0], ?keys[0]);
+    if (tally[0].score != 197 || tally[0].deaths != 7) { ret 1; }
+    if (tally[0].finished != 0 || tally[0].gaveup != 1) { ret 2; }
+    ret 0;
+}
+
+test trial_over__completion_dominates_every_style {
+    coop = 1;
+    var style: i32 = 0;
+    for (style < 11) {
+        var mode: i32 = 0;
+        for (mode < 3) {
+            var s: game.Session;
+            var l: League;
+            var picks: [4]i32;
+            var before: Tally;
+            var i: i32 = 0;
+            for (i < 4) {
+                picks[i] = i;
+                l.members[i].kind = KIND_SCRIPT;
+                i = i + 1;
+            }
+            l.members[0].kind = KIND_LEARNS;
+            l.members[0].style = style;
+            s.completed = 1;
+            s.capped = mode != 1;
+            s.bots[0].net[0] = 42;
+            tdied[0] = 0;
+            theld[0] = 0;
+            tkeep_on[0] = 0;
+            if (mode == 1) {
+                before.score = 10000;
+                before.frags = 10000;
+                before.progress = 100;
+                before.secrets = 100;
+                before.found = 100;
+                before.keys = 3;
+                before.doors = 3;
+                before.worked = 10;
+                before.turned = 300000;
+                before.uses = 10000;
+            }
+            or {
+                if (mode == 0) { before.finished = 1; }
+                s.g.players[0].killcount = 20000;
+                s.g.players[0].secretcount = 100;
+                s.bots[0].goalstart = 101;
+                s.bots[0].goalbest = 1;
+                s.bots[0].turned = 300000;
+                s.bots[0].uses = 10000;
+                if (style == 9) { tdied[0] = 1000; }
+            }
+            twas[0] = before;
+            thuman[0] = 1;
+            val humans_before: i64 = human_kept;
+            trial_s = ?s;
+            trial_over(?l, ?picks[0]);
+            val wanted: bool = mode != 0;
+            if (tkeep_on[0] != wanted || (l.members[0].generation == 1) != wanted) { ret style * 3 + mode + 1; }
+            if (wanted && tkeep[0] != 42) { ret 40; }
+            if ((human_kept > humans_before) != wanted) { ret 41; }
+            mode = mode + 1;
+        }
+        style = style + 1;
+    }
+    trial_s = nil;
+    ret 0;
+}
+
+test cohort__selects_only_the_four_active_members {
+    cohort = 1;
+    seed = 1;
+    var round: i32 = 0;
+    for (round < 32) {
+        var picks: [4]i32;
+        choose_members(?picks[0]);
+        var i: i32 = 0;
+        for (i < 4) {
+            if (!lf.cohort_member(picks[i])) { ret 1; }
+            var j: i32 = 0;
+            for (j < i) {
+                if (picks[j] == picks[i]) { ret 2; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    cohort = 0;
+    if (!active_member(0) || !active_member(99)) { ret 3; }
+    ret 0;
+}
+
+test cohort__inheritance_leaves_paused_records_untouched {
+    var l: League;
+    cohort = 1;
+    seed = 1;
+    var i: i32 = 0;
+    for (i < 4) {
+        val who: i32 = lf.COHORT[i];
+        if (STYLE_OF[who % 20] != 0) { ret 1; }
+        l.members[who].games = 20;
+        l.members[who].rating = 10000 * (i + 1);
+        l.members[who].net[0] = (i + 1)::i8;
+        i = i + 1;
+    }
+    l.members[1].games = 20;
+    l.members[1].rating = 900000;
+    l.members[1].net[0] = 77;
+    l.members[2].games = 20;
+    l.members[2].rating = -900000;
+    l.members[2].net[0] = 99;
+    inherit(?l);
+    if (l.members[lf.COHORT[0]].net[0] != 4) { ret 2; }
+    if (l.members[1].net[0] != 77 || l.members[2].net[0] != 99 || l.members[2].rating != -900000) { ret 3; }
+    var picks: [4]i32 = lf.COHORT;
+    if (kind_for(?l, ?picks[0], 0) != bot.KIND_NET) { ret 4; }
+    cohort = 0;
+    ret 0;
+}
+
+test human_proposal__does_not_install_untested_weights {
+    var m: Member;
+    var first: [942]i8;
+    var pool: [200016]u8;
+    var i: i32 = 0;
+    for (i < 768) { first[i] = 1; i = i + 1; }
+    i = 792;
+    for (i < 936) { first[i] = -1; i = i + 1; }
+    i = 0;
+    for (i < ENOUGH) {
+        val at: i32 = POOL_HEAD + i * POOL_RECORD;
+        pool[at] = 1;
+        pool[at + 1] = 1;
+        var j: i32 = 2;
+        for (j < POOL_RECORD) { pool[at + j] = 127; j = j + 1; }
+        i = i + 1;
+    }
+    m.net[0] = 17;
+    m.generation = 7;
+    m.sigma = 2;
+    m.share = 4;
+    cohort = 1;
+    coop = 1;
+    seed = 1;
+    keeppb = ?pool[0];
+    pooled = ENOUGH;
+    taught = ENOUGH - 1;
+    if (propose(?m, ?first[0], 1)) { ret 1; }
+    taught = ENOUGH;
+    if (!propose(?m, ?first[0], 1)) { ret 2; }
+    if (human_proposed != 1 || m.net[0] != 17 || m.generation != 7 || human_kept != 0) { ret 3; }
+    keeppb = nil;
+    pooled = 0;
+    taught = 0;
+    cohort = 0;
+    coop = 0;
+    ret 0;
+}
+
+test human_coverage__separates_modes_and_levels {
+    var pool: [136]u8;
+    pool[16] = 1; pool[17] = 3;
+    pool[56] = 1; pool[57] = 7;
+    pool[96] = 2; pool[97] = 3;
+    coop = 1;
+    if (of_this_kind(?pool[0], 3) != 2 || taughtmaps[2] != 1 || taughtmaps[6] != 1) { ret 1; }
+    coop = 0;
+    if (of_this_kind(?pool[0], 3) != 1 || taughtmaps[2] != 1 || taughtmaps[6] != 0) { ret 2; }
     ret 0;
 }

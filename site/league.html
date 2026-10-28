@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Doom in Mach: the bot leagues</title>
-<meta name="description" content="Two leagues of a hundred neural-network bots each, playing Doom around the clock: one at deathmatch, one as co-op teams on Nightmare.">
+<meta name="description" content="Doom bots learning around the clock: a deathmatch league and four completion-first co-op learners on Nightmare, learning from self-play and opt-in human demonstrations.">
 <style>
   :root {
     --bg: #f6f3ee; --fg: #1d1a17; --muted: #5d564e; --rule: #ddd5ca; --panel: #ffffff;
@@ -59,14 +59,13 @@
   <p class="lede" id="lede-dm">A hundred bots, each a 942-byte neural network, playing two-minute deathmatches
   against each other around the clock. They all began as the same network. Each learns by its own lights, so
   they have not stayed the same.</p>
-  <p class="lede" id="lede-coop" hidden>A hundred other bots, with networks of their own, playing as teams of four
-  against the first episode on Nightmare: fast monsters that come back. They play a level through, not race it:
-  into every secret they can find a way into, fighting until five minutes are up, and only then out by the
-  exit. A match is a <b>campaign</b>: all nine levels in order, the same four from first to last, carrying
-  their weapons forward, each level for eight minutes or until the team is out of it. A bot's score for the
-  campaign is what it did to get the team on (secrets, keys, locked doors, switches, the way it covered, a
-  little for a kill and a little off for a death) and nothing for standing still. It is rated against its
-  team-mates by that score, and <b>Points</b> is its running total over every campaign it has played.</p>
+  <p class="lede" id="lede-coop" hidden><b>Four active learners</b> train together against the first episode on
+  Nightmare: fast monsters that come back. The other league members keep their saved weights and histories
+  while this small cohort gets the practice. <b>Completion comes first; secrets are optional.</b> Required
+  keys, switches and the normal exit take priority. A campaign visits all nine levels, carrying equipment
+  forward. A stalled level is abandoned after a five-minute grace and three minutes without new progress,
+  with a thirty-minute safety cap; abandonment never counts as completion. These bots are still learning,
+  not yet qualified to finish the whole episode consistently. <b>Points</b> is each bot's running campaign total.</p>
 
   <p class="lede"><b>To watch a match:</b> in <a href="./">the game</a>, press Esc, choose <em>Play online</em>,
   then <em>Watch the co-op bots</em> or <em>Watch the deathmatch bots</em>. The co-op bots are joined where they
@@ -80,6 +79,8 @@
   </div>
   <p id="error" hidden>The standings could not be loaded. The league may be starting up; this page tries again by itself.</p>
 
+  <p id="cohort-status"></p>
+  <label id="paused-control" hidden><input type="checkbox" id="show-paused"> Show retained, paused co-op members</label>
   <div class="scroll">
     <table>
       <thead><tr><th>#</th><th>Bot</th><th>Style</th><th>Quirk</th><th>Rating</th><th>Games</th><th id="h-frags">Frags</th><th>Deaths</th><th id="h-ratio">F/D</th><th id="h-points">Points</th><th>Gen</th><th>Likes</th><th>Dislikes</th></tr></thead>
@@ -95,10 +96,11 @@
     Tourists want to run, Campers to stand still, Dervishes to spin, Doormen to press every wall, Pacifists never
     to fire, and Lemmings to die. Brawlers fight with their fists alone. They get better at what they want, which
     is not always winning.</p>
-    <p id="key-coop" hidden>Crusaders want everything a team needs: kills, the way to the exit, the keys, the level
-    finished, and not to die. Slayers and Marksmen want kills, Explorers the secrets and the way out, Survivors
-    not to die, Pacifists to get there without firing. Brawlers do it all with their fists. Campers, Dervishes,
-    Doormen and Lemmings want what they want in the other league, and are as much help as you would think.</p>
+    <p id="key-coop" hidden>The active cohort is four Steady Crusaders: Rusty Demon, Sleepy Baron, Dizzy Marine
+    and Grim Zombie. They use the normal neural policy without novelty traits or grudges. A candidate that
+    finishes a level beats one that does not, regardless of kills or secrets. With equal completion outcomes,
+    progress and the supporting score decide. Human demonstrations propose some candidates; the same-seed
+    level trial must still justify keeping them. The paused members' styles and records are retained.</p>
     <p>Every bot has a <b>quirk</b>. The Cautious back away from a fight when they are hurt; the Reckless charge,
     and take the short way through the slime, since dying only puts them back at the start; the Loyal stay by
     the bot they like best; Grudge-bearers feel everything three times over. And every bot has <b>feelings</b>
@@ -109,7 +111,16 @@
     table shows whom each likes best and least, and how much.</p>
     <p><i>Apprentices</i> learn from people instead of from their own matches: players who say yes when the game
     asks send how they move and fight, and each apprentice keeps nudging itself toward doing what those players
-    did. <span id="taught"></span></p>
+    did. The active co-op cohort also learns from those demonstrations, alongside self-play, with extra
+    attention to use and weapon-change decisions. <span id="taught"></span></p>
+    <p id="teaching-progress"></p>
+    <p id="teaching-maps"></p>
+    <p><b>To teach the co-op bots:</b> update the game, join or host an online co-op game, and opt in to
+    <em>Bots learn from my play</em>. Host a four-player room and press Enter in the lobby to fill its
+    other seats with bots. Every fourth tic, your 32 bot-observation features and six command values
+    can be sent with the map and game mode. No names or chat are recorded in the teaching samples.
+    Offline play is not uploaded. These observations teach decisions and tactics; they do not guarantee
+    that training alone will solve every level's route.</p>
     <p><i>The Teacher</i> is the hand-written bot they all first imitated, and <i>Static</i> is a network of noise;
     neither learns.</p>
   </div>
@@ -130,11 +141,19 @@
     document.getElementById("error").hidden = true;
     var rows = document.getElementById("rows");
     rows.textContent = "";
-    board.bots.forEach(function (b, i) {
+    var limited = coop && board.active_count && board.active_count < board.bots.length;
+    document.getElementById("paused-control").hidden = !limited;
+    document.getElementById("cohort-status").textContent = limited
+      ? board.active_count + " active learners; " + (board.bots.length - board.active_count) + " members paused with their records retained."
+      : "";
+    var visible = board.bots.filter(function (b) {
+      return !limited || b.active !== false || document.getElementById("show-paused").checked;
+    });
+    visible.forEach(function (b, i) {
       var tr = document.createElement("tr");
       if (b.style === "Hand-written" || b.style === "Noise") tr.className = "fixed";
       cell(tr, i + 1, "rank");
-      cell(tr, b.name);
+      cell(tr, b.name + (coop && b.active === false ? " (paused)" : ""));
       cell(tr, b.style, "style");
       cell(tr, b.quirk || "", "style");
       cell(tr, b.rating, "rating");
@@ -168,7 +187,13 @@
       ago(Date.now() / 1000 - board.updated);
     document.getElementById("taught").textContent = board.taught
       ? "They have " + board.taught.toLocaleString() + " moments of people's play to learn from in this league."
-      : "Nobody has sent any play for this league yet, so its apprentices are as they began.";
+      : "Nobody has sent any play for this league yet; human-guided proposals wait for enough examples.";
+    document.getElementById("teaching-progress").textContent = coop && board.human_proposed_session !== undefined
+      ? "Since this arena process started: " + board.human_proposed_session.toLocaleString() + " human-guided candidates proposed, " + board.human_kept_session.toLocaleString() + " accepted by level trials."
+      : "";
+    document.getElementById("teaching-maps").textContent = coop && board.taught_maps
+      ? "Human samples by level: " + board.taught_maps.map(function (n, i) { return "E1M" + (i + 1) + " " + n.toLocaleString(); }).join("; ") + "."
+      : "";
     document.getElementById("now").hidden = false;
   }
   var coop = location.hash === "#coop";
@@ -196,6 +221,7 @@
   }
   document.getElementById("tab-dm").addEventListener("click", function () { choose(false); });
   document.getElementById("tab-coop").addEventListener("click", function () { choose(true); });
+  document.getElementById("show-paused").addEventListener("change", load);
   choose(coop);
   setInterval(load, 30000);
 </script>

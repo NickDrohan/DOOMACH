@@ -213,6 +213,19 @@ own: what wins a deathmatch (find the others, shoot them) is not what gets a tea
 level, so the two leagues keep separate files and never exchange a weight. Both began from the
 same imitation of the hand-written bot (`fixtures/bot0.net`) and go their own ways from there.
 
+**The active foundation cohort.** `COOP_COHORT=4` concentrates co-op practice on four existing
+Steady Crusader learners: Rusty Demon (5), Sleepy Baron (23), Dizzy Marine (41), and Grim Zombie
+(64), using the file's zero-based IDs. Their existing weights and histories carry forward.
+The other 96 records remain in `coop.bin`, but are not selected, taught, reset or replaced by
+inheritance while this mode is enabled. Deathmatch is unchanged. `COOP_COHORT=0` restores the
+full co-op population; it does not reset either league. Keep the cohort small until its measured
+completion is dependable, rather than treating elapsed training time as qualification.
+
+The relay uses the same cohort for bots joining people's co-op games. Foundation games use
+normal neural controls without novelty traits or grudges. Names, saved records, and the full
+100-member binary layout are retained. The page shows the four active members by default and
+can show the paused records too.
+
 **The game.** Four bots are a team on a map of the first episode, on **Nightmare** and nothing
 easier: monsters twice as quick to attack, demons at twice the speed, fireballs at twice
 theirs, and everything killed gets up again. (Nightmare's fast demons and fireballs were not in
@@ -223,26 +236,30 @@ meets them (the secret level after the third), the same four from the first to t
 carrying forward what they hold as players do (`game.campaign_game`). A level has no time
 limit: it is left when the team finishes it, however long that takes, or when it has stopped
 getting anywhere — three minutes in which no bot came nearer the exit than any had by four
-cells, found a secret or picked up a key, counted only after the level's first five minutes,
+cells, found a secret or acquired a new key color, counted only after the level's first five minutes,
 and half an hour at
 the outside in case of something no one has thought of (`game.stalled`). Every campaign is
 every level, so no bot is ever rated on a lucky draw of maps, and a bot's score for a campaign
 is added to its running total, which the standings show as its points.
 
-**They play the level through; they do not race it.** A co-op bot with nobody to follow has
-two things to do, in order:
+**Completion comes first in bot-only games.** A co-op bot with nobody to follow has two
+priorities, in order:
 
-1. **Every secret it believes in.** The level's secret sectors are found when it loads, with a
-   place to stand in each. Each bot starts from a different one, so the team spreads out. A
-   bot gives a secret up when it can find no walk to it that it can vouch for, or has spent 45
-   seconds getting no nearer, and tries again a minute later or when it picks up a key — but a
-   secret given up on four times is counted out of reach for good, a new key aside: a key may
-   open the way there. Monsters on the way are fought as they come; there is no time in it.
-2. **Then, and not before, the exit.** While a secret is still believed in, a bot will not
-   press the exit switch, and lines that end the level when walked over are walls to it. Once
-   none is, if the way out needs a key it goes for the nearest key it can find a sure walk to
-   (keys stay where they are in co-op, so each bot fetches its own), a key it cannot get to
-   given up the same way. The exit itself it never gives up: it is the only way the level ends.
+1. **The exit and its prerequisites.** Every navigation update first asks for a verified
+   route to the normal exit, or to a key or switch needed on the way (`mission_bearing`).
+   Unfound secrets never lock the exit: a bot-only team can cross an exit line or press a
+   normal exit switch at any time. A usable normal exit is pressed even if the network is
+   not asking to move or use. Keys still stay for each co-op player to collect individually.
+2. **Optional exploration if the mission has no verified route.** A secret may provide a
+   useful detour, and a loyal bot may rejoin a friend, but neither takes priority over a
+   verified mission route. Speculative paths are not treated as verified: doing so trapped
+   exit-first teams at E1M5's lift/switch chain. Secrets retain their 45-second patience and
+   four-failure limit, with keys reopening possibilities, but those limits never control
+   permission to exit. Secrets encountered normally are still counted and rewarded.
+
+The existing preference for normal rather than secret-exit switches is unchanged; the league
+still visits the secret map after E1M3. Human-led games are unchanged: bots follow the person,
+wait when that person is dead, and do not choose when to end their level.
 
 **They learn as they go.** A net keeps the last eight things it decided — the senses it had
 and what it made of them — and what the world does to it next is laid at their door. A secret
@@ -359,43 +376,59 @@ weapons stay for the others) a shotgun it already had, and stood on it. Now an i
 only if the bot would pick it up and can walk straight to it. On the deathmatch measure, four
 hand-written bots for two minutes on each of the seven maps, that took frags from 81 to 102.
 
-**Where it stands.** Measured with four hand-written bots, one run a map, thirty minutes
-allowed (no level has a limit — they take what they take).
-"Calm" is the same level with the monsters taken out (`coopmatch ... calm`), which shows the
-route-finding apart from the fighting.
+**Completion-first baseline.** These measurements describe the incremental policy after
+`659f41d`, before the unqualified per-level controller experiments. Each result uses four hand-written bots, one fixed-seed run, and an eight-minute
+simulation ceiling. "Calm" removes monsters (`coopmatch ... calm`) to separate route-finding
+from fighting. E1M6 is not requalified; a timeout is not counted as either a finish or a loss.
 
 | Map | Calm: secrets, exit |
 |---|---|
-| E1M1 | 3 of 3, out at 1:25 |
-| E1M2 | 3 of 6, out at 4:23 |
-| E1M3 | 1 of 7, out at 4:59 |
-| E1M4 | 2 of 3, out at 3:59 |
-| E1M5 | 9 of 9, out at 2:49 |
-| E1M6 | 4 of 4, out at 15:28 |
-| E1M7 | 1 of 4, out at 3:59 |
-| E1M9 | 2 of 2, out at 4:29 |
+| E1M1 | 0 of 3, out at 0:28.7 |
+| E1M2 | 0 of 6, out at 0:50.3 |
+| E1M3 | 1 of 7, out at 1:51.3 |
+| E1M4 | 1 of 3, out at 1:14.7 |
+| E1M5 | 3 of 9, out at 2:20.9 |
+| E1M6 | Completion remains unverified within bounded diagnostics |
+| E1M7 | 0 of 4, out at 3:19.3 |
+| E1M9 | 1 of 2, out at 2:33.3 |
 
-On Nightmare the same four finish E1M1 with all three of its secrets at 1:23.
+The same-seed E1M1 comparison against the saved pre-completion-first local build:
 
-So: with the monsters out, every level that can end is finished — E1M8 alone cannot, having no
-exit line (below) — six of them with every secret, and all of them as soon as the secrets are
-done with rather than when a clock ran out. E1M6 took the quarter of an hour it needed: its
-secrets are found, and then it is out. The secrets not found are of three kinds. One: a bot
+| Nightmare team | Before | Completion-first |
+|---|---|---|
+| Hand-written | out at 1:36.3, 3/3 secrets | out at 0:45.4, 0/3 secrets |
+| Four copies of `fixtures/bot0.net` | no exit within 8:00 | out at 5:40.9, 1/3 secrets |
+
+Both E1M1 teams, E1M1 calm, and E1M5/E1M7 calm give identical outputs in debug and release.
+The unchanged starting network is now covered by a Nightmare E1M1 completion gate, not merely
+by tests of the hand-written bot. This is a fixed-seed regression result, not qualification
+of every live learner or the whole episode. Other Nightmare levels remain work: the wider
+bounded sample did not establish additional clears, and E1M6 hit its wall-time limit.
+
+The key planner accepts a reachable point within Doom's existing pickup radius and height
+limits, with clear sight, rather than requiring a path onto a raised key's exact ledge.
+Neither pickup physics nor Nightmare difficulty has been changed.
+
+Standalone `coopmatch` runs do not exercise the campaign's no-progress cutoff unless their
+final argument is `league` or `leaguetrace`; `harness/coopcheck.py --league` selects that mode. Seven non-boss
+calm maps have been rechecked to finish without requiring every secret; E1M6 remains
+unverified and E1M8 needs its boss-death trigger (below).
+The secrets not found are of three kinds. One: a bot
 can circle a goal it believes in and cannot reach — 45 seconds without getting nearer now
 gives it up, and a secret given up four times is counted out of reach, for monsters, keys and
 the friend it follows alike, though the exit is never given up. Two: a place can be walked
 into but never back out of — E1M6's nukage trenches are one-way drops, and everything left
 inside one (secrets, keys, items, a monster, a friend) is now left alone; what enters anyway,
 roaming or pushed, does not come back. Three: a way believed can hinge on what is not
-working — E1M6's door pocket opens on a one-shot switch half the map away and shuts again on
-a timer. Where Nightmare falls short of calm the bots die, and a death puts a bot back at
+working: E1M6 includes a close-for-thirty-seconds-then-reopen trap, distinct from its
+remote opening switch. Waiting for that trap is not a fresh activation. Where Nightmare falls short of calm the bots die, and a death puts a bot back at
 the start. That part is the fighting, which is what the nets are there to learn. E1M8 is
 different from the rest: it has no exit line at all. The level ends on a floor that hurts to
 death, past walls that fall when the last bruiser dies and a teleporter inside them — so the
-grid marks the 666-tagged walls as movers it trusts, takes the teleport as the way out, and
-holds it shut to the bots until the secrets are done like any other way across the level's
-end. They still have to kill the bruisers to open it, and on Nightmare dead monsters come
-back; a calm E1M8 cannot end.
+grid marks the 666-tagged walls as movers it trusts and takes the teleport as the way out.
+Unfound secrets no longer prohibit that route for a bot-only team, but the actual walls still
+require both bruisers to be dead before either respawns. A calm E1M8 cannot trigger that
+boss-death mechanism.
 
 **How a league learns.** Both leagues once learned by blocks: six games as a bot is against
 six as a mutant of itself, on whatever maps and against whomever the draw gave. That cannot
@@ -405,8 +438,11 @@ of that league averaged under a frag a game each, where four copies of the net t
 as get nine or ten a match between them: they had drifted *down*. So now every match in both
 leagues is played twice. The second time is the same map, the same seeds and the same four,
 but each learner is replaced by a mutant of itself; a mutant that earned clearly more of what
-its style wants than the bot did in the very same match (a quarter more, and ten) takes its
-place. In the co-op league, where a match is nine levels, the trial is level by level instead:
+its style wants than the bot did in the very same deathmatch (a quarter of the old reward's
+magnitude, plus ten, as the margin) takes its place. In co-op, a completed trial level always
+beats an abandoned one, for every style; a larger kill or secret score cannot reverse that.
+When completion is equal, the margin is a twentieth of the old style reward's magnitude
+plus five. The co-op trial is level by level:
 as each level ends it is played again from where it began, each learner a mutant of the net
 it began that level with, and a mutant that clearly outdid it there goes on as the bot —
 as the mutant ended the level, what it learned in the winning kept — for the levels to come.
@@ -425,8 +461,9 @@ was wanted. Paid two a kill and five off a death, its top bots came to kill half
 and finish no more levels. Paid fifteen off a death, it learned that the bot which never moves
 never dies: Survivors and Pacifists that stood where they began rose to the top with four
 kills a game, and levels finished fell from one in eleven to one in twenty-six. So now a death
-costs little, and nothing at all can be earned by standing still. A campaign's score, each
-thing once a level:
+costs little, and merely remaining alive earns no flat bonus. Completion takes priority in
+trial selection; the campaign's points and rating still use this score, each objective once
+a level:
 
 | | Points |
 |---|---|
@@ -434,14 +471,18 @@ thing once a level:
 | a locked door opened, to whoever was at it | 30 |
 | a switch thrown or a line crossed that works once, to whoever was at it | 8 |
 | a secret, to the first in | 25 |
-| each hundredth of the way to a level's exit | 1 |
-| a kill | 1 |
+| each hundredth of the way to a level's exit | 2 |
+| kills | half the kill count, rounded down per tally |
 | a death | -3 |
 | a level finished, to each of the four (in the running total and a style's reward; it does not tell team-mates apart, so not in the rating) | 100 |
 
 A door opened forty times is a door opened once: only the first opening counts, and only
 lines that work once are counted at all, so there is nothing to farm. The route is still the
 hand-written route-finding's; what the net is paid for is getting along it alive.
+The campaign and per-level trial now share `coop_score`, so their kill/progress weights
+cannot silently differ. The trial still does not attribute locked doors and one-shot switches.
+Mid-campaign standings include deaths counted so far and a refreshed score at each level's
+end; those fields are no longer left at zero until the whole campaign ends.
 
 The styles: Crusaders and Brawlers want all of that. Explorers want it without the kills.
 Survivors want the way covered and the levels finished, at little cost in deaths; Pacifists
@@ -492,8 +533,30 @@ processor, so at 3% of a shared one the co-op league plays a match every few min
 
 ## Learning from people
 
-Five bots in each league are **apprentices** (the fourteenth of every twenty). They are rated
-like the rest, but they do not learn from their matches. They learn from people.
+**The four co-op learners use both sources of experience.** At alternating seats/maps, a level
+trial can start from a human-guided proposal rather than a random mutation. It requires at
+least 5,000 co-op samples. A lesson draws up to a fifth of its 300 samples from use or weapon
+changes, then fills from ordinary co-op decisions; rare interactions must not disappear under
+walking and shooting. Sixty-four small imitation mutations propose a candidate in scratch
+storage. The learner's live net and generation are not changed by that lesson.
+
+The candidate then plays the same-seed level trial against the recorded parent outcome.
+Completion dominates acceptance; an unfinished proposal cannot replace a completed parent.
+For equal completion outcomes it must improve the supporting score by the existing margin.
+Only a retained trial is installed between levels, with the ordinary watch/replay rules.
+Random mutations and in-level learning continue; more demonstrations are not a guarantee of
+solving every map.
+
+`coop.json` includes `active_count`, each member's `active` flag, `taught_maps` (nine counts),
+and `human_proposed_session` / `human_kept_session`. The latter counters explicitly restart
+with the arena process; the members' generations, histories and weights remain persistent.
+The teaching pool is still the bounded 100,000-record `MDT1` file. No new personal fields or
+expanded telemetry are collected. Only an opted-in online player's samples are uploaded;
+offline play and players who have not agreed do not contribute.
+
+Outside the foundation cohort, five bots in each full league are **apprentices** (the
+fourteenth of every twenty). They are rated like the rest, but learn from people instead of
+their own matches. In four-member co-op mode those paused apprentices are left untouched.
 
 **Asking.** The first time a player opens "Play online" the game asks whether the bots may
 learn from them, says what is sent, and keeps the answer in `doom.cfg` beside the program
@@ -535,7 +598,8 @@ picks things up, given the same view of the world a bot has. Not where a secret 
 person does not decide once every four tics or hold a button the way a bot's reflexes do, so
 the likeness is rough. Nor does the relay know that what it is sent was played by a person:
 anyone in a started game can send samples, so the pool could be fed nonsense. It is small,
-it only steers five bots, and their ratings will say if they have been taught badly.
+its proposals are advisory. The co-op cohort additionally tests them in levels before
+accepting them; the full leagues' apprentice behavior remains as described above.
 
 `board.json` and `coop.json` carry `taught`, the moments of that league's kind now held, and
 the league page shows it.

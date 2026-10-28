@@ -2643,7 +2643,7 @@ fun botmatch(argc: i64, argv: **u8) i64 {
 # a co-op game of four bots on Nightmare, as the co-op league plays it: how
 # far each got toward the exit, what it killed and how often it died
 #
-#   doom coopmatch <wad> <map> <tics> [<net file> | trace | calm | calmtrace | lead | calmlead | idle]
+#   doom coopmatch <wad> <map> <tics> [<net file> | script | trace | calm | calmtrace | lead | calmlead | idle] [seed] [trace | league | leaguetrace]
 #
 # "calm" is the level with no monsters in it, which shows what the bots can
 # find their way to when nothing is killing them; "trace" says every five
@@ -2663,9 +2663,13 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
 
     var net:  *i8  = nil;
     var kind: i32  = bot.KIND_SCRIPT;
-    val calm:     bool = argc == 6 && (argv[5][0] == 'c' && argv[5][1] == 'a' || str_equals(argv[5], "lead") || str_equals(argv[5], "idle"));
-    val trace:    bool = argc == 6 && (str_equals(argv[5], "trace") || str_equals(argv[5], "calmtrace") || str_equals(argv[5], "calmleadtrace"));
-    if (argc >= 6 && !trace && !calm) {
+    var runseed: u32 = 0;
+    if (argc >= 7) { runseed = number(argv[6], 0)::u32; }
+    val calm:     bool = argc >= 6 && (argv[5][0] == 'c' && argv[5][1] == 'a' || str_equals(argv[5], "lead") || str_equals(argv[5], "idle"));
+    val traced_mode: bool = argc >= 6 && (str_equals(argv[5], "trace") || str_equals(argv[5], "calmtrace") || str_equals(argv[5], "calmleadtrace"));
+    val league: bool = argc == 8 && (str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace"));
+    val trace: bool = traced_mode || (argc == 8 && (str_equals(argv[7], "trace") || str_equals(argv[7], "leaguetrace")));
+    if (argc >= 6 && !traced_mode && !calm && !str_equals(argv[5], "script")) {
         val file: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, argv[5]);
         if (sel file.err) { ret EXIT_WAD; }
         if (file.ok.len != bot.NETSIZE::usize) { ret EXIT_DATA; }
@@ -2680,13 +2684,16 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     if (!game.coop_game(s, 4, 0, defs.SK_NIGHTMARE, map)) { ret EXIT_MAP; }
     # "calm" and "calmtrace": the level with nothing in it, to see what the
     # bots can find their way to when nothing is killing them
-    if (argc == 6 && argv[5][0] == 'c' && argv[5][1] == 'a') {
+    if (argc >= 6 && argv[5][0] == 'c' && argv[5][1] == 'a') {
         s.g.nomonsters = 1;
         if (!game.init_new(s, defs.SK_NIGHTMARE, 1, map)) { ret EXIT_MAP; }
     }
+    if (league) { s.campaign = 1; s.levelcap = tics; s.capped = 0; }
+    var skip: u32 = runseed & 255;
+    for (skip > 0) { defs.p_random(?s.g); skip = skip - 1; }
     var i: i32 = 0;
     for (i < 4) {
-        game.set_bot(s, i, kind, net, (0x9e3779b9 * (i + 1):~u32) | 1);
+        game.set_bot(s, i, kind, net, ((0x9e3779b9 * (i + 1):~u32) ^ (runseed * 0x85ebca6b)) | 1);
         i = i + 1;
     }
 
@@ -2694,11 +2701,11 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     # the level as a bot alone does; the other three take it for a person
     # and follow. How much of the time each is with it says whether bots
     # keep up with someone who opens the level ahead of them.
-    val lead: bool = argc == 6 && (str_equals(argv[5], "lead") || str_equals(argv[5], "calmlead") || str_equals(argv[5], "calmleadtrace"));
+    val lead: bool = argc >= 6 && (str_equals(argv[5], "lead") || str_equals(argv[5], "calmlead") || str_equals(argv[5], "calmleadtrace"));
     if (lead) { s.g.isbot[0] = 0; }
     # "idle": the first player is a person who never touches the keys. The
     # bots must stay with them, and must not end the level over their head.
-    if (argc == 6 && str_equals(argv[5], "idle")) {
+    if (argc >= 6 && str_equals(argv[5], "idle")) {
         s.g.isbot[0]     = 0;
         s.bots[0].active = 0;
     }
@@ -2720,9 +2727,17 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
             if (trace && tic % 175 == 0) {
                 val tb: *bot.Bot = ?s.bots[i];
                 print.eprintlnf("t{} b{} at {},{} after {} want {} at {},{} works {} way {} stuck {} gaveup {} hp {}", tic / 35, i + 1, s.g.players[i].mo.x >> 16, s.g.players[i].mo.y >> 16, tb.after, tb.want, tb.afterx >> 16, tb.aftery >> 16, tb.works, tb.haveway, tb.feat[bot.F_STUCK], tb.gaveup, s.g.players[i].health);
+                val tp: *defs.Player = ?s.g.players[i];
                 if (tb.nbans > 0) { print.eprintlnf("    b{} went round {} lines: {} {} {} {} {} {}", i + 1, tb.nbans, tb.bans[0], tb.bans[1], tb.bans[2], tb.bans[3], tb.bans[4], tb.bans[5]); }
             }
-            if (now && !dead[i]) { deaths[i] = deaths[i] + 1; }
+            if (now && !dead[i]) {
+                deaths[i] = deaths[i] + 1;
+                if (trace) {
+                    var who: i32 = -1;
+                    if (s.g.players[i].attacker != nil) { who = s.g.players[i].attacker.kind; }
+                    print.eprintlnf("death t{} b{} at {},{} attacker {}", tic / 35, i + 1, s.g.players[i].mo.x >> 16, s.g.players[i].mo.y >> 16, who);
+                }
+            }
             dead[i] = now;
             # hurt by a friend: a tic on which its hurt rose and whoever did
             # it is another player
@@ -2764,7 +2779,8 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     }
     print.eprintlnf("{} tics in {} ms", tic, took / 1000);
     var done: i32 = 0;
-    if (s.completed) { done = 1; }
+    if (s.completed && !s.capped) { done = 1; }
+    if (league) { print.printlnf("league cutoff {}", s.capped); }
     print.printlnf("hit by friends {} times", friendly);
     print.printlnf("end tic {} finished {} secrets {} of {} sum {} map E1M{}", tic, done, found, s.g.totalsecret, game.checksum(s), map);
     ret EXIT_OK;
@@ -3785,7 +3801,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc == 3 && str_equals(argv[1], "joinleague"))                       { ret joinleague(argv); }
     if (argc == 5 && str_equals(argv[1], "resumecheck"))                      { ret resumecheck(argv); }
     if (argc == 3 && str_equals(argv[1], "fingerprint"))                      { ret print_fingerprint(argv); }
-    if ((argc == 5 || argc == 6) && str_equals(argv[1], "coopmatch"))         { ret coopmatch(argc, argv); }
+    if (argc >= 5 && argc <= 8 && str_equals(argv[1], "coopmatch") && (argc < 8 || str_equals(argv[7], "trace") || str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace")))         { ret coopmatch(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "rooms"))                            { ret rooms(argv); }
     if (argc == 4 && str_equals(argv[1], "watch"))                            { ret watch(argc, argv); }
     if (argc == 6 && str_equals(argv[1], "muswav"))                           { ret muswav(argv); }

@@ -546,6 +546,7 @@ var waystep:    [65536]u8;
 # the keys whoever is walking has, a bit a colour; and the keys the doors
 # the walk went through needed
 var walkhave: i32;
+var walkitem: *Mobj;
 var walkkey:  i32;
 # a strict test asks whether the walk can be made as the level stands this
 # tic, doors shut and lifts wherever they are; and notes the line that
@@ -1171,9 +1172,9 @@ pub fun reaches(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed, round1: i3
     walkhave = KEY_ALL;
     if (g.navserial != g.levelserial) { build_grid(g); }
     if (g.navgrid == nil) { ret -1; }
-    nbanned   = 2;
-    banned[0] = round1;
-    banned[1] = round2;
+    nbanned = 0;
+    if (round1 >= 0) { banned[nbanned] = round1; nbanned = nbanned + 1; }
+    if (round2 >= 0 && round2 != round1) { banned[nbanned] = round2; nbanned = nbanned + 1; }
     val cells: i32 = g.navw * g.navh;
     val queue: *u16 = ?reachqueue[0];
     var tail:  i32 = 0;
@@ -1581,9 +1582,9 @@ fun given_up(g: *Game, b: *Bot, x: Fixed, y: Fixed) bool {
     ret dx + dy <= GAVE_RADIUS;
 }
 
-# whether the level still holds a secret this bot has not counted out of
-# reach: what the way out stays shut to it for. A secret given up on only
-# for the moment still counts — it will be tried again.
+# whether optional exploration still has a secret not counted out of
+# reach. A secret given up on only for the moment still counts, to be
+# tried again when no verified mission route is available.
 fun secrets_left(g: *Game, b: *Bot) bool {
     if (g.navserial != g.levelserial) { build_grid(g); }
     if (g.navgrid == nil || g.navsecrets == 0) { ret 0; }
@@ -1595,9 +1596,9 @@ fun secrets_left(g: *Game, b: *Bot) bool {
     ret 0;
 }
 
-# the way for a co-op bot that follows nobody, which plays the level: to
-# each secret nobody has been in, for as long as one is left it believes
-# in; then to the exit, or to a key the way there needs; 0 if there is
+# the way for a co-op bot that follows nobody: a verified route to the
+# exit or its keys and switches first. Unfound secrets are optional
+# exploration when no mission route can be vouched for; 0 if there is
 # nowhere to go
 fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     val me: *Mobj = g.players[playernum].mo;
@@ -1613,10 +1614,9 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         b.gavekeys   = had;
         b.keyuntil   = 0;
     }
-    # until the secrets are done with, the lines that end the level are
-    # walls to it
-    var have: i32 = had;
-    if (secrets_left(g, b)) { have = have & (KEY_ALL ^ KEY_EXIT); }
+    # A bot-only team may leave even while secrets remain. Human-led
+    # routing removes KEY_EXIT in path_bearing instead.
+    val have: i32 = had;
     walkhave = have;
 
     # how far it has come toward the exit, for whoever scores it: by the
@@ -1643,14 +1643,14 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         }
     }
 
-    # First, the secrets: the ones nobody has been in yet and this bot has
-    # not given up on, each bot starting from a different one so that the
-    # team spreads out. A secret it cannot find a way into, or has made for
-    # for too long without getting there, it gives up for a while; a key it
-    # finds opens everything again, and a minute gone by arms them all for
-    # one more try — but a secret struck SECRET_TRIES times is out of reach
-    # for good, and when none is left to try the secrets are done and the
-    # way out opens.
+    # Keep optional exploration current when keys or doors may have
+    # changed. The mission is always tried first: its exit, the keys
+    # it needs, and switches that open its route. Without a verified
+    # mission route it may try an unfound secret, each starting at a different
+    # one. A stalled or unreachable secret is given up for a while;
+    # SECRET_TRIES failures count it out until another key is found.
+    # None of that prevents the team from taking a normal exit whenever
+    # it reaches one, or a mission route from taking priority again.
     if (b.gavekeys != had) {
         var z: i32 = 0;
         for (z < 32) {
@@ -1664,8 +1664,11 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         b.gaveup   = 0;
         b.gavetill = 0;
     }
+    val mission: i32 = mission_bearing(g, playernum, me, b, have);
+    if (b.haveway && !unsure) { b.want = -1; ret mission; }
+
     var tries: i32 = 0;
-    for (tries < 4 && g.navsecrets > 0) {
+    for (tries < 4 && secrets_left(g, b)) {
         tries = tries + 1;
         var pick: i32 = -1;
         if (b.want >= 0 && g.lv.sectors[g.navsecret[b.want]].special == 9 && (b.gaveup & (1 << b.want:~u32)) == 0 && b.struck[b.want]::i32 < SECRET_TRIES && !lost(g, g.navsecretx[b.want], g.navsecrety[b.want])) { pick = b.want; }
@@ -1692,8 +1695,8 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         b.gaveup = b.gaveup | (1 << pick:~u32);
     }
 
-    # A loyal bot, with no secret to make for, stays with the bot it likes
-    # best, if it likes one and has strayed from it
+    # With no mission or optional secret route, a loyal bot stays with
+    # the bot it likes best, if it likes one and has strayed from it
     if (b.quirk == QUIRK_LOYAL) {
         var friend: *Mobj = nil;
         var liked:  i32   = 59;
@@ -1716,7 +1719,37 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         }
     }
 
-    # Then the exit: in front of its switch and facing it, or across its line
+    ret mission_bearing(g, playernum, me, b, have);
+}
+
+fun pickup_point(g: *Game, me: *Mobj, item: *Mobj, x: Fixed, y: Fixed, tx: *Fixed, ty: *Fixed) bool {
+    val reach: Fixed = me.radius + item.radius - 65536;
+    if (reach <= 0) { ret 0; }
+    var probe: Mobj;
+    probe.x = item.x + clamp(x - item.x, 0 - reach, reach);
+    probe.y = item.y + clamp(y - item.y, 0 - reach, reach);
+    probe.subsector = render.point_in_subsector(g.lv, probe.x, probe.y);
+    probe.z = g.lv.sectors[g.lv.subsectors[probe.subsector].sector].floorheight;
+    probe.height = me.height;
+    val delta: Fixed = item.z - probe.z;
+    if (delta > probe.height || delta < 0 - 8 * 65536 || !maputl.check_sight(g, ?probe, item)) { ret 0; }
+    if (!walks_now(g, x, y, probe.x, probe.y)) { ret 0; }
+    @tx = probe.x;
+    @ty = probe.y;
+    ret 1;
+}
+
+fun solve_pickup(g: *Game, me: *Mobj, b: *Bot, key: *Mobj, have: i32) i32 {
+    val previous: *Mobj = walkitem;
+    walkitem = key;
+    val to: i32 = solve_to(g, me, b, key.x, key.y, key.x, key.y, have);
+    walkitem = previous;
+    ret to;
+}
+
+fun mission_bearing(g: *Game, playernum: i32, me: *Mobj, b: *Bot, have: i32) i32 {
+    # The exit: in front of its switch and facing it, or across its line
+    b.haveway = 0;
     if (g.navexitline < 0) { ret 0; }
     var x:  Fixed = g.navax;
     var y:  Fixed = g.navay;
@@ -1780,7 +1813,7 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     var k: i32 = 0;
     for (k < n && g.leveltime < b.keyuntil) {
         if (keys[k].x == b.keyx && keys[k].y == b.keyy && !lost(g, b.keyx, b.keyy)) {
-            val to: i32 = solve_to(g, me, b, b.keyx, b.keyy, b.keyx, b.keyy, have);
+            val to: i32 = solve_pickup(g, me, b, keys[k], have);
             if (b.haveway && !unsure && !stalling(g, b, me, b.keyx, b.keyy)) { ret to; }
             give_up(g, b, b.keyx, b.keyy);
         }
@@ -1789,7 +1822,7 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     k = 0;
     for (k < n) {
         if (given_up(g, b, keys[k].x, keys[k].y) || lost(g, keys[k].x, keys[k].y)) { k = k + 1; cnt; }
-        val to: i32 = solve_to(g, me, b, keys[k].x, keys[k].y, keys[k].x, keys[k].y, have);
+        val to: i32 = solve_pickup(g, me, b, keys[k], have);
         if (b.haveway && !unsure && !stalling(g, b, me, keys[k].x, keys[k].y)) {
             b.keyx     = keys[k].x;
             b.keyy     = keys[k].y;
@@ -1807,7 +1840,7 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     # door its key opens, the nearest key, on trust, given up on or not. A
     # team without it once wandered the last two minutes of every E1M2.
     b.after = 4;
-    ret solve_to(g, me, b, keys[0].x, keys[0].y, keys[0].x, keys[0].y, have);
+    ret solve_pickup(g, me, b, keys[0], have);
 }
 
 # the bearing of a place a few cells along the shortest walk to a place,
@@ -1833,6 +1866,9 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
         i       = i + 1;
     }
     var ends:  [9]i32;
+    var goalx: [9]Fixed;
+    var goaly: [9]Fixed;
+    val collecting: bool = walkitem != nil && tox == walkitem.x && toy == walkitem.y;
     var nends: i32 = 0;
     var tail:  i32 = 0;
     var dy:    i32 = -1;
@@ -1840,10 +1876,20 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
         var dx: i32 = -1;
         for (dx <= 1) {
             val near: i32 = cell_of(g, tox + ((dx * CELL) << 16), toy + ((dy * CELL) << 16));
-            if (near >= 0 && step[near] == 0 && can_walk(g, cell_x(g, near % g.navw), cell_y(g, near / g.navw), tox, toy)) {
-                step[near]  = 16;
-                queue[tail] = near::u16;
-                tail        = tail + 1;
+            if (near >= 0 && step[near] == 0) {
+                val x: Fixed = cell_x(g, near % g.navw);
+                val y: Fixed = cell_y(g, near / g.navw);
+                var gx: Fixed = tox;
+                var gy: Fixed = toy;
+                var reaches: bool = can_walk(g, x, y, tox, toy);
+                if (!reaches && collecting) { reaches = pickup_point(g, me, walkitem, x, y, ?gx, ?gy); }
+                if (reaches) {
+                    step[near]  = 16;
+                    queue[tail] = near::u16;
+                    goalx[tail] = gx;
+                    goaly[tail] = gy;
+                    tail        = tail + 1;
+                }
             }
             val by: i32 = cell_of(g, me.x + ((dx * CELL) << 16), me.y + ((dy * CELL) << 16));
             if (by >= 0 && can_walk(g, me.x, me.y, cell_x(g, by % g.navw), cell_y(g, by / g.navw))) {
@@ -1854,6 +1900,8 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
         }
         dy = dy + 1;
     }
+
+    val starts: i32 = tail;
 
     # breadth first from the opponent's cells. step[c] is the way to go from
     # c, as its direction's bit, 16 at an end of the walk, 0 if not reached.
@@ -1960,9 +2008,13 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
         b.wayy = y;
     }
     # at the end of the walk, the opponent itself
-    if (step[at] == 16 && can_walk(g, me.x, me.y, tox, toy)) {
-        b.wayx = tox;
-        b.wayy = toy;
+    if (step[at] == 16) {
+        var end: i32 = 0;
+        for (end < starts && queue[end] != at::u16) { end = end + 1; }
+        if (end < starts && can_walk(g, me.x, me.y, goalx[end], goaly[end])) {
+            b.wayx = goalx[end];
+            b.wayy = goaly[end];
+        }
     }
     ret clamp(bearing(me, b.wayx, b.wayy), -127, 127);
 }
@@ -2489,7 +2541,8 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         if (b.feat[F_SEEN] == 0 || b.feat[F_CLOSE] < 40) { b.engaged = 0; }
         or (b.feat[F_CLOSE] >= 64) { b.engaged = 1; }
     }
-    if (g.deathmatch == 0 && !b.shy && b.haveway && !b.engaged && b.feat[F_SEEN] > 0 && p.readyweapon != defs.WP_FIST && p.readyweapon != defs.WP_CHAINSAW) {
+    val walking: bool = g.deathmatch == 0 && !b.shy && b.haveway && !b.engaged && b.feat[F_SEEN] > 0 && p.readyweapon != defs.WP_FIST && p.readyweapon != defs.WP_CHAINSAW;
+    if (walking) {
         forward = 100;
         side    = 0;
         turn    = clamp(b.feat[F_PATH] * 6, -127, 127);
@@ -2565,7 +2618,11 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     # breadth; and a turn that reverses the last is taken at half.
     var toward: i32  = 0;
     var aimed:  bool = 0;
-    if (b.feat[F_SEEN] > 0) {
+    if (walking) {
+        toward = b.feat[F_PATH];
+        aimed  = 1;
+    }
+    or (b.feat[F_SEEN] > 0) {
         toward = b.feat[F_BEARING];
         aimed  = 1;
     }
@@ -2611,14 +2668,14 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     # door would, the door is opened, shut and opened again and never
     # passed.
     if (b.usewait > 0) { b.usewait = b.usewait - 1; }
-    # and a bot playing the level does not throw the switch that ends it
-    # while it still believes in a secret, nor ever the one to the secret
-    # level
+    # a bot playing the level may use its normal exit before finding
+    # every secret. It never throws the switch to the secret level;
+    # the campaign visits that level in its own order
     # A bot following a person never throws either: when the level ends is
     # the person's to say.
     var hold: bool = 0;
     if (b.alone && b.useexit) {
-        hold = secrets_left(g, b) || g.lv.lines[rayline_of(g, p.mo)].special == 51;
+        hold = g.lv.lines[rayline_of(g, p.mo)].special == 51;
     }
     if (b.led && b.useexit) { hold = 1; }
     # Whatever decided, a usable line within reach dead ahead — a shut door,
@@ -2627,7 +2684,7 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     # learned the press circles the room until chance presses it instead.
     # The exit switch is excepted for a bot not playing the level itself:
     # when the level ends is the person's to say, or the decision's.
-    var press: bool = b.out[O_USE] > 0 || ((forward != 0 || side != 0) && (b.alone || !b.useexit));
+    var press: bool = requests_use(b, forward, side);
     if (press && looking && b.usewait == 0 && b.usable && !hold) {
         buttons   = buttons | defs.BT_USE;
         b.uses    = b.uses + 1;
@@ -2782,5 +2839,225 @@ test forward__zero_net_gives_zero {
     net[INPUTS * HIDDEN + HIDDEN]       = 32;
     forward(?net[0], ?f[0], ?out[0]);
     if (out[0] != 50) { ret 2; }
+    ret 0;
+}
+
+fun requests_use(b: *Bot, forward: i32, side: i32) bool {
+    ret b.out[O_USE] > 0 || (b.alone && b.useexit) || ((forward != 0 || side != 0) && (b.alone || !b.useexit));
+}
+
+test think__follows_route_past_distant_enemy {
+    var sign: i32 = -1;
+    for (sign <= 1) {
+        var g: Game;
+        var mo: Mobj;
+        var b: Bot;
+        var cmd: Ticcmd;
+        g.leveltime = 1;
+        g.players[0].mo = ?mo;
+        g.players[0].health = 100;
+        g.players[0].readyweapon = defs.WP_PISTOL;
+        b.kind = KIND_SCRIPT;
+        if (sign > 0) { b.kind = KIND_NET; }
+        b.haveway = 1;
+        b.feat[F_SEEN] = 127;
+        b.feat[F_CLOSE] = 20;
+        b.feat[F_PATH] = 32 * sign;
+        b.feat[F_WAY] = 127;
+        think(?g, 0, ?b, ?cmd);
+        if (cmd.forwardmove <= 0 || cmd.angleturn::i32 * sign != 1920) { ret 1; }
+        sign = sign + 2;
+    }
+    ret 0;
+}
+
+test think__keeps_combat_aim {
+    var mode: i32 = 0;
+    for (mode < 2) {
+        var g: Game;
+        var mo: Mobj;
+        var b: Bot;
+        var cmd: Ticcmd;
+        g.leveltime = 1;
+        g.deathmatch = mode;
+        g.players[0].mo = ?mo;
+        g.players[0].health = 100;
+        g.players[0].readyweapon = defs.WP_PISTOL;
+        b.kind = KIND_SCRIPT;
+        b.haveway = 1;
+        b.feat[F_SEEN] = 127;
+        b.feat[F_BEARING] = -32;
+        b.feat[F_CLOSE] = 80 - 60 * mode;
+        b.feat[F_PATH] = 32;
+        b.feat[F_WAY] = 127;
+        b.out[O_FORWARD] = 100;
+        b.out[O_TURN] = -127;
+        think(?g, 0, ?b, ?cmd);
+        if (cmd.angleturn != -1920) { ret 1; }
+        mode = mode + 1;
+    }
+    ret 0;
+}
+
+test pickup_point__rejects_unreachable_pickups {
+    var g: Game;
+    var lv: level.Level;
+    var sector: level.Sector;
+    var subsector: level.Subsector;
+    var me: Mobj;
+    var item: Mobj;
+    var x: Fixed = 123;
+    var y: Fixed = 456;
+    lv.sectors = ?sector;
+    lv.subsectors = ?subsector;
+    lv.numsectors = 1;
+    lv.numsubsectors = 1;
+    g.lv = ?lv;
+    me.radius = 16 * 65536;
+    me.height = 56 * 65536;
+    item.radius = 20 * 65536;
+    item.z = 57 * 65536;
+    if (pickup_point(?g, ?me, ?item, 0, 0, ?x, ?y)) { ret 1; }
+    item.z = -9 * 65536;
+    if (pickup_point(?g, ?me, ?item, 0, 0, ?x, ?y)) { ret 2; }
+    item.z = 0;
+    me.radius = 0;
+    item.radius = 0;
+    if (pickup_point(?g, ?me, ?item, 0, 0, ?x, ?y)) { ret 3; }
+    if (x != 123 || y != 456) { ret 4; }
+    ret 0;
+}
+
+test reaches__ignores_absent_avoided_lines {
+    var g: Game;
+    var lv: level.Level;
+    var grid: [2]u8;
+    var keys: [2]u8;
+    var exits: [2]u8;
+    var lines: [8]u16;
+    var marks: [2]u8;
+    g.lv = ?lv;
+    g.levelserial = 1;
+    g.navserial = 1;
+    g.navw = 2;
+    g.navh = 1;
+    grid[0] = EAST::u8;
+    grid[1] = WEST::u8;
+    g.navgrid = ?grid[0];
+    g.navkey = ?keys[0];
+    g.navout = ?exits[0];
+    g.navline = ?lines[0];
+    if (reaches(?g, 16 * 65536, 16 * 65536, 48 * 65536, 16 * 65536, -1, -1, ?marks[0], KEY_ALL) != 2) { ret 1; }
+    marks[0] = 0;
+    marks[1] = 0;
+    lines[0] = 8;
+    if (reaches(?g, 16 * 65536, 16 * 65536, 48 * 65536, 16 * 65536, 7, -1, ?marks[0], KEY_ALL) != -1) { ret 2; }
+    ret 0;
+}
+
+test goal_bearing__exit_precedes_optional_secret {
+    var g: Game;
+    var lv: level.Level;
+    var sector: level.Sector;
+    var subsector: level.Subsector;
+    var line: level.Line;
+    var vertices: [2]level.Vertex;
+    var grid: [3]u8;
+    var keys: [3]u8;
+    var exits: [3]u8;
+    var lines: [12]u16;
+    var distances: [3]u16;
+    var me: Mobj;
+    var b: Bot;
+    lv.numsectors = 1;
+    lv.sectors = ?sector;
+    lv.numsubsectors = 1;
+    lv.subsectors = ?subsector;
+    lv.numlines = 1;
+    lv.lines = ?line;
+    lv.numvertexes = 2;
+    lv.vertexes = ?vertices[0];
+    sector.ceilingheight = 128 * 65536;
+    sector.special = 9;
+    line.special = 11;
+    line.v2 = 1;
+    vertices[0].x = 96 * 65536;
+    vertices[1].x = 96 * 65536;
+    vertices[1].y = 32 * 65536;
+    g.lv = ?lv;
+    g.levelserial = 1;
+    g.navserial = 1;
+    g.navw = 3;
+    g.navh = 1;
+    grid[0] = EAST::u8;
+    grid[1] = (EAST | WEST)::u8;
+    grid[2] = WEST::u8;
+    distances[0] = 3;
+    distances[1] = 2;
+    distances[2] = 1;
+    g.navgrid = ?grid[0];
+    g.navkey = ?keys[0];
+    g.navout = ?exits[0];
+    g.navline = ?lines[0];
+    g.navexit = ?distances[0];
+    g.navax = 80 * 65536;
+    g.navbx = g.navax;
+    g.navay = 16 * 65536;
+    g.navby = g.navay;
+    g.navsecrets = 1;
+    g.navsecretx[0] = 48 * 65536;
+    g.navsecrety[0] = 16 * 65536;
+    g.thinkercap.next = ?g.thinkercap;
+    me.x = 16 * 65536;
+    me.y = 16 * 65536;
+    me.height = 56 * 65536;
+    me.radius = 16 * 65536;
+    g.players[0].mo = ?me;
+    b.kind = KIND_SCRIPT;
+    b.alone = 1;
+    goal_bearing(?g, 0, ?b, KEY_EXIT);
+    if (!b.haveway || b.after != 3) { ret 1; }
+    if ((walkhave & KEY_EXIT) == 0 || sector.special != 9) { ret 2; }
+    g.navexitline = -1;
+    b.haveway = 0;
+    goal_bearing(?g, 0, ?b, KEY_EXIT);
+    if (!b.haveway || b.after != 1) { ret 3; }
+    ret 0;
+}
+
+test path_bearing__human_keeps_the_level {
+    var alive: i32 = 0;
+    for (alive < 2) {
+        var g: Game;
+        var me: Mobj;
+        var person: Mobj;
+        var b: Bot;
+        g.playeringame[0] = 1;
+        g.playeringame[1] = 1;
+        g.isbot[0] = 1;
+        g.players[0].mo = ?me;
+        g.players[1].mo = ?person;
+        person.x = 64 * 65536;
+        person.health = 100 * alive;
+        if (path_bearing(?g, 0, ?b) != 0) { ret 1; }
+        if (b.alone || !b.led || b.haveway) { ret 2; }
+        alive = alive + 1;
+    }
+    ret 0;
+}
+
+test requests_use__stationary_bot_exit {
+    var b: Bot;
+    b.alone = 1;
+    b.useexit = 1;
+    if (!requests_use(?b, 0, 0)) { ret 1; }
+    b.alone = 0;
+    b.led = 1;
+    if (requests_use(?b, 0, 0) || requests_use(?b, 100, 0)) { ret 2; }
+    b.alone = 1;
+    b.led = 0;
+    b.useexit = 0;
+    if (requests_use(?b, 0, 0)) { ret 3; }
+    if (!requests_use(?b, 100, 0)) { ret 4; }
     ret 0;
 }

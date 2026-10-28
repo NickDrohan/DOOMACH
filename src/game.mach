@@ -662,17 +662,18 @@ fun stalled(s: *Session) bool {
             secrets = secrets + g.players[i].secretcount;
             var k: i32 = 0;
             for (k < 6) {
-                if (g.players[i].cards[k]) { keys = keys + 1; }
+                if (g.players[i].cards[k]) { keys = keys | (1 << (k % 3)); }
                 k = k + 1;
             }
         }
         i = i + 1;
     }
     val closer: bool = near > 0 && (s.gainnear == 0 || near + GAIN_CELLS <= s.gainnear);
-    if (closer || secrets > s.gainsecrets || keys > s.gainkeys) {
+    val newkey: bool = (keys & ~s.gainkeys) != 0;
+    if (closer || secrets > s.gainsecrets || newkey) {
         if (closer)                    { s.gainnear = near; }
         if (secrets > s.gainsecrets) { s.gainsecrets = secrets; }
-        if (keys > s.gainkeys)       { s.gainkeys = keys; }
+        if (newkey)                { s.gainkeys = s.gainkeys | keys; }
         s.lastgain = g.leveltime;
     }
     var since: i32 = s.lastgain;
@@ -1275,5 +1276,25 @@ test build_ticcmd__keys_become_commands {
     input.weapon   = 3;
     build_ticcmd(?s, ?input, ?cmd);
     if (cmd.buttons != (defs.BT_ATTACK | defs.BT_USE | defs.BT_CHANGE | (2 << defs.BT_WEAPONSHIFT))::u8) { ret 7; }
+    ret 0;
+}
+
+test stalled__a_new_key_counts_after_teammates_die {
+    var s: Session;
+    s.g.playeringame[0] = 1;
+    s.g.leveltime = bot.GRACE + STALL + 1;
+    s.gainkeys = 1 << defs.IT_REDCARD;
+    s.g.players[0].cards[defs.IT_BLUECARD] = 1;
+    if (stalled(?s)) { ret 1; }
+    if (s.lastgain != s.g.leveltime) { ret 2; }
+    s.g.leveltime = s.g.leveltime + STALL + 1;
+    s.g.players[0].cards[defs.IT_BLUECARD] = 0;
+    var i: i32 = 0;
+    for (i < 4) {
+        s.g.playeringame[i] = 1;
+        s.g.players[i].cards[defs.IT_REDCARD] = 1;
+        i = i + 1;
+    }
+    if (!stalled(?s)) { ret 3; }
     ret 0;
 }

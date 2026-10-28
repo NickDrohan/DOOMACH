@@ -11,7 +11,7 @@ root="$here"
     echo "package: data/DOOM1.WAD is missing or not shareware 1.9; run bootstrap.sh" >&2
     exit 1
 }
-"$root/scripts/mach" build "$here" --profile release --quiet
+"$root/scripts/mach" build "$here" --profile release --jobs 2 --quiet
 
 python=""
 for candidate in "${PYTHON:-}" python python3; do
@@ -24,22 +24,27 @@ done
 
 mkdir -p "$here/out/package"
 "$python" - "$root" "$here" "$here/out/package/doom-in-mach.zip" <<'EOF'
-import os, sys, zipfile
+import os, subprocess, sys, zipfile
 
 root, here, target = sys.argv[1:4]
 top = "doom-in-mach/"
 
-# the source: the repository as it stands; never the WAD, id's code, the
-# compiler, fetched dependencies, git's own files, or build output
-skip = {"data", "ref", "out", "dep", "tools", ".git"}
+# the source: tracked repository files, never local captures or tool metadata,
+# the WAD, id's code, the compiler, dependencies, or build output
+skip = {"data", "ref", "out", "dep", "tools", ".git", ".qark", ".devin", ".claude", ".cursor", ".vscode", ".idea"}
+new = subprocess.check_output(["git", "-C", here, "ls-files", "--others", "--exclude-standard", "-z", "--", "src", "harness", "site", "scripts", "package"]).decode("utf-8").split("\0")
+if any(new):
+    raise SystemExit("package: untracked source files must be added before publishing: " + ", ".join(path for path in new if path))
+tracked = subprocess.check_output(["git", "-C", here, "ls-files", "-z"]).decode("utf-8").split("\0")
 source = os.path.join(os.path.dirname(target), "source.zip")
 with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-    for base, dirs, files in os.walk(here):
-        rel = os.path.relpath(base, here)
-        dirs[:] = sorted(d for d in dirs if not (rel == "." and d in skip))
-        for name in sorted(files):
-            path = os.path.join(base, name)
-            z.write(path, os.path.join("DOOMACH", os.path.relpath(path, here)).replace(os.sep, "/"))
+    for rel in sorted(path for path in tracked if path):
+        if rel.split("/", 1)[0] in skip:
+            continue
+        path = os.path.join(here, rel)
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise SystemExit("package: source is not a regular file: " + rel)
+        z.write(path, "DOOMACH/" + rel)
 
 with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     z.write(os.path.join(here, "out/windows-x86_64/release/bin/doom.exe"), top + "doom.exe")

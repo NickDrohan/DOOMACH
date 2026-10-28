@@ -17,8 +17,18 @@ hedge_mach_sha256="b0bab055a4aa245bdb2767ec37d2c042a0187f39963403c402872ccc5cedd
 
 # the game and the zip, then the relay as the Linux machine runs it
 bash "$here/package.sh"
-"$root/scripts/mach" build "$here" --artifact relay --target linux-x86_64 --profile release --quiet
-"$root/scripts/mach" build "$here" --artifact arena --target linux-x86_64 --profile release --quiet
+python=""
+for candidate in "${PYTHON:-}" python python3; do
+    if [[ -n "$candidate" ]] && "$candidate" -c 'import subprocess, json' 2>/dev/null; then
+        python="$candidate"
+        break
+    fi
+done
+[[ -n "$python" ]] || { echo "deploy: python is needed for episode qualification" >&2; exit 1; }
+mkdir -p "$here/out/qualification"
+"$python" "$here/harness/coopcheck.py" --league --maps 1 --tics 16800 --seeds 0 --timeout 120 --fail-fast --report "$here/out/qualification/release.json"
+"$root/scripts/mach" build "$here" --artifact relay --target linux-x86_64 --profile release --jobs 2 --quiet
+"$root/scripts/mach" build "$here" --artifact arena --target linux-x86_64 --profile release --jobs 2 --quiet
 
 # hedge
 compiler="$root/tools/mach-$hedge_mach/mach.exe"
@@ -36,8 +46,13 @@ fi
 (cd "$hedge" && "$compiler" dep pull . && "$compiler" build . --profile release --target linux-x86_64)
 
 # the machine's files, laid out as they land in the image
-stage="$here/out/deploy"
-rm -rf "$stage"
+publish="$here/out/deploy"
+stage="$here/out/deploy.next"
+sequence=0
+while [[ -e "$stage" ]]; do
+    sequence=$((sequence + 1))
+    stage="$here/out/deploy.next-$sequence"
+done
 mkdir -p "$stage/usr/local/bin" "$stage/srv/site"
 cp "$here/out/linux-x86_64/release/bin/relay" "$stage/usr/local/bin/relay"
 cp "$hedge/out/linux-x86_64/release/bin/hedge" "$stage/usr/local/bin/hedge"
@@ -57,7 +72,18 @@ size="$(( $(wc -c <"$zip") / 1024 / 100 ))"
 size="$(( size / 10 )).$(( size % 10 )) MB"
 sum="$(sha256sum "$zip" | cut -d' ' -f1)"
 sed -e "s/{{SIZE}}/$size/" -e "s/{{SHA256}}/$sum/" "$here/site/index.html" >"$stage/srv/site/index.html"
-echo "staged $stage: download $size, sha256 $sum"
+if [[ -e "$publish" ]]; then
+    backup="$here/out/deploy.previous"
+    sequence=0
+    while [[ -e "$backup" ]]; do
+        sequence=$((sequence + 1))
+        backup="$here/out/deploy.previous-$sequence"
+    done
+    mv "$publish" "$backup"
+    echo "preserved previous staging in $backup"
+fi
+mv "$stage" "$publish"
+echo "staged $publish: download $size, sha256 $sum"
 
 [[ "${1:-}" == "--stage" ]] && exit 0
 cd "$here"
