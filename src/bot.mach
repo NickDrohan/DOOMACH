@@ -167,6 +167,21 @@ pub rec Bot {
     pressed:  i32;
     slide:    i32;
     slidedir: i32;
+    # the best thing in sight to pick up, where it lies and what it is
+    # worth to this bot (worth), 0 if nothing
+    itemx:     Fixed;
+    itemy:     Fixed;
+    itemworth: i32;
+    # the thing it is fetching and since when, and one it gave up on and
+    # until when: a thing it cannot get to is not made for again and again
+    fetchx:    Fixed;
+    fetchy:    Fixed;
+    fetchsince: i32;
+    nofetchx:  Fixed;
+    nofetchy:  Fixed;
+    nofetchtill: i32;
+    # the enemy in sight fights only up close: a demon, a spectre, a skull
+    foemelee:  bool;
     # the cells it last caught on, and until when its searches go round
     # them: what the map's lines do not show, a pillar or a crowd
     snag:     [4]i32;
@@ -2431,6 +2446,7 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
     }
 
     val enemy: *Mobj = find_enemy(g, me, b, playernum);
+    b.foemelee = enemy != nil && (enemy.kind == info.MT_SERGEANT || enemy.kind == info.MT_SHADOWS || enemy.kind == info.MT_SKULL);
     f[F_SEEN]    = 0;
     f[F_BEARING] = 0;
     f[F_CLOSE]   = 0;
@@ -2473,7 +2489,11 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
     f[F_ITEM]      = 0;
     f[F_ITEMBEAR]  = 0;
     f[F_ITEMCLOSE] = 0;
+    b.itemworth    = 0;
     if (item != nil) {
+        b.itemx        = item.x;
+        b.itemy        = item.y;
+        b.itemworth    = worth(g, p, item);
         f[F_ITEM]      = 127;
         f[F_ITEMBEAR]  = clamp(bearing(me, item.x, item.y), -127, 127);
         f[F_ITEMCLOSE] = clamp(127 - distance(me, item.x, item.y) / 8, 0, 127);
@@ -2935,7 +2955,44 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         val cell: i32 = cell_of(g, p.mo.x, p.mo.y);
         hazard = cell >= 0 && (g.navout[cell]::i32 & (HURTS | NEARHURT)) != 0;
     }
-    val guided: bool = g.deathmatch == 0 && !b.shy && b.haveway && g.navgrid != nil && g.navserial == g.levelserial && !brawl && (b.feat[F_SEEN] == 0 || !b.engaged || hazard);
+    # What it needs and can see close by is worth the detour, on Nightmare
+    # more than anywhere: a weapon better than the pistol, health when hurt,
+    # armour, a power-up, and ammunition when what is in hand runs low. Badly
+    # hurt, it goes for health even in a fight. A bot that walked its way
+    # past every medikit died with a pistol in hand, seventy times a level.
+    var fetch: bool = 0;
+    if (g.deathmatch == 0 && !b.shy && b.itemworth > 0 && g.isbot[playernum] && g.navgrid != nil && g.navserial == g.levelserial) {
+        val ammo: i32 = ammo_of(p.readyweapon);
+        val low: bool = ammo >= 0 && p.ammo[ammo] < 20;
+        # (following a person, only health it badly needs: it keeps up
+        # with them first)
+        var needed: bool = b.itemworth >= 140 || (b.itemworth == 110 && low);
+        if (!b.alone) { needed = b.itemworth >= 160 && p.health < 50; }
+        # (not out in slime, without a suit, and not one given up on)
+        val wet: bool = floor_hurts(g.lv.sectors[sector_at(g, b.itemx, b.itemy)].special::i32) && p.powers[defs.PW_IRONFEET] == 0;
+        val given: bool = b.nofetchtill > g.leveltime && distance(p.mo, b.nofetchx, b.nofetchy) < 4096 && b.itemx == b.nofetchx && b.itemy == b.nofetchy;
+        if (needed && !wet && !given && distance(p.mo, b.itemx, b.itemy) < 448 && body_walk(g, p.mo.x, p.mo.y, b.itemx, b.itemy)) { fetch = 1; }
+        if (fetch) {
+            if (b.itemx != b.fetchx || b.itemy != b.fetchy) {
+                b.fetchx = b.itemx;
+                b.fetchy = b.itemy;
+                b.fetchsince = g.leveltime;
+            }
+            or (g.leveltime - b.fetchsince > 6 * 35) {
+                b.nofetchx = b.itemx;
+                b.nofetchy = b.itemy;
+                b.nofetchtill = g.leveltime + 30 * 35;
+                fetch = 0;
+            }
+        }
+    }
+    val desperate: bool = fetch && p.health < 40 && b.itemworth >= 160;
+    # Within a short walk of the exit or of a key it is after, it makes for
+    # it whatever is in the way: the level is won there, not by the fight.
+    # Bots that had fought their way to the exit room stood in it trading
+    # shots with imps until they died, the switch a few strides away.
+    val closing: bool = g.deathmatch == 0 && b.alone && b.haveway && (b.after == 3 || b.after == 4) && distance(p.mo, b.afterx, b.aftery) < 384;
+    val guided: bool = g.deathmatch == 0 && !b.shy && (b.haveway || fetch) && g.navgrid != nil && g.navserial == g.levelserial && !brawl && (b.feat[F_SEEN] == 0 || !b.engaged || hazard || desperate || closing);
     var pathing: bool = 0;
     if (guided) {
         # and with room for the team: a team-mate close by pushes it off a
@@ -2952,7 +3009,7 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         val here: i32 = g.lv.subsectors[p.mo.subsector].sector;
         val lift: ptr = g.lv.sectors[here].specialdata;
         val waysec: i32 = sector_at(g, b.wayx, b.wayy);
-        if (lift != nil && (lift:~*defs.Thinker).kind == defs.TH_PLAT && (waysec == here || g.lv.sectors[waysec].floorheight > p.mo.floorz + STEP)) {
+        if (b.haveway && lift != nil && (lift:~*defs.Thinker).kind == defs.TH_PLAT && (waysec == here || g.lv.sectors[waysec].floorheight > p.mo.floorz + STEP)) {
             sector_middle(g, here, ?tx, ?ty);
             riding = 1;
             # and if it cannot get wholly on because a team-mate already is,
@@ -2967,7 +3024,7 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         # aboard: it waits its turn clear of the lift's edge
         var waiting: bool = 0;
         val waylift: ptr = g.lv.sectors[waysec].specialdata;
-        if (!riding && waysec != here && waylift != nil && (waylift:~*defs.Thinker).kind == defs.TH_PLAT && boarded(g, playernum, waysec)) {
+        if (b.haveway && !riding && waysec != here && waylift != nil && (waylift:~*defs.Thinker).kind == defs.TH_PLAT && boarded(g, playernum, waysec)) {
             waiting = 1;
             var mx: Fixed = 0;
             var my: Fixed = 0;
@@ -2987,6 +3044,10 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
                 ty = p.mo.y + (p.mo.y - ey);
                 waiting = 1;
             }
+        }
+        if (fetch && !riding && !waiting) {
+            tx = b.itemx;
+            ty = b.itemy;
         }
         val aim: u32 = world.point_to_angle2(p.mo.x, p.mo.y, tx, ty);
         val afine: u32 = aim >> t.ANGLETOFINESHIFT;
@@ -3037,7 +3098,7 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
             forward = 0;
             side    = 0;
         }
-        if (b.feat[F_SEEN] == 0) {
+        if (b.feat[F_SEEN] == 0 || closing) {
             turn = clamp(b.feat[F_PATH] * 6, -127, 127);
             if (b.feat[F_PATH] > -4 && b.feat[F_PATH] < 4) { turn = 0; }
         }
@@ -3078,6 +3139,15 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     or {
         b.pressed = 0;
         b.slide   = 0;
+    }
+
+    # Badly hurt, with something that fights with claws or teeth at arm's
+    # length and nothing to heal with in reach: give ground while still
+    # firing, out of its reach. From rifles and fireballs, backing away only
+    # lost the way it had made
+    if (g.deathmatch == 0 && !b.shy && b.quirk != QUIRK_RECKLESS && !brawl && !desperate && !closing && p.health < 35 && b.feat[F_SEEN] > 0 && b.feat[F_CLOSE] >= 110 && b.foemelee) {
+        forward = -100;
+        pathing = 0;
     }
 
     # In co-op, whatever decided: not into slime and not into a pit, unless

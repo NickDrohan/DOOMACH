@@ -16,7 +16,11 @@ def parse(text):
     if path is None or end is None:
         raise ValueError("missing pathing summary")
     result = dict(zip(FIELDS, map(int, path.groups())))
-    result.update(tics=int(end.group(1)), finished=end.group(2) == "1", deaths=deaths)
+    life = re.search(r"^survival meanlife (\d+) armed (\d+)$", text, re.M)
+    if life:
+        result.update(meanlife=int(life.group(1)), armed=int(life.group(2)))
+    near = [int(n) for n in re.findall(r"^bot \d+ .* nearest (\d+)", text, re.M) if int(n) > 0]
+    result.update(tics=int(end.group(1)), finished=end.group(2) == "1", deaths=deaths, nearest=min(near) if near else 0)
     return result
 
 
@@ -29,11 +33,12 @@ def main():
     parser.add_argument("--tics", type=int, default=16800)
     parser.add_argument("--timeout", type=float, default=40)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--last", default=None, help="final coopmatch word: league, uv")
     args = parser.parse_args()
     rows, totals = [], dict.fromkeys(FIELDS + ("deaths", "finished"), 0)
     for m in [int(v) for v in args.maps.split(",")]:
         for seed in [int(v) for v in args.seeds.split(",")]:
-            run = subprocess.run([str(args.exe), "coopmatch", str(ROOT / "data/DOOM1.WAD"), str(m), str(args.tics), args.mode, str(seed)],
+            run = subprocess.run([str(args.exe), "coopmatch", str(ROOT / "data/DOOM1.WAD"), str(m), str(args.tics), args.mode, str(seed)] + ([args.last] if args.last else []),
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", timeout=args.timeout)
             if run.returncode != 0:
                 raise SystemExit("E1M{} seed {} exited {}".format(m, seed, run.returncode))

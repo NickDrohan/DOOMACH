@@ -2648,6 +2648,16 @@ fun botmatch(argc: i64, argv: **u8) i64 {
 # "calm" is the level with no monsters in it, which shows what the bots can
 # find their way to when nothing is killing them; "trace" says every five
 # seconds where each bot is and what it is after.
+# "route" as the last word of coopmatch: where each bot walked, every
+# fourth tic, with what it did there (1 pressed use, 2 took a key, 4 rode
+# a floor up or down, 8 came back from dying), for the one that got out
+var routex: [65536]i16;
+var routey: [65536]i16;
+var routef: [65536]u8;
+var routea: [65536]u8;
+var routen: [4]i32;
+val ROUTEMOST: i32 = 16384;
+
 fun coopmatch(argc: i64, argv: **u8) i64 {
     var a:    allocator.Allocator;
     val made: err[allocator.Error] = page.make(?a);
@@ -2668,7 +2678,8 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     val calm:     bool = argc >= 6 && (argv[5][0] == 'c' && argv[5][1] == 'a' || str_equals(argv[5], "lead") || str_equals(argv[5], "idle"));
     val traced_mode: bool = argc >= 6 && (str_equals(argv[5], "trace") || str_equals(argv[5], "calmtrace") || str_equals(argv[5], "calmleadtrace"));
     val league: bool = argc == 8 && (str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace"));
-    val trace: bool = traced_mode || (argc == 8 && (str_equals(argv[7], "trace") || str_equals(argv[7], "leaguetrace")));
+    val routing: bool = argc == 8 && str_equals(argv[7], "route");
+    val trace: bool = traced_mode || (argc == 8 && (str_equals(argv[7], "trace") || str_equals(argv[7], "leaguetrace") || str_equals(argv[7], "uvtrace")));
     if (argc >= 6 && !traced_mode && !calm && !str_equals(argv[5], "script")) {
         val file: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, argv[5]);
         if (sel file.err) { ret EXIT_WAD; }
@@ -2681,7 +2692,10 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     if (sel got.err) { ret EXIT_DATA; }
     val s: *game.Session = got.ok;
     game.init(s, ?a, ?w, ?d);
-    if (!game.coop_game(s, 4, 0, defs.SK_NIGHTMARE, map)) { ret EXIT_MAP; }
+    # "uv" as the last word: Ultra-Violence instead of Nightmare, to compare
+    var skill: i32 = defs.SK_NIGHTMARE;
+    if (argc == 8 && (str_equals(argv[7], "uv") || str_equals(argv[7], "uvtrace"))) { skill = defs.SK_HARD; }
+    if (!game.coop_game(s, 4, 0, skill, map)) { ret EXIT_MAP; }
     # "calm" and "calmtrace": the level with nothing in it, to see what the
     # bots can find their way to when nothing is killing them
     if (argc >= 6 && argv[5][0] == 'c' && argv[5][1] == 'a') {
@@ -2723,6 +2737,13 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     var stucktics: i32 = 0;
     var wedges: i32 = 0;
     var acidtics: i32 = 0;
+    var alivetics: i32 = 0;
+    var rusesw: [4]i32;
+    var rcardsw: [4]i32;
+    var rfloorw: [4]i32;
+    var rmovedw: [4]i32;
+    var rlastx: [4]i32;
+    var rlasty: [4]i32;
     var floordeaths: i32 = 0;
     val began:  i64 = win.micros_now();
     var tic:    i32 = 0;
@@ -2739,7 +2760,7 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
                     val ts: i32 = s.g.lv.subsectors[tp.mo.subsector].sector;
                     var kind: i32 = -1;
                     if (s.g.lv.sectors[ts].specialdata != nil) { kind = (s.g.lv.sectors[ts].specialdata:~*defs.Thinker).kind::i32; }
-                    print.eprintlnf("    b{} sector {} floor {} z {} mover {} next {},{} slide {} pressed {}", i + 1, ts, s.g.lv.sectors[ts].floorheight >> 16, tp.mo.z >> 16, kind, tb.wayx >> 16, tb.wayy >> 16, tb.slide, tb.pressed);
+                    print.eprintlnf("    b{} sector {} floor {} z {} mover {} next {},{} slide {} pressed {} usable {} usewait {}", i + 1, ts, s.g.lv.sectors[ts].floorheight >> 16, tp.mo.z >> 16, kind, tb.wayx >> 16, tb.wayy >> 16, tb.slide, tb.pressed, tb.usable, tb.usewait);
                 }
                 if (tb.nbans > 0) { print.eprintlnf("    b{} went round {} lines: {} {} {} {} {} {}", i + 1, tb.nbans, tb.bans[0], tb.bans[1], tb.bans[2], tb.bans[3], tb.bans[4], tb.bans[5]); }
             }
@@ -2749,6 +2770,39 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
                 val special: i32 = s.g.lv.sectors[s.g.lv.subsectors[pm.subsector].sector].special::i32;
                 onhurt = special == 4 || special == 5 || special == 7 || special == 16;
             }
+            if (routing && pm != nil && (tic & 3) == 0 && routen[i] < ROUTEMOST) {
+                val rb: *bot.Bot = ?s.bots[i];
+                var flags: i32 = 0;
+                if (rb.uses != rusesw[i]) { flags = flags | 1; }
+                var cards: i32 = 0;
+                var ck: i32 = 0;
+                for (ck < 6) {
+                    if (s.g.players[i].cards[ck]) { cards = cards + 1; }
+                    ck = ck + 1;
+                }
+                if (cards > rcardsw[i]) { flags = flags | 2; }
+                var dz: i32 = (pm.floorz >> 16) - rfloorw[i];
+                if (dz < 0) { dz = -dz; }
+                if (dz >= 16 && rmovedw[i] < 8) { flags = flags | 4; }
+                if (now) { flags = flags | 8; }
+                val at: i32 = i * ROUTEMOST + routen[i];
+                routex[at] = (pm.x >> 16)::i16;
+                routey[at] = (pm.y >> 16)::i16;
+                routef[at] = flags::u8;
+                routea[at] = (pm.angle >> 24)::u8;
+                routen[i] = routen[i] + 1;
+                var mx2: i32 = (pm.x >> 16) - rlastx[i];
+                var my2: i32 = (pm.y >> 16) - rlasty[i];
+                if (mx2 < 0) { mx2 = -mx2; }
+                if (my2 < 0) { my2 = -my2; }
+                rmovedw[i] = mx2 + my2;
+                rlastx[i] = pm.x >> 16;
+                rlasty[i] = pm.y >> 16;
+                rusesw[i] = rb.uses;
+                rcardsw[i] = cards;
+                rfloorw[i] = pm.floorz >> 16;
+            }
+            if (!now && pm != nil) { alivetics = alivetics + 1; }
             if (!now && pm != nil) {
                 if (onhurt) {
                     acidtics = acidtics + 1;
@@ -2831,6 +2885,41 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     if (league) { print.printlnf("league cutoff {}", s.capped); }
     print.printlnf("hit by friends {} times", friendly);
     print.printlnf("pathing stuck {} wedges {} acid {} floordeaths {}", stucktics, wedges, acidtics, floordeaths);
+    var lives: i32 = 4;
+    var armed: i32 = 0;
+    var li: i32 = 0;
+    for (li < 4) {
+        lives = lives + deaths[li];
+        if (s.g.players[li].weaponowned[defs.WP_SHOTGUN] || s.g.players[li].weaponowned[defs.WP_CHAINGUN]) { armed = armed + 1; }
+        li = li + 1;
+    }
+    print.printlnf("survival meanlife {} armed {}", alivetics / lives, armed);
+    if (routing && s.completed) {
+        # the bot that got out: the one alive nearest the exit
+        var best: i32 = -1;
+        var bestd: i32 = 0x7fffffff;
+        var rb2: i32 = 0;
+        for (rb2 < 4) {
+            val mo: *defs.Mobj = s.g.players[rb2].mo;
+            if (mo != nil && s.g.players[rb2].playerstate != defs.PST_DEAD) {
+                var ddx: i32 = (mo.x - s.g.navbx) >> 16;
+                var ddy: i32 = (mo.y - s.g.navby) >> 16;
+                if (ddx < 0) { ddx = -ddx; }
+                if (ddy < 0) { ddy = -ddy; }
+                if (ddx + ddy < bestd) { bestd = ddx + ddy; best = rb2; }
+            }
+            rb2 = rb2 + 1;
+        }
+        if (best >= 0) {
+            print.printlnf("route bot {} points {} lines {} sectors {}", best + 1, routen[best], s.g.lv.numlines, s.g.lv.numsectors);
+            var k: i32 = 0;
+            for (k < routen[best]) {
+                val at: i32 = best * ROUTEMOST + k;
+                print.printlnf("rt {} {} {} {}", routex[at]::i32, routey[at]::i32, routef[at]::i32, routea[at]::i32);
+                k = k + 1;
+            }
+        }
+    }
     print.printlnf("end tic {} finished {} secrets {} of {} sum {} map E1M{}", tic, done, found, s.g.totalsecret, game.checksum(s), map);
     ret EXIT_OK;
 }
@@ -3850,7 +3939,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc == 3 && str_equals(argv[1], "joinleague"))                       { ret joinleague(argv); }
     if (argc == 5 && str_equals(argv[1], "resumecheck"))                      { ret resumecheck(argv); }
     if (argc == 3 && str_equals(argv[1], "fingerprint"))                      { ret print_fingerprint(argv); }
-    if (argc >= 5 && argc <= 8 && str_equals(argv[1], "coopmatch") && (argc < 8 || str_equals(argv[7], "trace") || str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace")))         { ret coopmatch(argc, argv); }
+    if (argc >= 5 && argc <= 8 && str_equals(argv[1], "coopmatch") && (argc < 8 || str_equals(argv[7], "trace") || str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace") || str_equals(argv[7], "route") || str_equals(argv[7], "uv") || str_equals(argv[7], "uvtrace")))         { ret coopmatch(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "rooms"))                            { ret rooms(argv); }
     if (argc == 4 && str_equals(argv[1], "watch"))                            { ret watch(argc, argv); }
     if (argc == 6 && str_equals(argv[1], "muswav"))                           { ret muswav(argv); }

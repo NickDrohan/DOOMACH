@@ -88,6 +88,35 @@ deaths reflect bots advancing into more fights; that remains training work. Mons
 E1M1-7 and E1M9 all finish (E1M6 newly within the limit). Nightmare episode completion is
 still not qualified.
 
+**Survival and the finish line (co-op bot-only).**
+
+- *Finish line beats the fight:* within 384 units of the exit or of a key it is after,
+  a bot walks to it and faces it whatever is shooting at it. Bots used to fight their way
+  into E1M2's exit room and then trade shots with imps beside the switch until they died.
+- *Fetching:* a weapon, health when hurt, armour, power-ups, and ammunition when the
+  weapon in hand runs low are fetched when in sight, within 448 units, walkable by the
+  body, and not in slime. A thing not reached within six seconds is skipped for thirty.
+  Badly hurt (under 40), a bot fetches health even in a fight. Bots following a person
+  only fetch health when under 50, so they keep up.
+- *Giving ground:* under 35 health, with a demon, spectre or lost soul at arm's length,
+  a bot backs away while still firing. Backing away from rifles and fireballs was tried
+  and lost ground on E1M2 without saving lives, so it is not done.
+- Tried and dropped: recorded per-level walk routes (worse progress than the planner)
+  and sending stragglers back to the bot nearest the exit (it broke lift and route
+  handling on E1M6/E1M7 with no monsters).
+
+`coopmatch ... <seed> uv` plays Ultra-Violence instead of Nightmare for comparison, and
+`route` prints the finishing bot's walked path. Over four seeds, E1M2-E1M7 and E1M9:
+
+| | Nightmare | Ultra-Violence |
+|---|---:|---:|
+| Levels finished in 8 minutes | 0 of 28 | 10 of 28 (E1M2 4/4, E1M3 3/4, E1M9 3/4) |
+| Deaths per run | 63 (was 65) | 26 |
+
+On Ultra-Violence the same build without the finish-line rule finished none of 14. On
+Nightmare, respawning fast monsters still kill each bot every 25-35 seconds; that is now
+the main thing between the bots and the exits.
+
 ### What decides
 
 Six outputs: forward, sideways, turn, fire, use, change weapon. Two things can produce them.

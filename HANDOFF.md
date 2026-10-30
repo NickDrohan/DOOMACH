@@ -22,6 +22,16 @@ GitHub `main` includes code release `acc2408`; the older `v0.3.0` tag is histori
 Unqualified per-level experiments are preserved separately on the local WIP branch.
 Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
 
+## Local survival and finish-line work (not yet pushed or deployed)
+
+- On top of `9f94fa3`: finish-line priority near the exit or a wanted key, fetching
+  needed pickups, giving ground to melee monsters when badly hurt. Fingerprint changes
+  again; see BOTS.md. Monster-free, E1M1-7 and E1M9 all finish; human following 64%;
+  pinned fixtures unchanged; 57 tests pass in both profiles.
+- Nightmare E1M2-E1M9 still finish none in 8-minute runs. Ultra-Violence now finishes
+  E1M2, E1M3 and E1M9 most of the time. Whether the league should stay on Nightmare is
+  the owner's call.
+
 ## Local pathing upgrade (not yet pushed or deployed)
 
 - Clearance-weighted A\*, body-width shortcuts, hazard costs, team spacing, wall slides,
