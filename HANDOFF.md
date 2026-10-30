@@ -28,6 +28,8 @@ Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5
   needed pickups, giving ground to melee monsters when badly hurt. Fingerprint changes
   again; see BOTS.md. Monster-free, E1M1-7 and E1M9 all finish; human following 64%;
   pinned fixtures unchanged; 57 tests pass in both profiles.
+- League nets following people ignore keys and weapons on the floor (BOTS.md). The
+  league stays on Nightmare, at the owner's instruction.
 - Nightmare E1M2-E1M9 still finish none in 8-minute runs. Ultra-Violence now finishes
   E1M2, E1M3 and E1M9 most of the time. Whether the league should stay on Nightmare is
   the owner's call.

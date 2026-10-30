@@ -2675,7 +2675,7 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     var kind: i32  = bot.KIND_SCRIPT;
     var runseed: u32 = 0;
     if (argc >= 7) { runseed = number(argv[6], 0)::u32; }
-    val calm:     bool = argc >= 6 && (argv[5][0] == 'c' && argv[5][1] == 'a' || str_equals(argv[5], "lead") || str_equals(argv[5], "idle"));
+    val calm:     bool = argc >= 6 && (argv[5][0] == 'c' && argv[5][1] == 'a' || str_equals(argv[5], "lead") || str_equals(argv[5], "redlead") || str_equals(argv[5], "idle"));
     val traced_mode: bool = argc >= 6 && (str_equals(argv[5], "trace") || str_equals(argv[5], "calmtrace") || str_equals(argv[5], "calmleadtrace"));
     val league: bool = argc == 8 && (str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace"));
     val routing: bool = argc == 8 && str_equals(argv[7], "route");
@@ -2715,8 +2715,19 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     # the level as a bot alone does; the other three take it for a person
     # and follow. How much of the time each is with it says whether bots
     # keep up with someone who opens the level ahead of them.
-    val lead: bool = argc >= 6 && (str_equals(argv[5], "lead") || str_equals(argv[5], "calmlead") || str_equals(argv[5], "calmleadtrace"));
+    # "calmredlead": the person has the red key from the start, and the
+    # others none: do the bots follow them through the red doors they open?
+    # and as the last word after a net, "lead" or "redlead": the same with
+    # the net following, as it would beside a person online
+    val netlead: bool = argc == 8 && (str_equals(argv[7], "lead") || str_equals(argv[7], "redlead"));
+    val redlead: bool = (argc >= 6 && (str_equals(argv[5], "calmredlead") || str_equals(argv[5], "redlead"))) || (argc == 8 && str_equals(argv[7], "redlead"));
+    val lead: bool = netlead || redlead || (argc >= 6 && (str_equals(argv[5], "lead") || str_equals(argv[5], "calmlead") || str_equals(argv[5], "calmleadtrace")));
     if (lead) { s.g.isbot[0] = 0; }
+    if (redlead) {
+        s.g.players[0].cards[defs.IT_REDCARD] = 1;
+        s.g.players[0].cards[defs.IT_YELLOWCARD] = 1;
+        s.g.players[0].cards[defs.IT_BLUECARD] = 1;
+    }
     # "idle": the first player is a person who never touches the keys. The
     # bots must stay with them, and must not end the level over their head.
     if (argc >= 6 && str_equals(argv[5], "idle")) {
@@ -3939,7 +3950,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc == 3 && str_equals(argv[1], "joinleague"))                       { ret joinleague(argv); }
     if (argc == 5 && str_equals(argv[1], "resumecheck"))                      { ret resumecheck(argv); }
     if (argc == 3 && str_equals(argv[1], "fingerprint"))                      { ret print_fingerprint(argv); }
-    if (argc >= 5 && argc <= 8 && str_equals(argv[1], "coopmatch") && (argc < 8 || str_equals(argv[7], "trace") || str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace") || str_equals(argv[7], "route") || str_equals(argv[7], "uv") || str_equals(argv[7], "uvtrace")))         { ret coopmatch(argc, argv); }
+    if (argc >= 5 && argc <= 8 && str_equals(argv[1], "coopmatch") && (argc < 8 || str_equals(argv[7], "trace") || str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace") || str_equals(argv[7], "route") || str_equals(argv[7], "uv") || str_equals(argv[7], "uvtrace") || str_equals(argv[7], "lead") || str_equals(argv[7], "redlead")))         { ret coopmatch(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "rooms"))                            { ret rooms(argv); }
     if (argc == 4 && str_equals(argv[1], "watch"))                            { ret watch(argc, argv); }
     if (argc == 6 && str_equals(argv[1], "muswav"))                           { ret muswav(argv); }

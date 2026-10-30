@@ -2490,7 +2490,18 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
     f[F_ITEMBEAR]  = 0;
     f[F_ITEMCLOSE] = 0;
     b.itemworth    = 0;
-    if (item != nil) {
+    # A bot following a person does not go after keys or weapons: those
+    # are for the person to fetch or lead it to. Followers told to come
+    # through a red door went off after the shotgun beside it, and after a
+    # red key the person already had.
+    var shown: bool = item != nil;
+    # (the nets the league seats beside people; the hand-written bot goes
+    # only for what is close and in front of it already)
+    if (shown && g.deathmatch == 0 && b.led && b.kind == KIND_NET) {
+        val sp: i32 = item.sprite;
+        if (sp == info.SPR_BKEY || sp == info.SPR_YKEY || sp == info.SPR_RKEY || sp == info.SPR_BSKU || sp == info.SPR_YSKU || sp == info.SPR_RSKU || worth(g, p, item) == 300) { shown = 0; }
+    }
+    if (shown) {
         b.itemx        = item.x;
         b.itemy        = item.y;
         b.itemworth    = worth(g, p, item);

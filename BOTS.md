@@ -101,6 +101,18 @@ still not qualified.
 - *Giving ground:* under 35 health, with a demon, spectre or lost soul at arm's length,
   a bot backs away while still firing. Backing away from rifles and fireballs was tried
   and lost ground on E1M2 without saving lives, so it is not done.
+- *Following people:* a league net following a person does not see keys or weapons on
+  the floor, so it does not run off after the shotgun or a key the person already has.
+  Followers already route through doors the person unlocks (by the every-key walk when
+  their own keys allow none); a key door that has shut again cannot be opened by a bot
+  without the key, and DR key doors shut about four seconds after opening, so it helps to
+  stand in the doorway until they are through. `coopmatch <wad> <map> <tics> <net> <seed>
+  lead|redlead` measures nets following a stand-in person (`redlead`: the person holds
+  every key). Over 24 runs on E1M2-5, 7, 9 followers were with the person 49.6% of the
+  time, up from 48.0%; within noise except E1M4, where one run went from 11% to 43%.
+  Tried and dropped: holding still when no way to the person was found (followers then
+  lost the person behind lifts), treating a key door someone opened as open to all (bots
+  hung back at E1M2's red door until it shut), and following within 80 units.
 - Tried and dropped: recorded per-level walk routes (worse progress than the planner)
   and sending stragglers back to the bot nearest the exit (it broke lift and route
   handling on E1M6/E1M7 with no monsters).
