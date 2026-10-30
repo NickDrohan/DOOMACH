@@ -22,6 +22,21 @@ GitHub `main` includes code release `acc2408`; the older `v0.3.0` tag is histori
 Unqualified per-level experiments are preserved separately on the local WIP branch.
 Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
 
+## Local pathing upgrade (not yet pushed or deployed)
+
+- Clearance-weighted A\*, body-width shortcuts, hazard costs, team spacing, wall slides,
+  snag memory, lift etiquette, open-door protection and search budgets are local and
+  described in BOTS.md. New simulation fingerprint `2227431163`, debug and release.
+- 57 native tests pass in both profiles; harness tests pass; Windows doom/arena/relay and
+  Linux arena/relay build. Demos, two/four-player co-op, and deathmatch fixtures are
+  unchanged. Neural E1M1 and calm E1M5 agree between builds. Calm E1M1/3/5/7 gates,
+  human following (64%), human exit ownership and nine-level 350-tic resumption pass.
+- Fourteen-run Nightmare benchmark: hazardous-floor tics -69%, floor deaths -81%, wedges
+  -55%, finished levels 1 -> 2; total deaths +7%. Reports: ignored
+  `out/triage/pathing-baseline*.json` and `out/triage/pathing-final.json`.
+- E1M8 costs about 13 ms per tic in Nightmare starts, below the previous release's ~17 ms,
+  because each decision's search work is bounded. E1M8 still lacks boss-specific handling.
+
 ## Released completion-first cohort
 
 The owner approved shipping the smaller completion-first policy now, concentrating co-op

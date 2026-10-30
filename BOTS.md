@@ -45,6 +45,49 @@ its opponent back to itself every sixteenth tic, and heads for the farthest of t
 cells it could walk straight to. `doom navdump` draws the grid; it is how the one-way pit on
 E1M5 was found (yellow: walked into, with no way back, until moving sectors were allowed for).
 
+**Co-op path following (clearance and hazards).** The grid tests walks between cell
+*middles*, but a player is 32 units wide; the bots used to catch their shoulders on
+corners, crowd one another in doorways, and wade along slime. Co-op now follows the
+approach established by navigation-mesh and Doom bot work (agent-radius clearance, weighted
+A\*, string-pulling that respects the body, and ZDoom Cajun-style recovery when blocked):
+
+- At level start each cell is marked `NEAR` (a wall or ledge within a stride),
+  `NEARHURT` (beside slime), `HURTS`, or `THING` (beside a solid non-monster, such as a
+  pillar or barrel). Deathmatch keeps the original unweighted search and is unchanged.
+- A breadth-first search still answers whether a way exists and checks doors/switches. A
+  bounded A\* pass then chooses among usable routes: open floor costs 4, walls +5, slime
+  edges +4, slime +40, solid things +30, recently snagged cells +120, and trusted lines that
+  cannot be crossed as the level stands +200. Searches are capped per decision
+  (`SOLVE_WORK`) and a lost way is retried every eighth tic, not every tic.
+- Waypoint shortcuts require both shoulders' paths to be clear and never cross slime the
+  route avoids. Bots move toward the waypoint in world space, strafing as people do, and
+  fight their way out along the route when standing in or beside slime.
+- Team-mates separate, and a lower-numbered team-mate close ahead goes first. A bot pinned
+  for sixteen tics slides along the wall toward the more open side, remembers the snag for
+  twenty seconds, and alternates sides if that fails. It does not slide away from a door or
+  switch it is opening, and does not press use on a door already opening or standing open.
+- On a working lift a bot waits wholly on it; one that cannot fit gets off. Off a busy
+  lift, team-mates wait clear of its edge. A body across a working lift's edge steps back,
+  because Doom reverses a rising lift that would crush it.
+
+`harness/pathbench.py` reports `stuck` tics (moving with no displacement), `wedges` (35
+such tics in a row), `acid` tics, and floor deaths. On the same fourteen Nightmare runs
+(E1M1-5, 7 and 9, seeds 0 and 1, starting nets), compared with the previous release:
+
+| Measure | Before | After |
+|---|---:|---:|
+| Tics standing in hazardous floors | 45,079 | 14,103 |
+| Deaths to floor damage | 109 | 21 |
+| Wedges | 593 | 269 |
+| Stuck tics | 118,537 | 97,875 |
+| Levels finished | 1 | 2 |
+| All deaths | 752 | 804 |
+
+E1M1 now finishes in 1:32-1:51 on both seeds, instead of 5:41 or not at all. More combat
+deaths reflect bots advancing into more fights; that remains training work. Monster-free,
+E1M1-7 and E1M9 all finish (E1M6 newly within the limit). Nightmare episode completion is
+still not qualified.
+
 ### What decides
 
 Six outputs: forward, sideways, turn, fire, use, change weapon. Two things can produce them.

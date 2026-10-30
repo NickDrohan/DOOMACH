@@ -2717,6 +2717,13 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     var found:  i32 = 0;
     var hurt:     [4]i32;
     var friendly: i32 = 0;
+    var wasx: [4]i32;
+    var wasy: [4]i32;
+    var still: [4]i32;
+    var stucktics: i32 = 0;
+    var wedges: i32 = 0;
+    var acidtics: i32 = 0;
+    var floordeaths: i32 = 0;
     val began:  i64 = win.micros_now();
     var tic:    i32 = 0;
     for (tic < tics && !s.completed && !s.broken) {
@@ -2728,9 +2735,50 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
                 val tb: *bot.Bot = ?s.bots[i];
                 print.eprintlnf("t{} b{} at {},{} after {} want {} at {},{} works {} way {} stuck {} gaveup {} hp {}", tic / 35, i + 1, s.g.players[i].mo.x >> 16, s.g.players[i].mo.y >> 16, tb.after, tb.want, tb.afterx >> 16, tb.aftery >> 16, tb.works, tb.haveway, tb.feat[bot.F_STUCK], tb.gaveup, s.g.players[i].health);
                 val tp: *defs.Player = ?s.g.players[i];
+                if (tp.mo != nil) {
+                    val ts: i32 = s.g.lv.subsectors[tp.mo.subsector].sector;
+                    var kind: i32 = -1;
+                    if (s.g.lv.sectors[ts].specialdata != nil) { kind = (s.g.lv.sectors[ts].specialdata:~*defs.Thinker).kind::i32; }
+                    print.eprintlnf("    b{} sector {} floor {} z {} mover {} next {},{} slide {} pressed {}", i + 1, ts, s.g.lv.sectors[ts].floorheight >> 16, tp.mo.z >> 16, kind, tb.wayx >> 16, tb.wayy >> 16, tb.slide, tb.pressed);
+                }
                 if (tb.nbans > 0) { print.eprintlnf("    b{} went round {} lines: {} {} {} {} {} {}", i + 1, tb.nbans, tb.bans[0], tb.bans[1], tb.bans[2], tb.bans[3], tb.bans[4], tb.bans[5]); }
             }
+            val pm: *defs.Mobj = s.g.players[i].mo;
+            var onhurt: bool = 0;
+            if (pm != nil && s.g.players[i].powers[defs.PW_IRONFEET] == 0 && pm.z <= pm.floorz) {
+                val special: i32 = s.g.lv.sectors[s.g.lv.subsectors[pm.subsector].sector].special::i32;
+                onhurt = special == 4 || special == 5 || special == 7 || special == 16;
+            }
+            if (!now && pm != nil) {
+                if (onhurt) {
+                    acidtics = acidtics + 1;
+                    if (trace && acidtics % 35 == 0) {
+                        val ab: *bot.Bot = ?s.bots[i];
+                        print.eprintlnf("acid t{} b{} at {},{} sector {} after {} goal {},{} way {} wades {} next {},{} seen {} stuck {} hp {}", tic / 35, i + 1, pm.x >> 16, pm.y >> 16, s.g.lv.subsectors[pm.subsector].sector, ab.after, ab.afterx >> 16, ab.aftery >> 16, ab.haveway, ab.wades, ab.wayx >> 16, ab.wayy >> 16, ab.feat[bot.F_SEEN], ab.feat[bot.F_STUCK], s.g.players[i].health);
+                    }
+                }
+                var mx: i32 = (pm.x >> 16) - wasx[i];
+                var my: i32 = (pm.y >> 16) - wasy[i];
+                if (mx < 0) { mx = -mx; }
+                if (my < 0) { my = -my; }
+                val pushing: bool = s.g.players[i].cmd.forwardmove != 0 || s.g.players[i].cmd.sidemove != 0;
+                if (pushing && mx + my < 1) {
+                    stucktics = stucktics + 1;
+                    still[i] = still[i] + 1;
+                    if (still[i] == 35) {
+                        wedges = wedges + 1;
+                        if (trace) {
+                            val wb: *bot.Bot = ?s.bots[i];
+                            print.eprintlnf("wedge t{} b{} at {},{} after {} goal {},{} way {} next {},{} seen {} cmd {},{} turn {}", tic / 35, i + 1, pm.x >> 16, pm.y >> 16, wb.after, wb.afterx >> 16, wb.aftery >> 16, wb.haveway, wb.wayx >> 16, wb.wayy >> 16, wb.feat[bot.F_SEEN], s.g.players[i].cmd.forwardmove::i32, s.g.players[i].cmd.sidemove::i32, s.g.players[i].cmd.angleturn::i32);
+                        }
+                    }
+                }
+                or { still[i] = 0; }
+                wasx[i] = pm.x >> 16;
+                wasy[i] = pm.y >> 16;
+            }
             if (now && !dead[i]) {
+                if (onhurt && s.g.players[i].attacker == nil) { floordeaths = floordeaths + 1; }
                 deaths[i] = deaths[i] + 1;
                 if (trace) {
                     var who: i32 = -1;
@@ -2782,6 +2830,7 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     if (s.completed && !s.capped) { done = 1; }
     if (league) { print.printlnf("league cutoff {}", s.capped); }
     print.printlnf("hit by friends {} times", friendly);
+    print.printlnf("pathing stuck {} wedges {} acid {} floordeaths {}", stucktics, wedges, acidtics, floordeaths);
     print.printlnf("end tic {} finished {} secrets {} of {} sum {} map E1M{}", tic, done, found, s.g.totalsecret, game.checksum(s), map);
     ret EXIT_OK;
 }

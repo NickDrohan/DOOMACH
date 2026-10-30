@@ -31,6 +31,7 @@ use doom.fixed.Fixed;
 use doom.info;
 use doom.level;
 use doom.maputl;
+use doom.movers;
 use doom.render;
 use t: doom.tables;
 use doom.world;
@@ -158,6 +159,19 @@ pub rec Bot {
     # with it fights out to the end of sight, what it is passing by stays
     # passed — the line between fighting and passing must not flutter
     engaged:  bool;
+    # pressing on without getting anywhere: where it stood eight tics
+    # ago, how many such checks in a row it barely moved, and a slide
+    # along the wall in progress (tics left, and which way)
+    pressx:   Fixed;
+    pressy:   Fixed;
+    pressed:  i32;
+    slide:    i32;
+    slidedir: i32;
+    # the cells it last caught on, and until when its searches go round
+    # them: what the map's lines do not show, a pillar or a crowd
+    snag:     [4]i32;
+    snagtill: [4]i32;
+    nsnag:    i32;
 
     # tics until it may press use again, and whether there is something
     # within reach ahead to use
@@ -542,6 +556,26 @@ var floodqueue: [65536]u16;
 var reachqueue: [65536]u16;
 var wayqueue:   [65536]u16;
 var waystep:    [65536]u8;
+# a co-op search weighs its steps: what each cell has cost to reach, and a
+# heap of cells still to look at, the cost in the high half
+var waycost:    [65536]u16;
+# which search last touched a cell: a cell another search left is unvisited,
+# so the cells need not all be cleared before every search
+var waymark:    [65536]u16;
+var wayepoch:   u16;
+# the cells one co-op decision's searches have looked at: past SOLVE_WORK it
+# stops working through doors and switches and takes what it has on trust.
+# Where a goal lies behind something nothing opens, as E1M8's exit behind
+# its barons' wall does, every door between was otherwise worked through
+# again on every decision, the whole map flooded each time
+var solvework: i32;
+val SOLVE_WORK: i32 = 150000;
+# what a step taken on trust looked like as the level stood, remembered for
+# the rest of the tic: many searches in a tic ask about the same few steps
+var trustnow:   [262144]u8;
+var truststamp: [262144]u32;
+var wayheap:    [262144]u32;
+var nheap:      i32;
 
 # the keys whoever is walking has, a bit a colour; and the keys the doors
 # the walk went through needed
@@ -574,6 +608,150 @@ var careful: bool;
 
 # a cell's floor hurts whoever stands on it: marked in the cell's navout byte
 val HURTS: i32 = 0x10;
+# a cell a player's body barely fits: a wall or a ledge within a stride of
+# its middle, where a bot walking the middle catches its shoulder; and a
+# cell beside one whose floor hurts, where a sidestep is a step into it
+val NEAR:     i32 = 0x20;
+val NEARHURT: i32 = 0x40;
+# a cell a solid thing stands in or beside: a pillar, a lamp, a barrel
+val THING:    i32 = 0x80;
+
+# what stepping into a cell costs a co-op search: a cell of open floor 4;
+# against a wall or beside slime more; slime itself a great deal, so that a
+# way that must wade wades the least it can
+fun step_cost(g: *Game, cell: i32) i32 {
+    val out: i32 = g.navout[cell]::i32;
+    var cost: i32 = 4;
+    if ((out & NEAR) != 0)     { cost = cost + 5; }
+    if ((out & NEARHURT) != 0) { cost = cost + 4; }
+    if ((out & HURTS) != 0)    { cost = cost + 40; }
+    if ((out & THING) != 0)    { cost = cost + 30; }
+    ret cost;
+}
+
+# and for one bot, a cell it caught on lately costs a great deal more
+fun snag_cost(g: *Game, b: *Bot, cell: i32) i32 {
+    var i: i32 = 0;
+    for (i < 4) {
+        if (b.snag[i] == cell && b.snagtill[i] > g.leveltime) { ret 120; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the least the walk from a cell to the bot's could cost
+fun guess(cell: i32, mex: i32, mey: i32, w: i32) i32 {
+    var dx: i32 = cell % w - mex;
+    var dy: i32 = cell / w - mey;
+    if (dx < 0) { dx = -dx; }
+    if (dy < 0) { dy = -dy; }
+    var d: i32 = dx + dy - 1;
+    if (d < 0) { d = 0; }
+    ret d * 4;
+}
+
+fun open_now(g: *Game, cell: i32, way: i32, to: i32) bool {
+    val at: i32 = cell * 4 + way_index(way);
+    val stamp: u32 = ((g.levelserial::u32) << 20) ^ (g.leveltime::u32) ^ 0x80000000;
+    if (truststamp[at] != stamp) {
+        truststamp[at] = stamp;
+        trustnow[at] = 2;
+        if (walks_now(g, cell_x(g, cell % g.navw), cell_y(g, cell / g.navw), cell_x(g, to % g.navw), cell_y(g, to / g.navw))) { trustnow[at] = 1; }
+    }
+    ret trustnow[at] == 1;
+}
+
+fun new_search() {
+    if (wayepoch == 0xffff) {
+        var i: i32 = 0;
+        for (i < 65536) {
+            waymark[i] = 0;
+            i = i + 1;
+        }
+        wayepoch = 0;
+    }
+    wayepoch = wayepoch + 1;
+}
+
+# what a search knows of a cell: the way out of it it found (16 at an end of
+# the walk, 0 if it has not reached it), and what reaching it cost
+fun step_of(cell: i32) i32 {
+    if (waymark[cell] != wayepoch) { ret 0; }
+    ret waystep[cell]::i32;
+}
+
+fun cost_of(cell: i32) i32 {
+    if (waymark[cell] != wayepoch) { ret 0xffff; }
+    ret waycost[cell]::i32;
+}
+
+fun set_step(cell: i32, way: i32, cost: i32) {
+    waymark[cell] = wayepoch;
+    waystep[cell] = way::u8;
+    waycost[cell] = cost::u16;
+}
+
+fun heap_push(key: u32) {
+    if (nheap >= 262144) { ret; }
+    var at: i32 = nheap;
+    nheap = nheap + 1;
+    for (at > 0) {
+        val up: i32 = (at - 1) / 2;
+        if (wayheap[up] <= key) { brk; }
+        wayheap[at] = wayheap[up];
+        at = up;
+    }
+    wayheap[at] = key;
+}
+
+fun heap_pop() u32 {
+    val top: u32 = wayheap[0];
+    nheap = nheap - 1;
+    val last: u32 = wayheap[nheap];
+    var at: i32 = 0;
+    for {
+        var child: i32 = at * 2 + 1;
+        if (child >= nheap) { brk; }
+        if (child + 1 < nheap && wayheap[child + 1] < wayheap[child]) { child = child + 1; }
+        if (last <= wayheap[child]) { brk; }
+        wayheap[at] = wayheap[child];
+        at = child;
+    }
+    if (nheap > 0) { wayheap[at] = last; }
+    ret top;
+}
+
+# whether a player's body, not just its middle, can walk from one place to
+# another: the middle's walk and, on each side where there is room to stand
+# at all, the walk of a shoulder fourteen units out
+fun body_walk(g: *Game, x1: Fixed, y1: Fixed, x2: Fixed, y2: Fixed) bool {
+    if (!can_walk(g, x1, y1, x2, y2)) { ret 0; }
+    # and no short cut across slime the way itself goes round: the middle
+    # of the body is what the floor hurts, every eight units of the walk
+    if (!floor_hurts(g.lv.sectors[sector_at(g, x2, y2)].special::i32)) {
+        var len0: i32 = maputl.aprox_distance(x2 - x1, y2 - y1) >> 16;
+        var n: i32 = len0 / 8;
+        var k: i32 = 1;
+        for (k < n) {
+            val px: Fixed = x1 + ((x2 - x1) / n) * k;
+            val py: Fixed = y1 + ((y2 - y1) / n) * k;
+            if (floor_hurts(g.lv.sectors[sector_at(g, px, py)].special::i32)) { ret 0; }
+            k = k + 1;
+        }
+    }
+    var len: i32 = maputl.aprox_distance(x2 - x1, y2 - y1) >> 16;
+    if (len < 4) { ret 1; }
+    val ox: Fixed = (0 - (y2 - y1) / len) * 14;
+    val oy: Fixed = ((x2 - x1) / len) * 14;
+    var sign: i32 = -1;
+    for (sign <= 1) {
+        val sx: Fixed = x1 + ox * sign;
+        val sy: Fixed = y1 + oy * sign;
+        if (can_walk(g, x1, y1, sx, sy) && !can_walk(g, sx, sy, x2 + ox * sign, y2 + oy * sign)) { ret 0; }
+        sign = sign + 2;
+    }
+    ret 1;
+}
 
 # a floor that hurts: the slime, acid and lava kinds of sector
 fun floor_hurts(special: i32) bool {
@@ -901,6 +1079,64 @@ fun build_grid_with_every_key(g: *Game) {
     for (c < g.navw * g.navh) {
         if (g.navgrid[c] != 0 && floor_hurts(g.lv.sectors[sector_at(g, cell_x(g, c % g.navw), cell_y(g, c / g.navw))].special::i32)) {
             g.navout[c] = g.navout[c] | HURTS::u8;
+        }
+        c = c + 1;
+    }
+    # the cells a solid thing that is no monster stands in or beside
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            val mo: *Mobj = th:~*Mobj;
+            if ((mo.flags & defs.MF_SOLID) != 0 && (mo.flags & defs.MF_COUNTKILL) == 0 && mo.player == nil) {
+                val reach: i32 = (mo.radius >> 16) + 16;
+                var oy: i32 = 0 - reach;
+                for (oy <= reach) {
+                    var ox: i32 = 0 - reach;
+                    for (ox <= reach) {
+                        val tc: i32 = cell_of(g, mo.x + ox * 65536, mo.y + oy * 65536);
+                        if (tc >= 0) { g.navout[tc] = g.navout[tc] | THING::u8; }
+                        ox = ox + 16;
+                    }
+                    oy = oy + 16;
+                }
+            }
+        }
+        th = th.next;
+    }
+    # the cells a body barely fits, and the cells beside slime
+    c = 0;
+    for (c < g.navw * g.navh) {
+        if (g.navgrid[c] != 0) {
+            val cx: i32 = c % g.navw;
+            val cy: i32 = c / g.navw;
+            val x: Fixed = cell_x(g, cx);
+            val y: Fixed = cell_y(g, cy);
+            var near: bool = (g.navgrid[c]::i32 & (EAST | WEST | NORTH | SOUTH)) != (EAST | WEST | NORTH | SOUTH);
+            var d: i32 = 0;
+            for (d < 4 && !near) {
+                var dx: i32 = 20;
+                var dy: i32 = 20;
+                if ((d & 1) != 0) { dx = -20; }
+                if ((d & 2) != 0) { dy = -20; }
+                if (!walks_now(g, x, y, x + dx * 65536, y + dy * 65536)) { near = 1; }
+                d = d + 1;
+            }
+            if (near) { g.navout[c] = g.navout[c] | NEAR::u8; }
+            if ((g.navout[c]::i32 & HURTS) == 0) {
+                var oy: i32 = -1;
+                for (oy <= 1) {
+                    var ox: i32 = -1;
+                    for (ox <= 1) {
+                        val nx: i32 = cx + ox;
+                        val ny: i32 = cy + oy;
+                        if (nx >= 0 && ny >= 0 && nx < g.navw && ny < g.navh && (g.navout[ny * g.navw + nx]::i32 & HURTS) != 0) {
+                            g.navout[c] = g.navout[c] | NEARHURT::u8;
+                        }
+                        ox = ox + 1;
+                    }
+                    oy = oy + 1;
+                }
+            }
         }
         c = c + 1;
     }
@@ -1244,7 +1480,17 @@ fun cell_of(g: *Game, x: Fixed, y: Fixed) i32 {
 fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     val me: *Mobj = g.players[playernum].mo;
     if (((g.leveltime + playernum) & 15) != 0 && b.haveway) { ret clamp(bearing(me, b.wayx, b.wayy), -127, 127); }
+    # in co-op a way not found is looked for again every eighth tic, not
+    # every tic: where there is none, a search floods the whole map and
+    # solves every door in it, four bots at a time
+    if (g.deathmatch == 0 && !b.haveway && ((g.leveltime + playernum) & 7) != 0) { ret 0; }
+    # and a way that took working through many things to find is kept a
+    # while longer before it is worked out again, while the bot is still
+    # some way short of the place it was making for
+    if (g.deathmatch == 0 && b.haveway && b.works >= 8 && ((g.leveltime + playernum) & 63) != 0 && distance(me, b.wayx, b.wayy) > 24) { ret clamp(bearing(me, b.wayx, b.wayy), -127, 127); }
     b.haveway = 0;
+    solvework = 0;
+    if (g.deathmatch != 0) { solvework = 0 - 0x40000000; }
     val have: i32 = keys_of(?g.players[playernum]);
     walkhave = have;
 
@@ -1472,7 +1718,7 @@ fun solve_pass(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, fx_in: Fixe
     nbanned = 0;
     detour  = 1;
     solved  = 1;
-    for (solved && depth < 17) {
+    for (solved && depth < 17 && solvework < SOLVE_WORK) {
         solving = 1;
         solved  = 0;
         keepfx  = fx;
@@ -1490,7 +1736,7 @@ fun solve_pass(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, fx_in: Fixe
         nbanned   = 0;
         depth     = 0;
         b.haveway = 0;
-        for (depth < 17) {
+        for (depth < 17 && solvework < SOLVE_WORK) {
             solving    = 1;
             solvedepth = works;
             solved     = 0;
@@ -1666,6 +1912,17 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
     }
     val mission: i32 = mission_bearing(g, playernum, me, b, have);
     if (b.haveway && !unsure) { b.want = -1; ret mission; }
+    # what the mission said, for falling back on without working it all out
+    # a second time
+    val mhave: bool = b.haveway;
+    val mwayx: Fixed = b.wayx;
+    val mwayy: Fixed = b.wayy;
+    val mafter: i32 = b.after;
+    val mafterx: Fixed = b.afterx;
+    val maftery: Fixed = b.aftery;
+    val mworks: i32 = b.works;
+    val mwades: bool = b.wades;
+    val munsure: bool = unsure;
 
     var tries: i32 = 0;
     for (tries < 4 && secrets_left(g, b)) {
@@ -1719,7 +1976,16 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         }
     }
 
-    ret mission_bearing(g, playernum, me, b, have);
+    b.haveway = mhave;
+    b.wayx    = mwayx;
+    b.wayy    = mwayy;
+    b.after   = mafter;
+    b.afterx  = mafterx;
+    b.aftery  = maftery;
+    b.works   = mworks;
+    b.wades   = mwades;
+    unsure    = munsure;
+    ret mission;
 }
 
 fun pickup_point(g: *Game, me: *Mobj, item: *Mobj, x: Fixed, y: Fixed, tx: *Fixed, ty: *Fixed) bool {
@@ -1845,6 +2111,32 @@ fun mission_bearing(g: *Game, playernum: i32, me: *Mobj, b: *Bot, have: i32) i32
 
 # the bearing of a place a few cells along the shortest walk to a place,
 # for a player with these keys; 0 if there is no way
+# the first line along a found walk that is shut as the level stands and
+# that the walk cannot open by itself (a use door it reaches is opened by
+# walking at it), or -1
+fun first_shut(g: *Game, from: i32) i32 {
+    var c: i32 = from;
+    var n: i32 = 0;
+    for (n < 4000 && step_of(c) != 16) {
+        var next: i32 = c - g.navw;
+        if (step_of(c) == EAST)  { next = c + 1; }
+        if (step_of(c) == WEST)  { next = c - 1; }
+        if (step_of(c) == NORTH) { next = c + g.navw; }
+        val cx: Fixed = cell_x(g, c % g.navw);
+        val cy: Fixed = cell_y(g, c / g.navw);
+        if (!walks_now(g, cx, cy, cell_x(g, next % g.navw), cell_y(g, next / g.navw)) && walkblock >= 0) {
+            val shut: i32 = walkblock;
+            # a line that works when used is opened by walking at it and
+            # pressing use; and a door's far face, come at from inside
+            # the door, is open by then
+            if (!(g.lv.lines[shut].special != 0 && !walked_over(g.lv.lines[shut].special::i32))) { ret shut; }
+        }
+        c = next;
+        n = n + 1;
+    }
+    ret -1;
+}
+
 fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 {
     var i: i32 = 0;
     if (g.navserial != g.levelserial) { build_grid(g); }
@@ -1860,11 +2152,8 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
     val step:  *u8  = ?waystep[0];
     val queue: *u16 = ?wayqueue[0];
     val cells: i32 = g.navw * g.navh;
-    i = 0;
-    for (i < cells) {
-        step[i] = 0;
-        i       = i + 1;
-    }
+    val weighed: bool = g.deathmatch == 0;
+    new_search();
     var ends:  [9]i32;
     var goalx: [9]Fixed;
     var goaly: [9]Fixed;
@@ -1876,7 +2165,7 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
         var dx: i32 = -1;
         for (dx <= 1) {
             val near: i32 = cell_of(g, tox + ((dx * CELL) << 16), toy + ((dy * CELL) << 16));
-            if (near >= 0 && step[near] == 0) {
+            if (near >= 0 && step_of(near) == 0) {
                 val x: Fixed = cell_x(g, near % g.navw);
                 val y: Fixed = cell_y(g, near / g.navw);
                 var gx: Fixed = tox;
@@ -1884,7 +2173,7 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
                 var reaches: bool = can_walk(g, x, y, tox, toy);
                 if (!reaches && collecting) { reaches = pickup_point(g, me, walkitem, x, y, ?gx, ?gy); }
                 if (reaches) {
-                    step[near]  = 16;
+                    set_step(near, 16, 0);
                     queue[tail] = near::u16;
                     goalx[tail] = gx;
                     goaly[tail] = gy;
@@ -1908,84 +2197,161 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
     var from: i32 = -1;
     i = 0;
     for (i < nends && from < 0) {
-        if (step[ends[i]] != 0) { from = ends[i]; }
+        if (step_of(ends[i]) != 0) { from = ends[i]; }
         i = i + 1;
     }
-    var head: i32 = 0;
-    for (head < tail && from < 0) {
-        val to: i32 = queue[head]::i32;
-        head = head + 1;
-        val tx: i32 = to % g.navw;
-        # each neighbour that can walk into this cell
-        var k: i32 = 0;
-        for (k < 4) {
-            var next: i32 = -1;
-            var way:  i32 = 0;
-            if (k == 0 && tx > 0)               { next = to - 1;      way = EAST; }
-            if (k == 1 && tx + 1 < g.navw)      { next = to + 1;      way = WEST; }
-            if (k == 2 && to >= g.navw)         { next = to - g.navw; way = NORTH; }
-            if (k == 3 && to + g.navw < cells)  { next = to + g.navw; way = SOUTH; }
-            k = k + 1;
-            if (next < 0 || step[next] != 0 || !way_open(g, next, way, have)) { cnt; }
-            # keeping out of harm: no step from a safe cell into a harmful
-            # one. Out of one, or along inside one, is another matter.
-            if (careful && (g.navout[to]::i32 & HURTS) != 0 && (g.navout[next]::i32 & HURTS) == 0) { cnt; }
-            step[next]  = way::u8;
-            queue[tail] = next::u16;
-            tail        = tail + 1;
+    val mex: i32 = mine % g.navw;
+    val mey: i32 = mine / g.navw;
+    # first breadth first, which says quickly whether there is any way at
+    # all; then, in co-op, again by cost for the way to take (step_cost)
+    var heaped: bool = 0;
+    var pass: i32 = 0;
+    # and the search by cost is given only so long: half as many cells
+    # again as the first search looked at, and never fewer than two thousand
+    var budget: i32 = 2000;
+    var pops: i32 = 0;
+    for (pass < 3) {
+        var head: i32 = 0;
+        # in co-op, the cheapest way rather than the fewest cells: walls and
+        # slime cost more than open floor (step_cost)
+        # (and searched toward the bot first: a cell's cost so far plus the
+        # least the rest could cost, four a cell, decides which is looked at
+        # next, so the search does not flood the whole map)
+        nheap = 0;
+        if (heaped) {
             i = 0;
-            for (i < nends) {
-                if (ends[i] == next) { from = next; }
+            for (i < tail) {
+                heap_push((guess(queue[i]::i32, mex, mey, g.navw)::u32 << 16) | queue[i]::u32);
                 i = i + 1;
             }
+            head = tail;
         }
-    }
-    if (from < 0) { ret 0; }
-
-    # asked to solve it: along the whole walk, the first step that cannot be
-    # taken as the level stands and that something elsewhere works
-    if (solving) {
-        var c: i32 = from;
-        var n: i32 = 0;
-        for (n < 4000 && step[c] != 16) {
-            var next: i32 = c - g.navw;
-            if (step[c] == EAST::u8)  { next = c + 1; }
-            if (step[c] == WEST::u8)  { next = c - 1; }
-            if (step[c] == NORTH::u8) { next = c + g.navw; }
-            val cx: Fixed = cell_x(g, c % g.navw);
-            val cy: Fixed = cell_y(g, c / g.navw);
-            if (!walks_now(g, cx, cy, cell_x(g, next % g.navw), cell_y(g, next / g.navw)) && walkblock >= 0) {
-                val shut: i32 = walkblock;
-                # a line that works when used is opened by walking at it and
-                # pressing use; and a door's far face, come at from inside
-                # the door, is open by then
-                val own: bool = g.lv.lines[shut].special != 0 && !walked_over(g.lv.lines[shut].special::i32);
-                if (!own && nbanned >= 16) {
-                    # more shut lines than it can keep count of: no walk
-                    # it can vouch for
-                    solved = 1;
-                    ret 0;
+        for ((heaped && nheap > 0 && from < 0) || (!heaped && head < tail && from < 0)) {
+            var to: i32 = 0;
+            if (heaped) {
+                val top: u32 = heap_pop();
+                pops = pops + 1;
+                solvework = solvework + 1;
+                if (pops > budget) {
+                    from = -2;
+                    brk;
                 }
-                if (!own) {
-                    # something elsewhere works it: go there, and not this
-                    # way; nothing does, or the search is for a way round:
-                    # another way to the same place
-                    solved = 1;
-                    if (detour || !activator(g, me, b, shut)) {
-                        solvex = tox;
-                        solvey = toy;
-                        facex  = keepfx;
-                        facey  = keepfy;
-                    }
-                    banned[nbanned] = shut;
-                    nbanned         = nbanned + 1;
-                    ret 0;
+                to = (top & 0xffff)::i32;
+                if ((top >> 16)::i32 != clamp(cost_of(to) + guess(to, mex, mey, g.navw), 0, 0xffff)) { cnt; }
+                i = 0;
+                for (i < nends) {
+                    if (ends[i] == to) { from = to; }
+                    i = i + 1;
+                }
+                if (from >= 0) { brk; }
+            }
+            or {
+                to = queue[head]::i32;
+                head = head + 1;
+                solvework = solvework + 1;
+            }
+            val tx: i32 = to % g.navw;
+            # each neighbour that can walk into this cell
+            var k: i32 = 0;
+            for (k < 4) {
+                var next: i32 = -1;
+                var way:  i32 = 0;
+                if (k == 0 && tx > 0)               { next = to - 1;      way = EAST; }
+                if (k == 1 && tx + 1 < g.navw)      { next = to + 1;      way = WEST; }
+                if (k == 2 && to >= g.navw)         { next = to - g.navw; way = NORTH; }
+                if (k == 3 && to + g.navw < cells)  { next = to + g.navw; way = SOUTH; }
+                k = k + 1;
+                if (next < 0 || !way_open(g, next, way, have)) { cnt; }
+                if (step_of(next) != 0 && !heaped) { cnt; }
+                # keeping out of harm: no step from a safe cell into a harmful
+                # one. Out of one, or along inside one, is another matter.
+                if (careful && (g.navout[to]::i32 & HURTS) != 0 && (g.navout[next]::i32 & HURTS) == 0) { cnt; }
+                if (heaped) {
+                    if (step_of(next) == 16) { cnt; }
+                    var cost: i32 = cost_of(to) + step_cost(g, next) + snag_cost(g, b, next);
+                    # a step taken on trust that cannot be taken as the
+                    # level stands costs a great deal: a floor that was to
+                    # move may have moved the other way, or will not again
+                    if (g.navline[next * 4 + way_index(way)] != 0 && !open_now(g, next, way, to)) { cost = cost + 200; }
+                    if (cost > 0xfffe) { cost = 0xfffe; }
+                    if (cost >= cost_of(next)) { cnt; }
+                    set_step(next, way, cost);
+                    heap_push((clamp(cost + guess(next, mex, mey, g.navw), 0, 0xffff)::u32 << 16) | next::u32);
+                    cnt;
+                }
+                set_step(next, way, 0);
+                queue[tail] = next::u16;
+                tail        = tail + 1;
+                i = 0;
+                for (i < nends) {
+                    if (ends[i] == next) { from = next; }
+                    i = i + 1;
                 }
             }
-            c = next;
-            n = n + 1;
         }
+        if (heaped && (from == -2 || (solving && first_shut(g, from) >= 0))) {
+            # the walk by cost took too long to find, or meets what the
+            # first walk went round: the first walk, again
+            new_search();
+            i = 0;
+            for (i < starts) {
+                set_step(queue[i]::i32, 16, 0);
+                i = i + 1;
+            }
+            tail   = starts;
+            from   = -1;
+            heaped = 0;
+            i = 0;
+            for (i < nends && from < 0) {
+                if (step_of(ends[i]) != 0) { from = ends[i]; }
+                i = i + 1;
+            }
+            pass = 2;
+            cnt;
+        }
+        if (from < 0) { ret 0; }
+        # asked to solve it: along the whole walk, the first step that
+        # cannot be taken as the level stands and that something elsewhere
+        # works. Asked of the first, breadth-first walk; a cheaper walk by
+        # cost that would meet a shut line the first does not is not taken
+        if (solving && !heaped) {
+            val shut: i32 = first_shut(g, from);
+            if (shut >= 0 && nbanned >= 16) {
+                # more shut lines than it can keep count of: no walk it
+                # can vouch for
+                solved = 1;
+                ret 0;
+            }
+            if (shut >= 0) {
+                # something elsewhere works it: go there, and not this
+                # way; nothing does, or the search is for a way round:
+                # another way to the same place
+                solved = 1;
+                if (detour || !activator(g, me, b, shut)) {
+                    solvex = tox;
+                    solvey = toy;
+                    facex  = keepfx;
+                    facey  = keepfy;
+                }
+                banned[nbanned] = shut;
+                nbanned         = nbanned + 1;
+                ret 0;
+            }
+        }
+        if (!weighed || heaped || pass >= 2 || step_of(from) == 16) { brk; }
+        if (tail + tail / 2 > budget) { budget = tail + tail / 2; }
+        new_search();
+        i = 0;
+        for (i < starts) {
+            set_step(queue[i]::i32, 16, 0);
+            i = i + 1;
+        }
+        tail   = starts;
+        from   = -1;
+        heaped = 1;
+        pass   = pass + 1;
     }
+    if (from < 0) { ret 0; }
 
     # along the way: the farthest of the next six cells the bot can walk
     # straight to, so that it cuts corners no more than the walls allow
@@ -2003,7 +2369,10 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
         hops = hops + 1;
         val x: Fixed = cell_x(g, at % g.navw);
         val y: Fixed = cell_y(g, at / g.navw);
-        if (!can_walk(g, me.x, me.y, x, y)) { brk; }
+        if (weighed) {
+            if (!body_walk(g, me.x, me.y, x, y)) { brk; }
+        }
+        or { if (!can_walk(g, me.x, me.y, x, y)) { brk; } }
         b.wayx = x;
         b.wayy = y;
     }
@@ -2011,7 +2380,7 @@ fun way_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, have: i32) i32 
     if (step[at] == 16) {
         var end: i32 = 0;
         for (end < starts && queue[end] != at::u16) { end = end + 1; }
-        if (end < starts && can_walk(g, me.x, me.y, goalx[end], goaly[end])) {
+        if (end < starts && can_walk(g, me.x, me.y, goalx[end], goaly[end]) && (!weighed || body_walk(g, me.x, me.y, goalx[end], goaly[end]))) {
             b.wayx = goalx[end];
             b.wayy = goaly[end];
         }
@@ -2550,6 +2919,167 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         if (b.feat[F_PATH] > 32 || b.feat[F_PATH] < -32) { forward = 40; }
     }
 
+    # In co-op, with a way and nothing close to fight, the way is walked in
+    # the world's terms: straight at the next place along it, forward and
+    # sideways together, whichever way the bot happens to face, as a person
+    # strafes round a corner. A net left to steer by bearing alone swung
+    # wide and caught its shoulder on every corner. And pressing on without
+    # getting anywhere, it slides along the wall the way there is more room,
+    # as a person does, instead of pushing into it until it gives up.
+    val brawl: bool = (p.readyweapon == defs.WP_FIST || p.readyweapon == defs.WP_CHAINSAW) && b.feat[F_SEEN] > 0;
+    # (in a fight too, when standing in slime or at its edge: a dodge or a
+    # step back there is a step into it, and a fight is no place to stand
+    # in it, so it fights its way out along the way instead)
+    var hazard: bool = 0;
+    if (g.deathmatch == 0 && g.navgrid != nil && g.navserial == g.levelserial) {
+        val cell: i32 = cell_of(g, p.mo.x, p.mo.y);
+        hazard = cell >= 0 && (g.navout[cell]::i32 & (HURTS | NEARHURT)) != 0;
+    }
+    val guided: bool = g.deathmatch == 0 && !b.shy && b.haveway && g.navgrid != nil && g.navserial == g.levelserial && !brawl && (b.feat[F_SEEN] == 0 || !b.engaged || hazard);
+    var pathing: bool = 0;
+    if (guided) {
+        # and with room for the team: a team-mate close by pushes it off a
+        # little, and one close ahead in a lower seat goes first, so that
+        # four making for the same doorway file through it rather than jam
+        # it shoulder to shoulder
+        # On a lift that has not yet brought it level with the way on: to
+        # the lift's middle, and wait there. A bot standing at a lift's edge,
+        # its shoulder over a lower ceiling beside, stops the lift rising,
+        # and Doom sends it back down: E1M7's held four bots for good.
+        var tx: Fixed = b.wayx;
+        var ty: Fixed = b.wayy;
+        var riding: bool = 0;
+        val here: i32 = g.lv.subsectors[p.mo.subsector].sector;
+        val lift: ptr = g.lv.sectors[here].specialdata;
+        val waysec: i32 = sector_at(g, b.wayx, b.wayy);
+        if (lift != nil && (lift:~*defs.Thinker).kind == defs.TH_PLAT && (waysec == here || g.lv.sectors[waysec].floorheight > p.mo.floorz + STEP)) {
+            sector_middle(g, here, ?tx, ?ty);
+            riding = 1;
+            # and if it cannot get wholly on because a team-mate already is,
+            # it gets off again and lets the lift go: half on, it would hold
+            # the lift down for everyone
+            if (!wholly_in(g, p.mo, here) && boarded(g, playernum, here)) {
+                tx = p.mo.x + (p.mo.x - tx);
+                ty = p.mo.y + (p.mo.y - ty);
+            }
+        }
+        # Off a working lift its way lies on, with a team-mate already
+        # aboard: it waits its turn clear of the lift's edge
+        var waiting: bool = 0;
+        val waylift: ptr = g.lv.sectors[waysec].specialdata;
+        if (!riding && waysec != here && waylift != nil && (waylift:~*defs.Thinker).kind == defs.TH_PLAT && boarded(g, playernum, waysec)) {
+            waiting = 1;
+            var mx: Fixed = 0;
+            var my: Fixed = 0;
+            sector_middle(g, waysec, ?mx, ?my);
+            tx = p.mo.x + (p.mo.x - mx);
+            ty = p.mo.y + (p.mo.y - my);
+        }
+        # Off the lift but with a shoulder over its working edge: step back
+        # off it, whatever the way says, and let it go
+        if (!riding) {
+            val edge: i32 = lift_edge(g, p.mo, here);
+            if (edge >= 0) {
+                var ex: Fixed = 0;
+                var ey: Fixed = 0;
+                sector_middle(g, edge, ?ex, ?ey);
+                tx = p.mo.x + (p.mo.x - ex);
+                ty = p.mo.y + (p.mo.y - ey);
+                waiting = 1;
+            }
+        }
+        val aim: u32 = world.point_to_angle2(p.mo.x, p.mo.y, tx, ty);
+        val afine: u32 = aim >> t.ANGLETOFINESHIFT;
+        var vx: i32 = t.FINESINE[afine + 2048];
+        var vy: i32 = t.FINESINE[afine];
+        var rx: i32 = 0;
+        var ry: i32 = 0;
+        var yield: bool = 0;
+        var o: i32 = 0;
+        for (o < defs.MAXPLAYERS) {
+            val om: *Mobj = g.players[o].mo;
+            if (!riding && !waiting && o != playernum && g.playeringame[o] && om != nil && om.health > 0) {
+                val ax: i32 = (p.mo.x - om.x) >> 16;
+                val ay: i32 = (p.mo.y - om.y) >> 16;
+                val d: i32 = maputl.aprox_distance(p.mo.x - om.x, p.mo.y - om.y) >> 16;
+                if (d > 0 && d < 72) {
+                    val push: i32 = (72 - d) * 900;
+                    rx = rx + ax * push / d;
+                    ry = ry + ay * push / d;
+                    if (o < playernum && d < 56 && (0 - ax) * (vx >> 8) + (0 - ay) * (vy >> 8) > 0) { yield = 1; }
+                }
+            }
+            o = o + 1;
+        }
+        if (yield) {
+            vx = vx / 4;
+            vy = vy / 4;
+        }
+        vx = vx + rx;
+        vy = vy + ry;
+        val toward: u32 = world.point_to_angle2(0, 0, vx, vy) - p.mo.angle;
+        val fine: u32 = toward >> t.ANGLETOFINESHIFT;
+        val c: i32 = t.FINESINE[fine + 2048];
+        val s: i32 = t.FINESINE[fine];
+        var big: i32 = c;
+        if (big < 0) { big = -big; }
+        var other: i32 = s;
+        if (other < 0) { other = -other; }
+        if (other > big) { big = other; }
+        if (big < 1) { big = 1; }
+        forward = c * 127 / big;
+        side    = 0 - s * 127 / big;
+        if (yield) {
+            forward = forward / 2;
+            side    = side / 2;
+        }
+        if ((riding && (distance(p.mo, tx, ty) < 10 || wholly_in(g, p.mo, here))) || (waiting && wholly_in(g, p.mo, here) && distance(p.mo, p.mo.x * 2 - tx, p.mo.y * 2 - ty) > 112)) {
+            forward = 0;
+            side    = 0;
+        }
+        if (b.feat[F_SEEN] == 0) {
+            turn = clamp(b.feat[F_PATH] * 6, -127, 127);
+            if (b.feat[F_PATH] > -4 && b.feat[F_PATH] < 4) { turn = 0; }
+        }
+        if (((g.leveltime + playernum) & 7) == 0) {
+            # (but not at a door or a switch within reach: that is opened,
+            # not slid away from, and a door takes its time to rise)
+            if (distance(p.mo, b.pressx, b.pressy) < 6 && !b.usable && !yield && !riding && !waiting) { b.pressed = b.pressed + 1; }
+            or { b.pressed = 0; }
+            b.pressx = p.mo.x;
+            b.pressy = p.mo.y;
+        }
+        if (b.pressed >= 2 && b.slide == 0) {
+            # remember what it caught on, for its searches to go round
+            val snagged: i32 = cell_of(g, p.mo.x + t.FINESINE[afine + 2048] * 24, p.mo.y + t.FINESINE[afine] * 24);
+            if (snagged >= 0) {
+                b.snag[b.nsnag & 3] = snagged;
+                b.snagtill[b.nsnag & 3] = g.leveltime + 20 * 35;
+                b.nsnag = b.nsnag + 1;
+            }
+            # the side with more room, and the other way from last time if
+            # that did not free it
+            var dir: i32 = -1;
+            if (b.feat[F_RAYS + 5] > b.feat[F_RAYS + 6]) { dir = 1; }
+            if (b.feat[F_RAYS + 5] == b.feat[F_RAYS + 6] && b.feat[F_PHASE] > 0) { dir = 1; }
+            if (b.slidedir == dir) { dir = 0 - dir; }
+            b.slidedir = dir;
+            b.slide    = 24;
+            b.pressed  = 0;
+        }
+        if (b.slide > 0) {
+            b.slide = b.slide - 1;
+            side    = b.slidedir * 127;
+            forward = forward / 3;
+            if (b.slide > 16) { forward = -64; }
+        }
+        or { pathing = 1; }
+    }
+    or {
+        b.pressed = 0;
+        b.slide   = 0;
+    }
+
     # In co-op, whatever decided: not into slime and not into a pit, unless
     # the way it has chosen goes there or it is standing in one already.
     # Sidestepping in a fight and backing off a wall walked bots into acid,
@@ -2562,14 +3092,14 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
             val sina: Fixed = t.FINESINE[fine];
             # walking its way it is already kept out of harm by the way; this
             # is for the rest: fighting, roaming, backing off when stuck
-            val free: bool = b.feat[F_SEEN] > 0 || !b.haveway || forward < 0;
+            val free: bool = (b.feat[F_SEEN] > 0 && !pathing) || !b.haveway || forward < 0;
             if (forward != 0 && free) {
                 var reach: i32 = 56;
                 if (forward < 0) { reach = -56; }
                 val ahead: i32 = cell_of(g, p.mo.x + cosa * reach, p.mo.y + sina * reach);
                 if (ahead >= 0 && harmful(g, ahead)) { forward = 0; }
             }
-            if (side != 0) {
+            if (side != 0 && !pathing) {
                 # sideways is to the right when positive
                 var reach: i32 = 56;
                 if (side < 0) { reach = -56; }
@@ -2685,7 +3215,7 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     # The exit switch is excepted for a bot not playing the level itself:
     # when the level ends is the person's to say, or the decision's.
     var press: bool = requests_use(b, forward, side);
-    if (press && looking && b.usewait == 0 && b.usable && !hold) {
+    if (press && looking && b.usewait == 0 && b.usable && !hold && (g.deathmatch != 0 || !opening_door(g, rayline_of(g, p.mo)))) {
         buttons   = buttons | defs.BT_USE;
         b.uses    = b.uses + 1;
         b.usewait = USE_WAIT;
@@ -2698,6 +3228,105 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         if (want != p.readyweapon) { buttons = buttons | defs.BT_CHANGE | (want << defs.BT_WEAPONSHIFT); }
     }
     cmd.buttons = buttons::u8;
+}
+
+# whether the whole of a thing's body stands in a sector, by its corners
+# and a unit more
+# the working lift whose edge a thing's body lies across, from the sector it
+# stands in, or -1: standing so, a body holds a rising lift down
+fun lift_edge(g: *Game, mo: *Mobj, sector: i32) i32 {
+    val r: Fixed = mo.radius + 65536;
+    var box: [4]Fixed;
+    box[level.BOXTOP] = mo.y + r;
+    box[level.BOXBOTTOM] = mo.y - r;
+    box[level.BOXLEFT] = mo.x - r;
+    box[level.BOXRIGHT] = mo.x + r;
+    val sec: *level.Sector = ?g.lv.sectors[sector];
+    var i: i32 = 0;
+    for (i < sec.linecount) {
+        val ln: i32 = g.lv.sector_lines[sec.firstline + i];
+        val line: *level.Line = ?g.lv.lines[ln];
+        i = i + 1;
+        if (line.sidenum[1] == level.NONE) { cnt; }
+        var other: i32 = line.frontsector;
+        if (other == sector) { other = line.backsector; }
+        val data: ptr = g.lv.sectors[other].specialdata;
+        if (data == nil || (data:~*defs.Thinker).kind != defs.TH_PLAT) { cnt; }
+        if (box[level.BOXRIGHT] <= line.bbox[level.BOXLEFT] || box[level.BOXLEFT] >= line.bbox[level.BOXRIGHT] || box[level.BOXTOP] <= line.bbox[level.BOXBOTTOM] || box[level.BOXBOTTOM] >= line.bbox[level.BOXTOP]) { cnt; }
+        if (maputl.box_on_line_side(g, ?box[0], ln) == -1) { ret other; }
+    }
+    ret -1;
+}
+
+fun wholly_in(g: *Game, mo: *Mobj, sector: i32) bool {
+    # its box, a unit wider, crosses none of the sector's two-sided lines:
+    # a wall it stands against is no matter, a line onto lower ceiling is
+    val r: Fixed = mo.radius + 65536;
+    var box: [4]Fixed;
+    box[level.BOXTOP] = mo.y + r;
+    box[level.BOXBOTTOM] = mo.y - r;
+    box[level.BOXLEFT] = mo.x - r;
+    box[level.BOXRIGHT] = mo.x + r;
+    val sec: *level.Sector = ?g.lv.sectors[sector];
+    var i: i32 = 0;
+    for (i < sec.linecount) {
+        val ln: i32 = g.lv.sector_lines[sec.firstline + i];
+        val line: *level.Line = ?g.lv.lines[ln];
+        i = i + 1;
+        if (line.sidenum[1] == level.NONE) { cnt; }
+        if (box[level.BOXRIGHT] <= line.bbox[level.BOXLEFT] || box[level.BOXLEFT] >= line.bbox[level.BOXRIGHT] || box[level.BOXTOP] <= line.bbox[level.BOXBOTTOM] || box[level.BOXBOTTOM] >= line.bbox[level.BOXTOP]) { cnt; }
+        if (maputl.box_on_line_side(g, ?box[0], ln) == -1) { ret 0; }
+    }
+    ret 1;
+}
+
+# whether another player, alive, stands wholly on a sector
+fun boarded(g: *Game, playernum: i32, sector: i32) bool {
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        val mo: *Mobj = g.players[i].mo;
+        if (i != playernum && g.playeringame[i] && mo != nil && mo.health > 0 && g.lv.subsectors[mo.subsector].sector == sector && wholly_in(g, mo, sector)) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun wholly_at(g: *Game, x: Fixed, y: Fixed, r: Fixed, sector: i32) bool {
+    ret sector_at(g, x - r, y - r) == sector && sector_at(g, x + r, y - r) == sector && sector_at(g, x - r, y + r) == sector && sector_at(g, x + r, y + r) == sector;
+}
+
+# the middle of a sector: the average of the ends of its lines
+fun sector_middle(g: *Game, sector: i32, x: *Fixed, y: *Fixed) {
+    val sec: *level.Sector = ?g.lv.sectors[sector];
+    var sx: i64 = 0;
+    var sy: i64 = 0;
+    var n: i64 = 0;
+    var i: i32 = 0;
+    for (i < sec.linecount) {
+        val line: *level.Line = ?g.lv.lines[g.lv.sector_lines[sec.firstline + i]];
+        sx = sx + (g.lv.vertexes[line.v1].x >> 16)::i64 + (g.lv.vertexes[line.v2].x >> 16)::i64;
+        sy = sy + (g.lv.vertexes[line.v1].y >> 16)::i64 + (g.lv.vertexes[line.v2].y >> 16)::i64;
+        n = n + 2;
+        i = i + 1;
+    }
+    if (n == 0) { ret; }
+    @x = ((sx / n)::i32) << 16;
+    @y = ((sy / n)::i32) << 16;
+}
+
+# whether a door is already on its way up or standing open: pressing use
+# on it then sends it back down, and a team at a door, each pressing in
+# turn, kept shutting it in one another's faces
+fun opening_door(g: *Game, linenum: i32) bool {
+    if (linenum < 0 || linenum >= g.lv.numlines) { ret 0; }
+    val line: *level.Line = ?g.lv.lines[linenum];
+    if (line.sidenum[1] == level.NONE) { ret 0; }
+    val data: ptr = g.lv.sectors[line.backsector].specialdata;
+    if (data == nil) { ret 0; }
+    val head: *defs.Thinker = data:~*defs.Thinker;
+    if (head.kind != defs.TH_DOOR) { ret 0; }
+    val door: *movers.Door = data:~*movers.Door;
+    ret door.direction >= 0;
 }
 
 # the line straight ahead of a thing, within reach, or line 0
@@ -3059,5 +3688,61 @@ test requests_use__stationary_bot_exit {
     b.useexit = 0;
     if (requests_use(?b, 0, 0)) { ret 3; }
     if (!requests_use(?b, 100, 0)) { ret 4; }
+    ret 0;
+}
+
+test opening_door__is_not_toggled_shut {
+    var g: Game;
+    var lv: level.Level;
+    var line: level.Line;
+    var sector: level.Sector;
+    var door: movers.Door;
+    g.lv = ?lv;
+    lv.numlines = 1;
+    lv.numsectors = 1;
+    lv.lines = ?line;
+    lv.sectors = ?sector;
+    sector.specialdata = (?door):~ptr;
+    door.thinker.kind = defs.TH_DOOR;
+    door.direction = 1;
+    if (!opening_door(?g, 0)) { ret 1; }
+    door.direction = 0;
+    if (!opening_door(?g, 0)) { ret 2; }
+    door.direction = -1;
+    if (opening_door(?g, 0)) { ret 3; }
+    door.direction = 1;
+    door.thinker.kind = defs.TH_FLOOR;
+    if (opening_door(?g, 0)) { ret 4; }
+    sector.specialdata = nil;
+    if (opening_door(?g, 0)) { ret 5; }
+    ret 0;
+}
+
+test step_cost__prefers_open_floor_over_walls_and_slime {
+    var g: Game;
+    var out: [4]u8;
+    g.navout = ?out[0];
+    out[1] = NEAR::u8;
+    out[2] = NEARHURT::u8;
+    out[3] = HURTS::u8;
+    if (step_cost(?g, 0) >= step_cost(?g, 1) || step_cost(?g, 0) >= step_cost(?g, 2)) { ret 1; }
+    if (step_cost(?g, 3) < 8 * step_cost(?g, 0)) { ret 2; }
+    ret 0;
+}
+
+test heap__pops_in_order {
+    nheap = 0;
+    heap_push(50);
+    heap_push(7);
+    heap_push(31);
+    heap_push(7);
+    heap_push(2);
+    if (heap_pop() != 2 || heap_pop() != 7 || heap_pop() != 7 || heap_pop() != 31 || heap_pop() != 50 || nheap != 0) { ret 1; }
+    ret 0;
+}
+
+test guess__never_overestimates_a_neighbour {
+    if (guess(5, 5, 0, 10) != 0 || guess(6, 5, 0, 10) != 0) { ret 1; }
+    if (guess(27, 5, 0, 10) != 12) { ret 2; }
     ret 0;
 }
