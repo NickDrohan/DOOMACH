@@ -284,6 +284,8 @@ pub rec Bot {
     tn:      i32;
     # learns nothing as it plays (a diagnostic's control)
     frozen:  bool;
+    # outputs a diagnostic has silenced, a bit each (O_FORWARD first)
+    ablate:  i32;
     wstate:  i32;
     whealth: i32;
     wkills:  i32;
@@ -2998,6 +3000,13 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
         }
         or (b.kind == KIND_NET) {
             forward(?b.net[0], ?b.feat[0], ?b.out[0]);
+            # a diagnostic can silence outputs, to tell which of them the
+            # net's decisions actually change the game through
+            var o: i32 = 0;
+            for (o < OUTPUTS) {
+                if (((b.ablate >> o) & 1) != 0) { b.out[o] = 0; }
+                o = o + 1;
+            }
             # and remember it, for what happens next to be laid at its door
             var r: i32 = 0;
             for (r < INPUTS) {

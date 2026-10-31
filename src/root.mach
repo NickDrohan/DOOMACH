@@ -2718,6 +2718,19 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     }
     # COOP_FROZEN set: the nets play as they are and learn nothing in the
     # level, to tell what that learning does from what the weights do
+    # COOP_ABLATE=<mask>: those net outputs are silenced (1 forward, 2 side,
+    # 4 turn, 8 fire, 16 use, 32 weapon switch)
+    var ablatebuf: [16]u8;
+    val ablateenv: res[opt[usize], env.EnvError] = env.get("COOP_ABLATE", ?ablatebuf[0], 16);
+    if (sel ablateenv.ok) {
+        if (sel ablateenv.ok.some) {
+            i = 0;
+            for (i < 4) {
+                s.bots[i].ablate = number(?ablatebuf[0], 0)::i32;
+                i = i + 1;
+            }
+        }
+    }
     var frozenbuf: [8]u8;
     val frozenenv: res[opt[usize], env.EnvError] = env.get("COOP_FROZEN", ?frozenbuf[0], 8);
     if (sel frozenenv.ok) {
