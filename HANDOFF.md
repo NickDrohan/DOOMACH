@@ -46,6 +46,22 @@ Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5
   farm as the next seed, is done ad hoc with the owner. To stop: `farm.sh stop <m> arena`
   and `farm.sh stop <m> farm-train.sh`.
 
+- Overnight 2026-10-30/31 (22 copies; consolidation benchmarked on the laptop with
+  `farm-collect.py prepare` / `score`, then a check of the top picks on held-out seeds
+  2-4 in `C:\Users\nick\work\doomverify`):
+  - The arena seeds collapse 2k and 2k+1 (`seed | 1`); seven copies were duplicates until
+    restarted with odd seeds. Scripts now use odd seeds only.
+  - Gen 1 (after ~1.5 h): two learners were ~10% closer to the exits than the live
+    cohort on held-out seeds (mean nearest 56.3 and 58.3 vs 59.9-64.3). Consolidated
+    with the two best live nets (`out/farm/seed/coop.bin`, previous kept as
+    `coop.gen1.bin`) and every copy restarted from it (`redistribute 1`; old runs kept as
+    `gen1-runN` on each machine).
+  - Gen 2 (3 h later): no candidate beat the gen-1 nets on held-out seeds, so it was not
+    redistributed (`out/farm/consolidated/coop.bin` from that pass is unused).
+  - Across all copies campaigns still clear about one level each (E1M1); nothing has
+    finished E1M2-E1M9 on Nightmare. Mutation training improves how far the bots get, a
+    little; it has not yet changed what they finish. The consolidated cohort is not on Fly.
+
 ## Local survival and finish-line work (now deployed)
 
 - On top of `9f94fa3`: finish-line priority near the exit or a wanted key, fetching
