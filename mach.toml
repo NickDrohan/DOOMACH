@@ -15,6 +15,17 @@ isa = "x86_64"
 os  = "linux"
 abi = "sysv64"
 
+# the home farm's trainers: the Raspberry Pis and the Mac mini
+[target.linux-aarch64]
+isa = "aarch64"
+os  = "linux"
+abi = "aapcs64"
+
+[target.darwin-x86_64]
+isa = "x86_64"
+os  = "darwin"
+abi = "sysv64"
+
 [artifact.doom]
 kind = "bin"
 entry = "root.mach"
@@ -103,6 +114,6 @@ ref = "tag/v9.4.1"
 kind = "bin"
 entry = "arena.mach"
 out = "bin/arena{artifact.suffix}"
-targets = ["windows-x86_64", "linux-x86_64"]
+targets = ["windows-x86_64", "linux-x86_64", "linux-aarch64", "darwin-x86_64"]
 link = ["kernel32", "ws2_32"]
 need = []

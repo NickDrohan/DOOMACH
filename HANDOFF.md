@@ -22,7 +22,24 @@ GitHub `main` includes code release `acc2408`; the older `v0.3.0` tag is histori
 Unqualified per-level experiments are preserved separately on the local WIP branch.
 Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
 
-## Local survival and finish-line work (not yet pushed or deployed)
+## Home farm co-op training
+
+- `6d67c81` is pushed and deployed (Fly backup `/data/league-before-6d67c81.tar`, also in
+  ignored `out/triage/`). The relay had 29,688 human samples (E1M1 11,712, E1M2 17,976).
+- The arena now also builds for `linux-aarch64` (the Pis) and `darwin-x86_64` (the Mac);
+  the simulation fingerprint matched Windows on both (`2227431163`).
+- `harness/farm-train.sh` runs in `~/work/doomach` on each machine (nothing else there:
+  arena binary, WAD, bot0.net, the league snapshot in `seed/`). It waits for the chess
+  project's stockfish/gen jobs to finish, then runs independent copies of the four-learner
+  cohort in `run1..N` at full speed: pi-01 3 (seeds 1001-1003), pi-02 3 (2001-2003), mac 5
+  (3001-3005). The owner keeps this PC for the chess project.
+- `python harness/farm-collect.py collect|summary|consolidate` fetches results, reports
+  them, and benchmarks every run's learners (and the seed's) to write the best four into
+  `out/farm/consolidated/coop.bin`. Installing that into Fly, or redistributing it to the
+  farm as the next seed, is done ad hoc with the owner. To stop: `farm.sh stop <m> arena`
+  and `farm.sh stop <m> farm-train.sh`.
+
+## Local survival and finish-line work (now deployed)
 
 - On top of `9f94fa3`: finish-line priority near the exit or a wanted key, fetching
   needed pickups, giving ground to melee monsters when badly hurt. Fingerprint changes
