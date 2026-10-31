@@ -3,7 +3,7 @@ rem Co-op cohort training on a Windows farm machine: one arena copy in run<N>
 rem with its own seed, from the league snapshot in seed\. Started below normal
 rem priority by the PC (Win32_Process Create), so it yields to anything else.
 rem
-rem   farm-train.cmd <N> <seed>
+rem   farm-train.cmd <N> <seed>   (odd: the arena sets the seed's low bit)
 cd /d "%~dp0"
 set ARENA_DUTY=100
 set COOP_COHORT=4

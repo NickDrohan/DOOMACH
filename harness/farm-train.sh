@@ -3,6 +3,7 @@
 #
 #   farm-train.sh <instances> <seed base>
 #
+# (Seeds are odd: the arena sets a seed's low bit, so 2k and 2k+1 are one.)
 # Waits until the machine's chess jobs (stockfish, gen) have finished, then
 # runs <instances> independent copies of the arena's four-learner co-op
 # cohort, each in runN/ from the league snapshot in seed/, with its own
@@ -20,7 +21,7 @@ while [ "$i" -le "$n" ]; do
     mkdir -p "$d"
     [ -f "$d/coop.bin" ] || cp seed/coop.bin "$d/coop.bin"
     [ -f "$d/train.bin" ] || cp seed/train.bin "$d/train.bin"
-    ARENA_DUTY=100 COOP_COHORT=4 ARENA_SEED=$((base + i)) ./arena DOOM1.WAD bot0.net "$d" 0 coop >>"$d/arena.log" 2>&1 &
+    ARENA_DUTY=100 COOP_COHORT=4 ARENA_SEED=$((base + 2 * i + 1)) ./arena DOOM1.WAD bot0.net "$d" 0 coop >>"$d/arena.log" 2>&1 &
     i=$((i + 1))
 done
 wait
