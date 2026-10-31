@@ -11,6 +11,8 @@ use std.types.size.usize;
 use std.types.string.str;
 
 # virtual key codes
+pub val VK_LBUTTON: i32 = 0x01;
+pub val VK_RBUTTON: i32 = 0x02;
 pub val VK_SHIFT:   i32 = 0x10;
 pub val VK_CONTROL: i32 = 0x11;
 pub val VK_SPACE:   i32 = 0x20;
@@ -58,6 +60,11 @@ rec MSG {
     pt_x:     i32;
     pt_y:     i32;
     lPrivate: u32;
+}
+
+rec POINT {
+    x: i32;
+    y: i32;
 }
 
 rec RECT {
@@ -122,6 +129,17 @@ ext fun GetForegroundWindow() isize;
 #[library("user32.dll")]
 ext fun SetWindowTextA(hwnd: isize, text: *u8) i32;
 
+#[library("user32.dll")]
+ext fun GetCursorPos(point: *POINT) i32;
+#[library("user32.dll")]
+ext fun SetCursorPos(x: i32, y: i32) i32;
+#[library("user32.dll")]
+ext fun ClientToScreen(hwnd: isize, point: *POINT) i32;
+#[library("user32.dll")]
+ext fun ShowCursor(show: i32) i32;
+#[library("user32.dll")]
+ext fun ClipCursor(rect: *RECT) i32;
+
 #[library("gdi32.dll")]
 ext fun StretchDIBits(hdc: isize, xd: i32, yd: i32, wd: i32, hd: i32, xs: i32, ys: i32, ws: i32, hs: i32, bits: *u8, info: *BITMAPINFO8, usage: u32, rop: u32) i32;
 
@@ -154,6 +172,10 @@ pub rec Window {
     hdc:  isize;
     info: BITMAPINFO8;
     freq: i64;
+    # the mouse is held for looking: cursor hidden, kept to the window
+    mouseheld: bool;
+    # mouse movement read and not yet given to a tic
+    mousepend: i32;
 }
 
 # open a window whose client area is the given size
@@ -194,6 +216,8 @@ pub fun open(win: *Window, title: str, width: i32, height: i32) bool {
     win.info.biClrUsed  = 256;
 
     QueryPerformanceFrequency(?win.freq);
+    win.mouseheld = 0;
+    win.mousepend = 0;
     closed   = 0;
     keyfirst = 0;
     keycount = 0;
@@ -242,6 +266,47 @@ pub fun key_down(win: *Window, key: i32) bool {
     ret (GetAsyncKeyState(key)::i32 & 0x8000) != 0;
 }
 
+# Mouse look: while `on` and the window has the focus, the cursor is hidden,
+# kept inside the window and put back in its middle after every reading; the
+# horizontal distance it moved since the last reading comes back, in pixels,
+# positive to the right. Otherwise the cursor is let go and this is 0.
+pub fun mouse_look(win: *Window, on: bool) i32 {
+    if (!on || GetForegroundWindow() != win.hwnd) {
+        if (win.mouseheld) {
+            ClipCursor(nil);
+            ShowCursor(1);
+            win.mouseheld = 0;
+        }
+        ret 0;
+    }
+    var rect: RECT;
+    GetClientRect(win.hwnd, ?rect);
+    var middle: POINT;
+    middle.x = (rect.left + rect.right) / 2;
+    middle.y = (rect.top + rect.bottom) / 2;
+    ClientToScreen(win.hwnd, ?middle);
+    if (!win.mouseheld) {
+        var corner: POINT;
+        corner.x = rect.left;
+        corner.y = rect.top;
+        ClientToScreen(win.hwnd, ?corner);
+        var screen: RECT;
+        screen.left   = corner.x;
+        screen.top    = corner.y;
+        screen.right  = corner.x + rect.right - rect.left;
+        screen.bottom = corner.y + rect.bottom - rect.top;
+        ClipCursor(?screen);
+        ShowCursor(0);
+        SetCursorPos(middle.x, middle.y);
+        win.mouseheld = 1;
+        ret 0;
+    }
+    var at: POINT;
+    if (GetCursorPos(?at) == 0) { ret 0; }
+    SetCursorPos(middle.x, middle.y);
+    ret at.x - middle.x;
+}
+
 # show a frame, stretched to fill the window
 # ---
 # win:    the window
@@ -259,6 +324,7 @@ pub fun set_title(win: *Window, title: str) {
 
 # close the window
 pub fun close(win: *Window) {
+    mouse_look(win, 0);
     DestroyWindow(win.hwnd);
 }
 

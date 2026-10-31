@@ -52,7 +52,14 @@ pub rec Input {
     activate:     bool;
     # 1 to 7 to change weapon, 0 for no change
     weapon: i32;
+    # how far the mouse moved sideways since the last tic, in pixels,
+    # positive to the right
+    mousex: i32;
 }
+
+# turning per pixel of mouse movement, in the ticcmd's angle units (65536
+# make a full turn): about a twentieth of a degree, near a modern default
+val MOUSETURN: i32 = 10;
 
 pub rec Session {
     g:   Game;
@@ -794,6 +801,9 @@ pub fun build_ticcmd(s: *Session, input: *Input, cmd: *Ticcmd) {
     var turn: i32 = 0;
     if (input.right) { turn = turn - ANGLETURN[tspeed]; }
     if (input.left)  { turn = turn + ANGLETURN[tspeed]; }
+    turn = turn - input.mousex * MOUSETURN;
+    if (turn > 32767)  { turn = 32767; }
+    if (turn < -32768) { turn = -32768; }
     cmd.angleturn = turn::i16;
 
     if (input.forward)      { forward = forward + FORWARDMOVE[speed]; }
@@ -1268,6 +1278,15 @@ test build_ticcmd__keys_become_commands {
     input.right = 1;
     build_ticcmd(?s, ?input, ?cmd);
     if (cmd.angleturn != 0 - 1280) { ret 6; }
+
+    # the mouse to the right turns right, and a wild sweep stays in range
+    input        = blank;
+    input.mousex = 12;
+    build_ticcmd(?s, ?input, ?cmd);
+    if (cmd.angleturn != 0 - 12 * MOUSETURN) { ret 8; }
+    input.mousex = 0 - 100000;
+    build_ticcmd(?s, ?input, ?cmd);
+    if (cmd.angleturn != 32767) { ret 9; }
 
     # fire, use, and a change to weapon 3
     input          = blank;

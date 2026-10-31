@@ -821,9 +821,15 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
         # run however many tics are due, but never try to catch up on a stall
         val now:   i64 = win.micros(?window);
         var steps: i32 = 0;
+        # mouse look while a level is being played and no menu is up; the
+        # movement since the last frame goes to the first tic run now
+        window.mousepend = window.mousepend + win.mouse_look(?window, f.mode == front.MODE_LEVEL && !f.menuactive);
+        if (f.menuactive || f.mode != front.MODE_LEVEL) { window.mousepend = 0; }
         for (now >= next && steps < 4) {
             var input: game.Input;
             if (!f.menuactive) {
+                input.mousex       = window.mousepend;
+                window.mousepend   = 0;
                 input.forward      = win.key_down(?window, win.VK_UP) || win.key_down(?window, 'W');
                 input.back         = win.key_down(?window, win.VK_DOWN) || win.key_down(?window, 'S');
                 input.left         = win.key_down(?window, win.VK_LEFT);
@@ -831,8 +837,8 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                 input.strafe_left  = win.key_down(?window, 'A');
                 input.strafe_right = win.key_down(?window, 'D');
                 input.run          = win.key_down(?window, win.VK_SHIFT);
-                input.fire         = win.key_down(?window, win.VK_CONTROL) || win.key_down(?window, 'F');
-                input.activate     = win.key_down(?window, win.VK_SPACE) || win.key_down(?window, 'E');
+                input.fire         = win.key_down(?window, win.VK_CONTROL) || win.key_down(?window, 'F') || (f.mode == front.MODE_LEVEL && win.key_down(?window, win.VK_LBUTTON));
+                input.activate     = win.key_down(?window, win.VK_SPACE) || win.key_down(?window, 'E') || (f.mode == front.MODE_LEVEL && win.key_down(?window, win.VK_RBUTTON));
                 input.weapon       = weapon;
                 weapon             = 0;
             }
