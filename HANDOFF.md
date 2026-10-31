@@ -32,7 +32,14 @@ Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5
   arena binary, WAD, bot0.net, the league snapshot in `seed/`). It waits for the chess
   project's stockfish/gen jobs to finish, then runs independent copies of the four-learner
   cohort in `run1..N` at full speed: pi-01 3 (seeds 1001-1003), pi-02 3 (2001-2003), mac 5
-  (3001-3005). The owner keeps this PC for the chess project.
+  (3001-3005); later pi-01/pi-02 run4 (1004/2004) and mac run6 (3006). The owner keeps
+  this PC for the chess project.
+- The owner's laptop (`nick@192.168.1.233`, Windows, i7-11800H, the farm key works) runs
+  eight more copies via `harness/farm-train.cmd` in `C:\Users\nick\work\doomach`,
+  started below normal priority through `Win32_Process Create` so they survive ssh and
+  yield to its own `m-probe` jobs (seeds 4001-4008). Its 4 GB GPU is unused: the bots'
+  nets are 942-byte integer networks inside a deterministic integer simulation, so
+  training is all game simulation on the CPU. Stop: `Stop-Process -Name arena` there.
 - `python harness/farm-collect.py collect|summary|consolidate` fetches results, reports
   them, and benchmarks every run's learners (and the seed's) to write the best four into
   `out/farm/consolidated/coop.bin`. Installing that into Fly, or redistributing it to the

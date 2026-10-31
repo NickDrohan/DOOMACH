@@ -22,7 +22,10 @@ FARM = Path.home() / ".claude/skills/farm-machines/farm.sh"
 RESULTS = ROOT / "out/farm/results"
 SEED = ROOT / "out/farm/seed/coop.bin"
 OUT = ROOT / "out/farm/consolidated"
-MACHINES = {"pi-01": 4, "pi-02": 4, "mac": 6}
+MACHINES = {"pi-01": 4, "pi-02": 4, "mac": 6, "laptop": 8}
+# the Windows laptop is not in the farm helper: plain scp, as nick, with the
+# farm key, into C:/Users/nick/work/doomach (harness/farm-train.cmd)
+LAPTOP = "nick@192.168.1.233"
 COHORT = [5, 23, 41, 64]
 HEAD, MEMBER, AT_NET, NET = 16, 1932, 48, 942
 BASH = r"C:\Program Files\Git\bin\bash.exe"
@@ -38,7 +41,12 @@ def collect():
             here = RESULTS / machine / "run{}".format(i)
             here.mkdir(parents=True, exist_ok=True)
             for name in ("coop.bin", "coop.json"):
-                got = farm("get", machine, "work/doomach/run{}/{}".format(i, name), str(here / name).replace("\\", "/"))
+                if machine == "laptop":
+                    got = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", str(Path.home() / ".ssh/machete_farm"),
+                                          "{}:C:/Users/nick/work/doomach/run{}/{}".format(LAPTOP, i, name), str(here / name)],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                else:
+                    got = farm("get", machine, "work/doomach/run{}/{}".format(i, name), str(here / name).replace("\\", "/"))
                 print(machine, "run{}".format(i), name, "ok" if got.returncode == 0 else "missing")
 
 
