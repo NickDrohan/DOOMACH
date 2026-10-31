@@ -10,14 +10,16 @@ param(
     [string]$Kit = 'C:\Users\nick\work\doomeval',
     [int]$Parallel = 6,
     [int[]]$Maps = @(2, 3, 4, 5, 7, 9),
-    [int[]]$Seeds = @(1)
+    [string]$Seeds = '1'
 )
+# (seeds as text, "2,3,4": an array does not survive powershell -File)
+$SeedList = @($Seeds -split ',' | ForEach-Object { [int]$_ })
 Set-Location $Kit
 New-Item -ItemType Directory -Force games | Out-Null
 $queue = New-Object System.Collections.Queue
 foreach ($net in Get-ChildItem candidates -Filter *.net) {
     foreach ($m in $Maps) {
-        foreach ($s in $Seeds) {
+        foreach ($s in $SeedList) {
             $out = "games\$($net.BaseName)_$($m)_$($s).txt"
             if (-not (Test-Path $out)) { $queue.Enqueue(@($net.FullName, $m, $s, $out)) }
         }
