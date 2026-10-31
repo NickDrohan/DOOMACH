@@ -1234,33 +1234,33 @@ fun touch_special_thing(g: *Game, special: *Mobj, toucher: *Mobj) {
     or (sprite == info.SPR_BKEY) {
         # cards; leave cards for everyone
         give_card(player, defs.IT_BLUECARD, "Picked up a blue keycard.");
-        # leave cards for everyone
-        if (g.netgame) { ret; }
+        # leave cards for everyone (but one a dead player dropped is taken)
+        if (g.netgame && (special.flags & defs.MF_DROPPED) == 0) { ret; }
     }
     or (sprite == info.SPR_YKEY) {
         give_card(player, defs.IT_YELLOWCARD, "Picked up a yellow keycard.");
-        # leave cards for everyone
-        if (g.netgame) { ret; }
+        # leave cards for everyone (but one a dead player dropped is taken)
+        if (g.netgame && (special.flags & defs.MF_DROPPED) == 0) { ret; }
     }
     or (sprite == info.SPR_RKEY) {
         give_card(player, defs.IT_REDCARD, "Picked up a red keycard.");
-        # leave cards for everyone
-        if (g.netgame) { ret; }
+        # leave cards for everyone (but one a dead player dropped is taken)
+        if (g.netgame && (special.flags & defs.MF_DROPPED) == 0) { ret; }
     }
     or (sprite == info.SPR_BSKU) {
         give_card(player, defs.IT_BLUESKULL, "Picked up a blue skull key.");
-        # leave cards for everyone
-        if (g.netgame) { ret; }
+        # leave cards for everyone (but one a dead player dropped is taken)
+        if (g.netgame && (special.flags & defs.MF_DROPPED) == 0) { ret; }
     }
     or (sprite == info.SPR_YSKU) {
         give_card(player, defs.IT_YELLOWSKULL, "Picked up a yellow skull key.");
-        # leave cards for everyone
-        if (g.netgame) { ret; }
+        # leave cards for everyone (but one a dead player dropped is taken)
+        if (g.netgame && (special.flags & defs.MF_DROPPED) == 0) { ret; }
     }
     or (sprite == info.SPR_RSKU) {
         give_card(player, defs.IT_REDSKULL, "Picked up a red skull key.");
-        # leave cards for everyone
-        if (g.netgame) { ret; }
+        # leave cards for everyone (but one a dead player dropped is taken)
+        if (g.netgame && (special.flags & defs.MF_DROPPED) == 0) { ret; }
     }
     or (sprite == info.SPR_STIM) {
         # medikits, heals
@@ -1417,6 +1417,46 @@ pub fun player_number(g: *Game, p: *Player) i32 {
     ret 0;
 }
 
+# In co-op a player who dies leaves the keys they carried where they fell,
+# so the team does not lose them to a respawn at the start: each key that
+# no other living player holds, and that is not already lying dropped
+# somewhere, as a dropped key the next one to touch takes away.
+fun drop_keys(g: *Game, target: *Mobj) {
+    if (!g.netgame || g.deathmatch != 0) { ret; }
+    var card: i32 = 0;
+    for (card < defs.NUMCARDS) {
+        # blue, yellow and red cards, then blue, yellow and red skulls
+        var kind: i32 = info.MT_MISC4;
+        if (card == 1) { kind = info.MT_MISC6; }
+        or (card == 2) { kind = info.MT_MISC5; }
+        or (card == 3) { kind = info.MT_MISC9; }
+        or (card == 4) { kind = info.MT_MISC7; }
+        or (card == 5) { kind = info.MT_MISC8; }
+        if (target.player.cards[card]) {
+            var held: bool = 0;
+            var q: i32 = 0;
+            for (q < defs.MAXPLAYERS) {
+                val qm: *Mobj = g.players[q].mo;
+                if (g.playeringame[q] && ?g.players[q] != target.player && qm != nil && qm.health > 0 && g.players[q].cards[card]) { held = 1; }
+                q = q + 1;
+            }
+            var th: *defs.Thinker = g.thinkercap.next;
+            for (!held && th != ?g.thinkercap) {
+                if (th.kind == defs.TH_MOBJ) {
+                    val mo: *Mobj = th:~*Mobj;
+                    if (mo.kind == kind && (mo.flags & defs.MF_DROPPED) != 0) { held = 1; }
+                }
+                th = th.next;
+            }
+            if (!held) {
+                val key: *Mobj = spawn_mobj(g, target.x, target.y, defs.ONFLOORZ, kind);
+                key.flags = key.flags | defs.MF_DROPPED;
+            }
+        }
+        card = card + 1;
+    }
+}
+
 fun kill_mobj(g: *Game, source: *Mobj, target: *Mobj) {
     target.flags = target.flags & ~(defs.MF_SHOOTABLE | defs.MF_FLOAT | defs.MF_SKULLFLY);
 
@@ -1447,6 +1487,7 @@ fun kill_mobj(g: *Game, source: *Mobj, target: *Mobj) {
         target.flags              = target.flags & ~defs.MF_SOLID;
         target.player.playerstate = defs.PST_DEAD;
         drop_weapon(g, target.player);
+        drop_keys(g, target);
     }
 
     if (target.health < 0 - info.mi(target.kind, info.MI_SPAWNHEALTH) && info.mi(target.kind, info.MI_XDEATHSTATE) != 0) {

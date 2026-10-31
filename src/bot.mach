@@ -2107,9 +2107,9 @@ fun mission_bearing(g: *Game, playernum: i32, me: *Mobj, b: *Bot, have: i32) i32
         if (th.kind == defs.TH_MOBJ) {
             var mo:  *Mobj = th:~*Mobj;
             var bit: i32   = 0;
-            if (mo.kind == info.MT_MISC4 || mo.kind == info.MT_MISC7) { bit = KEY_BLUE; }
-            if (mo.kind == info.MT_MISC6 || mo.kind == info.MT_MISC8) { bit = KEY_YELLOW; }
-            if (mo.kind == info.MT_MISC5 || mo.kind == info.MT_MISC9) { bit = KEY_RED; }
+            if (mo.kind == info.MT_MISC4 || mo.kind == info.MT_MISC9) { bit = KEY_BLUE; }
+            if (mo.kind == info.MT_MISC6 || mo.kind == info.MT_MISC7) { bit = KEY_YELLOW; }
+            if (mo.kind == info.MT_MISC5 || mo.kind == info.MT_MISC8) { bit = KEY_RED; }
             if (bit != 0 && (have & bit) == 0) {
                 var dist: i32 = distance(me, mo.x, mo.y);
                 var k:    i32 = 0;
