@@ -194,6 +194,9 @@ pub rec Bot {
     cover:     bool;
     hidetill:  i32;
     nearperson: bool;
+    # co-op with a person who has died: it gets on with the level, short
+    # of ending it, until they have come back and caught up with it
+    regroup:   bool;
     # the cells it last caught on, and until when its searches go round
     # them: what the map's lines do not show, a pillar or a crowd
     snag:     [4]i32;
@@ -1544,7 +1547,10 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     var i:        i32   = 0;
     for (i < defs.MAXPLAYERS) {
         val o: *Mobj = g.players[i].mo;
-        if (i != playernum && g.playeringame[i] && !g.isbot[i]) { anyone = 1; }
+        if (i != playernum && g.playeringame[i] && !g.isbot[i]) {
+            anyone = 1;
+            if (o == nil || o.health <= 0) { b.regroup = 1; }
+        }
         if (i != playernum && g.playeringame[i] && o != nil && o.health > 0) {
             var dist:   i32  = distance(me, o.x, o.y);
             # the hunted come before everyone, the most hated first
@@ -1564,6 +1570,13 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     b.alone = g.deathmatch == 0 && !b.shy && !anyone;
     b.led   = g.deathmatch == 0 && !b.shy && anyone;
     if (b.alone) { ret goal_bearing(g, playernum, b, have); }
+    # A person who died starts again at the beginning. The bots do not run
+    # back to them: they hold what was won and go on with the level's keys
+    # and switches (never across a line that ends it, never pressing its
+    # exit), and take up following again once the person has caught up.
+    if (!b.led) { b.regroup = 0; }
+    if (b.regroup && person && bestdist < 384) { b.regroup = 0; }
+    if (b.regroup) { ret goal_bearing(g, playernum, b, have & ~KEY_EXIT); }
     if (target == nil || (b.led && !person)) { ret 0; }
     # in co-op, near enough: stay about rather than stand on their toes
     b.nearperson = b.led && person && bestdist < 128;
@@ -3402,6 +3415,23 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     if (looking) {
         if ((turn > 0 && b.wasturn < 0) || (turn < 0 && b.wasturn > 0)) { b.swings = b.swings + 1; }
         if (turn != 0) { b.wasturn = turn; }
+    }
+
+    # Going somewhere in co-op, it goes flat out, as a player holding run
+    # and strafing at once does: the larger of the two pushed to the full,
+    # the other with it in proportion. Split by the angle to its waypoint,
+    # a bot heading off at forty-five degrees otherwise moved at half pace.
+    if (g.deathmatch == 0 && !b.shy) {
+        var fa: i32 = forward;
+        if (fa < 0) { fa = 0 - fa; }
+        var sa: i32 = side;
+        if (sa < 0) { sa = 0 - sa; }
+        var big: i32 = fa;
+        if (sa > big) { big = sa; }
+        if (big >= 48 && big < 127) {
+            forward = forward * 127 / big;
+            side    = side * 127 / big;
+        }
     }
 
     # the decision, held until the next: full speed is 50 forward and 40
