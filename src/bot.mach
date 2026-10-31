@@ -186,6 +186,14 @@ pub rec Bot {
     # for it to ride it up
     boardsec:  i32;
     boardtill: i32;
+    # in a fight: a place close by the enemy cannot see, and until when it
+    # ducks back there after being hit; and whether the person it follows
+    # is right beside it
+    coverx:    Fixed;
+    covery:    Fixed;
+    cover:     bool;
+    hidetill:  i32;
+    nearperson: bool;
     # the cells it last caught on, and until when its searches go round
     # them: what the map's lines do not show, a pillar or a crowd
     snag:     [4]i32;
@@ -1552,6 +1560,7 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     if (b.alone) { ret goal_bearing(g, playernum, b, have); }
     if (target == nil || (b.led && !person)) { ret 0; }
     # in co-op, near enough: stay about rather than stand on their toes
+    b.nearperson = b.led && person && bestdist < 128;
     if (follows && !b.shy && bestdist < 128) { ret 0; }
     if (!b.led) { ret way_to(g, me, b, target.x, target.y, have); }
 
@@ -2483,6 +2492,38 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
 
     val enemy: *Mobj = find_enemy(g, me, b, playernum);
     b.foemelee = enemy != nil && (enemy.kind == info.MT_SERGEANT || enemy.kind == info.MT_SHADOWS || enemy.kind == info.MT_SKULL);
+    # Cover, in co-op: every sixteenth tic in a fight, the nearest place a
+    # stride or two away that it can walk to and the enemy cannot see. Hit,
+    # it steps back there, then out again to shoot: a wall to fight from
+    # rather than standing in the open trading shots.
+    if (g.deathmatch == 0 && enemy != nil && !b.foemelee && ((g.leveltime + playernum) & 15) == 0) {
+        b.cover = 0;
+        var bestd: i32 = 0x7fffffff;
+        var probe: Mobj;
+        probe.height = me.height;
+        var k: i32 = 0;
+        for (k < 16) {
+            val fine: u32 = ((k & 7)::u32 * 1024) & 8191;
+            var reach: i32 = 72;
+            if (k >= 8) { reach = 128; }
+            val px: Fixed = me.x + t.FINESINE[fine + 2048] * reach;
+            val py: Fixed = me.y + t.FINESINE[fine] * reach;
+            if (walks_now(g, me.x, me.y, px, py) && !floor_hurts(g.lv.sectors[sector_at(g, px, py)].special::i32)) {
+                probe.x = px;
+                probe.y = py;
+                probe.subsector = render.point_in_subsector(g.lv, px, py);
+                probe.z = g.lv.sectors[g.lv.subsectors[probe.subsector].sector].floorheight;
+                if (!maputl.check_sight(g, enemy, ?probe) && reach < bestd) {
+                    bestd = reach;
+                    b.coverx = px;
+                    b.covery = py;
+                    b.cover = 1;
+                }
+            }
+            k = k + 1;
+        }
+    }
+    if (enemy == nil) { b.cover = 0; }
     f[F_SEEN]    = 0;
     f[F_BEARING] = 0;
     f[F_CLOSE]   = 0;
@@ -3041,6 +3082,47 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     val closing: bool = g.deathmatch == 0 && b.alone && b.haveway && (b.after == 3 || b.after == 4) && distance(p.mo, b.afterx, b.aftery) < 384;
     val guided: bool = g.deathmatch == 0 && !b.shy && (b.haveway || fetch) && g.navgrid != nil && g.navserial == g.levelserial && !brawl && (b.feat[F_SEEN] == 0 || !b.engaged || hazard || desperate || closing);
     var pathing: bool = 0;
+    # Following a person who is right beside it, with nothing to fight: it
+    # stands by them, out of their way, rather than let the net run it in
+    # circles about the room
+    if (g.deathmatch == 0 && b.led && b.nearperson && !guided && b.feat[F_SEEN] == 0) {
+        # (as they stand now, this tic: the moment they move off it goes too)
+        var beside: bool = 0;
+        var q: i32 = 0;
+        for (q < defs.MAXPLAYERS) {
+            val qm: *Mobj = g.players[q].mo;
+            if (q != playernum && g.playeringame[q] && !g.isbot[q] && qm != nil && qm.health > 0 && distance(p.mo, qm.x, qm.y) < 128) { beside = 1; }
+            q = q + 1;
+        }
+        if (beside) {
+            forward = 0;
+            side    = 0;
+            turn    = 0;
+            # but out of the way of anyone close: one standing still in a
+            # doorway holds up the person it is following
+            var rx: i32 = 0;
+            var ry: i32 = 0;
+            var o: i32 = 0;
+            for (o < defs.MAXPLAYERS) {
+                val om: *Mobj = g.players[o].mo;
+                if (o != playernum && g.playeringame[o] && om != nil && om.health > 0) {
+                    val d: i32 = maputl.aprox_distance(p.mo.x - om.x, p.mo.y - om.y) >> 16;
+                    if (d > 0 && d < 80) {
+                        rx = rx + ((p.mo.x - om.x) >> 16) * (80 - d) * 800 / d;
+                        ry = ry + ((p.mo.y - om.y) >> 16) * (80 - d) * 800 / d;
+                    }
+                }
+                o = o + 1;
+            }
+            if (rx != 0 || ry != 0) {
+                val away: u32 = world.point_to_angle2(0, 0, rx, ry) - p.mo.angle;
+                val af: u32 = away >> t.ANGLETOFINESHIFT;
+                forward = t.FINESINE[af + 2048] * 100 / 65536;
+                side    = 0 - t.FINESINE[af] * 100 / 65536;
+            }
+        }
+        or { b.nearperson = 0; }
+    }
     if (guided) {
         # and with room for the team: a team-mate close by pushes it off a
         # little, and one close ahead in a lower seat goes first, so that
@@ -3190,6 +3272,23 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
     or {
         b.pressed = 0;
         b.slide   = 0;
+    }
+
+    # Hit in a fight with cover at hand: back behind it for a second, still
+    # facing the enemy, then out again (the net's sidestep) to shoot
+    if (g.deathmatch == 0 && !b.shy && !brawl && !closing && !desperate && b.cover && b.feat[F_SEEN] > 0) {
+        if (p.damagecount > 0 && b.hidetill < g.leveltime - 35) { b.hidetill = g.leveltime + 35; }
+        if (b.hidetill > g.leveltime) {
+            val away: u32 = world.point_to_angle2(p.mo.x, p.mo.y, b.coverx, b.covery) - p.mo.angle;
+            val af: u32 = away >> t.ANGLETOFINESHIFT;
+            forward = t.FINESINE[af + 2048] * 127 / 65536;
+            side    = 0 - t.FINESINE[af] * 127 / 65536;
+            if (distance(p.mo, b.coverx, b.covery) < 12) {
+                forward = 0;
+                side    = 0;
+            }
+            pathing = 1;
+        }
     }
 
     # Badly hurt, with something that fights with claws or teeth at arm's
