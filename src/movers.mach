@@ -822,8 +822,18 @@ pub fun do_door(g: *Game, tag: i32, kind: i32) bool {
     ret rtn;
 }
 
-fun has_key(p: *Player, card: i32, skull: i32) bool {
-    ret p.cards[card] || p.cards[skull];
+# whether a player may open a lock of the colour: in co-op a lock once
+# opened stays open for everyone (the one who opened it may die on the far
+# side, key and all), so opening it is remembered
+fun has_key(g: *Game, p: *Player, card: i32, skull: i32) bool {
+    val coop: bool = g.netgame && g.deathmatch == 0;
+    var bit: i32 = 1;
+    if (card == defs.IT_YELLOWCARD) { bit = 2; }
+    or (card == defs.IT_REDCARD) { bit = 4; }
+    if (coop && (g.unlocked & bit) != 0) { ret 1; }
+    if (!p.cards[card] && !p.cards[skull]) { ret 0; }
+    if (coop) { g.unlocked = g.unlocked | bit; }
+    ret 1;
 }
 
 # EV_DoLockedDoor: move a locked door up/down
@@ -834,7 +844,7 @@ pub fun do_locked_door(g: *Game, linenum: i32, kind: i32, thing: *Mobj) bool {
     val special: i32 = g.lv.lines[linenum].special::i32;
     if (special == 99 || special == 133) {
         # blue lock
-        if (!has_key(p, defs.IT_BLUECARD, defs.IT_BLUESKULL)) {
+        if (!has_key(g, p, defs.IT_BLUECARD, defs.IT_BLUESKULL)) {
             p.message = "You need a blue key to activate this object";
             defs.sound(g, nil, info.SFX_OOF);
             ret 0;
@@ -842,7 +852,7 @@ pub fun do_locked_door(g: *Game, linenum: i32, kind: i32, thing: *Mobj) bool {
     }
     or (special == 134 || special == 135) {
         # red lock
-        if (!has_key(p, defs.IT_REDCARD, defs.IT_REDSKULL)) {
+        if (!has_key(g, p, defs.IT_REDCARD, defs.IT_REDSKULL)) {
             p.message = "You need a red key to activate this object";
             defs.sound(g, nil, info.SFX_OOF);
             ret 0;
@@ -850,7 +860,7 @@ pub fun do_locked_door(g: *Game, linenum: i32, kind: i32, thing: *Mobj) bool {
     }
     or (special == 136 || special == 137) {
         # yellow lock
-        if (!has_key(p, defs.IT_YELLOWCARD, defs.IT_YELLOWSKULL)) {
+        if (!has_key(g, p, defs.IT_YELLOWCARD, defs.IT_YELLOWSKULL)) {
             p.message = "You need a yellow key to activate this object";
             defs.sound(g, nil, info.SFX_OOF);
             ret 0;
@@ -870,7 +880,7 @@ pub fun vertical_door(g: *Game, linenum: i32, thing: *Mobj) {
     if (special == 26 || special == 32) {
         # blue lock
         if (player == nil) { ret; }
-        if (!has_key(player, defs.IT_BLUECARD, defs.IT_BLUESKULL)) {
+        if (!has_key(g, player, defs.IT_BLUECARD, defs.IT_BLUESKULL)) {
             player.message = "You need a blue key to open this door";
             defs.sound(g, nil, info.SFX_OOF);
             ret;
@@ -879,7 +889,7 @@ pub fun vertical_door(g: *Game, linenum: i32, thing: *Mobj) {
     or (special == 27 || special == 34) {
         # yellow lock
         if (player == nil) { ret; }
-        if (!has_key(player, defs.IT_YELLOWCARD, defs.IT_YELLOWSKULL)) {
+        if (!has_key(g, player, defs.IT_YELLOWCARD, defs.IT_YELLOWSKULL)) {
             player.message = "You need a yellow key to open this door";
             defs.sound(g, nil, info.SFX_OOF);
             ret;
@@ -888,7 +898,7 @@ pub fun vertical_door(g: *Game, linenum: i32, thing: *Mobj) {
     or (special == 28 || special == 33) {
         # red lock
         if (player == nil) { ret; }
-        if (!has_key(player, defs.IT_REDCARD, defs.IT_REDSKULL)) {
+        if (!has_key(g, player, defs.IT_REDCARD, defs.IT_REDSKULL)) {
             player.message = "You need a red key to open this door";
             defs.sound(g, nil, info.SFX_OOF);
             ret;

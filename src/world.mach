@@ -1417,6 +1417,33 @@ pub fun player_number(g: *Game, p: *Player) i32 {
     ret 0;
 }
 
+# the colour bit of a card or skull (1 blue, 2 yellow, 4 red), as in
+# Game.unlocked
+fun key_colour(card: i32) i32 {
+    if (card == defs.IT_BLUECARD || card == defs.IT_BLUESKULL) { ret 1; }
+    if (card == defs.IT_YELLOWCARD || card == defs.IT_YELLOWSKULL) { ret 2; }
+    ret 4;
+}
+
+# Co-op: a lock of a colour has been opened, so it opens for anyone from now
+# on, and every key of that colour, placed or dropped, leaves the level.
+pub fun sweep_unlocked_keys(g: *Game) {
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        val next: *defs.Thinker = th.next;
+        if (th.kind == defs.TH_MOBJ) {
+            val mo: *Mobj = th:~*Mobj;
+            var bit: i32 = 0;
+            if (mo.kind == info.MT_MISC4 || mo.kind == info.MT_MISC9) { bit = 1; }
+            or (mo.kind == info.MT_MISC6 || mo.kind == info.MT_MISC7) { bit = 2; }
+            or (mo.kind == info.MT_MISC5 || mo.kind == info.MT_MISC8) { bit = 4; }
+            if ((g.unlocked & bit) != 0) { remove_mobj(g, mo); }
+        }
+        th = next;
+    }
+    g.unlockswept = g.unlocked;
+}
+
 # In co-op a player who dies leaves the keys they carried where they fell,
 # so the team does not lose them to a respawn at the start: each key that
 # no other living player holds, and that is not already lying dropped
@@ -1432,7 +1459,8 @@ fun drop_keys(g: *Game, target: *Mobj) {
         or (card == 3) { kind = info.MT_MISC9; }
         or (card == 4) { kind = info.MT_MISC7; }
         or (card == 5) { kind = info.MT_MISC8; }
-        if (target.player.cards[card]) {
+        # (a colour whose lock is open for good is not worth carrying)
+        if (target.player.cards[card] && (g.unlocked & key_colour(card)) == 0) {
             var held: bool = 0;
             var q: i32 = 0;
             for (q < defs.MAXPLAYERS) {

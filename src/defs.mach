@@ -415,6 +415,12 @@ pub rec Game {
     leveltime:       i32;
     deathmatch:      i32;
     netgame:         bool;
+    # co-op: the key colours whose locks someone has opened this level (1
+    # blue, 2 yellow, 4 red); those locks open for anyone from then on, and
+    # the colours' keys leave the level. `unlockswept` is what of that the
+    # level's keys have been taken away for already.
+    unlocked:        i32;
+    unlockswept:     i32;
     respawnmonsters: bool;
     fastparm:        bool;
     nomonsters:      bool;

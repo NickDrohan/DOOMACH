@@ -856,11 +856,17 @@ fun key_of(special: i32) i32 {
 }
 
 # the keys a player has, a bit a colour: a card or a skull will do
-fun keys_of(p: *Player) i32 {
+fun keys_of(g: *Game, p: *Player) i32 {
     var have: i32 = 0;
     if (p.cards[defs.IT_BLUECARD] || p.cards[defs.IT_BLUESKULL])     { have = have | KEY_BLUE; }
     if (p.cards[defs.IT_YELLOWCARD] || p.cards[defs.IT_YELLOWSKULL]) { have = have | KEY_YELLOW; }
     if (p.cards[defs.IT_REDCARD] || p.cards[defs.IT_REDSKULL])       { have = have | KEY_RED; }
+    # in co-op a lock someone has opened opens for everyone now
+    if (g.netgame && g.deathmatch == 0) {
+        if ((g.unlocked & 1) != 0) { have = have | KEY_BLUE; }
+        if ((g.unlocked & 2) != 0) { have = have | KEY_YELLOW; }
+        if ((g.unlocked & 4) != 0) { have = have | KEY_RED; }
+    }
     ret have | KEY_EXIT;
 }
 
@@ -1521,7 +1527,7 @@ fun path_bearing(g: *Game, playernum: i32, b: *Bot) i32 {
     b.haveway = 0;
     solvework = 0;
     if (g.deathmatch != 0) { solvework = 0 - 0x40000000; }
-    val have: i32 = keys_of(?g.players[playernum]);
+    val have: i32 = keys_of(g, ?g.players[playernum]);
     walkhave = have;
 
     # whom to make for: in a deathmatch the nearest opponent, unless there
@@ -2947,7 +2953,7 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
 
     # look and decide every fourth tic, each player on its own tic
     val looking: bool = ((g.leveltime + playernum) & 3) == 0;
-    walkhave = keys_of(p);
+    walkhave = keys_of(g, p);
     if (looking) {
         sense(g, playernum, b);
         if (b.shy) {
@@ -3591,7 +3597,7 @@ pub fun observe(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd, out: *u8) bool 
     val p: *Player = ?g.players[playernum];
     if (p.mo == nil || p.playerstate == defs.PST_DEAD) { ret 0; }
     if (((g.leveltime + playernum) & 3) != 0)          { ret 0; }
-    walkhave = keys_of(p);
+    walkhave = keys_of(g, p);
     sense(g, playernum, b);
     var i: i32 = 0;
     for (i < INPUTS) {

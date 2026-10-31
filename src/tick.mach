@@ -325,6 +325,7 @@ pub fun ticker(g: *Game) {
     }
 
     run_thinkers(g);
+    if (g.unlocked != g.unlockswept) { world.sweep_unlocked_keys(g); }
     spec.update_specials(g);
 
     # for par times

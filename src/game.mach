@@ -218,6 +218,8 @@ fun load_level(s: *Session) bool {
     g.totalitems  = 0;
     g.totalsecret = 0;
     g.exited      = 0;
+    g.unlocked    = 0;
+    g.unlockswept = 0;
 
     # initial height of point of view will be set by player think
     g.players[g.consoleplayer].viewz = 1;
