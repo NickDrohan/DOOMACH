@@ -2035,7 +2035,36 @@ fun solve_pickup(g: *Game, me: *Mobj, b: *Bot, key: *Mobj, have: i32) i32 {
     ret to;
 }
 
+# E1M8's way out opens only when its two barons are dead (the walls tagged
+# 666 fall then): while one lives, the mission is to find it and kill it.
+# Searching for the exit through the shut walls flooded the map every
+# decision and walked the bots into the wall.
+fun boss_bearing(g: *Game, me: *Mobj, b: *Bot, have: i32) i32 {
+    if (g.gameepisode != 1 || g.gamemap != 8) { ret 0; }
+    var best: *Mobj = nil;
+    var bestd: i32 = 0x7fffffff;
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            val mo: *Mobj = th:~*Mobj;
+            if (mo.kind == info.MT_BRUISER && mo.health > 0) {
+                val d: i32 = distance(me, mo.x, mo.y);
+                if (d < bestd) { bestd = d; best = mo; }
+            }
+        }
+        th = th.next;
+    }
+    if (best == nil) { ret 0; }
+    val to: i32 = solve_to(g, me, b, best.x, best.y, best.x, best.y, have);
+    if (b.haveway) { b.after = 7; }
+    ret to;
+}
+
 fun mission_bearing(g: *Game, playernum: i32, me: *Mobj, b: *Bot, have: i32) i32 {
+    if (b.alone && g.deathmatch == 0) {
+        val boss: i32 = boss_bearing(g, me, b, have);
+        if (b.haveway) { ret boss; }
+    }
     # The exit: in front of its switch and facing it, or across its line
     b.haveway = 0;
     if (g.navexitline < 0) { ret 0; }
