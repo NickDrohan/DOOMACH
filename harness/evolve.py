@@ -131,10 +131,12 @@ def unixpath(p):
 
 
 def reachable(machine):
-    """whether a machine answers now (the laptop, on Wi-Fi, drops off; so does pi-02)"""
+    """whether a machine answers now and is ours to use (the laptop, on Wi-Fi, drops
+    off, and is someone's while Steam is open on it: the owner's rule)"""
     try:
         if machine == "laptop":
-            return ssh("echo ok", 30).returncode == 0
+            got = ssh('powershell -NoProfile -Command "if (Get-Process steam -ErrorAction SilentlyContinue) { \'steam\' } else { \'free\' }"', 30)
+            return got.returncode == 0 and "free" in got.stdout
         return "ok" in farm("run", machine, "echo ok", timeout=60).stdout
     except subprocess.TimeoutExpired:
         return False
@@ -295,6 +297,13 @@ def main():
     # before it takes over: among 23 mutants on 12 games the best is often
     # only the luckiest, and luck accepted every generation is a slide
     ap.add_argument("--confirm-seeds", type=int, default=2)
+    # and every so many generations the champion meets the last champion that
+    # passed this check (anchor.net) on seeds of their own (700 up, never
+    # trained on, apart from the final test's 900 up); losing, it is replaced
+    # by the anchor. On 2026-11-02 the out+senses run, confirmations and all,
+    # finished 8 of 36 unseen levels where the net it began from finished 16.
+    ap.add_argument("--validate-every", type=int, default=10)
+    ap.add_argument("--validate-seeds", type=int, default=4)
     ap.add_argument("--parallel", type=int, default=6)
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
@@ -309,7 +318,30 @@ def main():
     at_out = sorted(set(at) & set(mutable("out", outs)))
     at_in = sorted(set(at) - set(at_out))
     rng = random.Random(1234 + start)
+    anchor_path = OUT / "anchor.net"
+    anchor = widen(anchor_path.read_bytes()) if anchor_path.exists() else champion
+    if not anchor_path.exists():
+        anchor_path.write_bytes(anchor)
     for gen in range(start, start + a.gens):
+        if a.validate_every > 0 and gen > start and (gen - start) % a.validate_every == 0 and champion != anchor:
+            vseeds = [700 + k for k in range(a.validate_seeds)]
+            vrows = play({"champion": champion, "anchor": anchor}, maps, vseeds, a.parallel)
+            want = len(maps) * len(vseeds)
+            if len(vrows.get("champion", [])) == want and len(vrows.get("anchor", [])) == want:
+                vc = sum(score(r) for r in vrows["champion"])
+                va = sum(score(r) for r in vrows["anchor"])
+                kept = vc >= va
+                if kept:
+                    anchor = champion
+                    anchor_path.write_bytes(anchor)
+                else:
+                    champion = anchor
+                    champ_path.write_bytes(champion)
+                entry = {"validate": gen, "champion": vc, "anchor": va, "kept": kept,
+                         "finished": [sum(bool(r["finished"]) for r in vrows["champion"]), sum(bool(r["finished"]) for r in vrows["anchor"])]}
+                print(json.dumps(entry), flush=True)
+                with (OUT / "validate.jsonl").open("a") as f:
+                    f.write(json.dumps(entry) + "\n")
         seeds = [100 + gen * a.seeds_per_gen + k for k in range(a.seeds_per_gen)]
         nets = {"champion": champion}
         for i in range(a.pop):
