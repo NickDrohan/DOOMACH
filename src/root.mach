@@ -733,7 +733,7 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                     var names: [96]u8;
                     var q:     i32 = 0;
                     for (q < 96) {
-                        names[q] = fetch.data[16 + (q / 24) * 986 + 20 + q % 24];
+                        names[q] = fetch.data[16 + (q / 24) * relayproto.WATCHSEAT + 20 + q % 24];
                         q        = q + 1;
                     }
                     front.start_watching(?f, s, ?names[0]);
@@ -2084,15 +2084,16 @@ fun netmatch(argv: **u8) i64 {
         print.eprintln("doom: the net could not be read");
         ret EXIT_DATA;
     }
-    if (weights.ok.len != bot.NETSIZE::usize) {
-        print.eprintln("doom: that is not a net: it should be 942 bytes");
+    val botnet: *i8 = read_net(weights.ok.data, weights.ok.len);
+    if (botnet == nil) {
+        print.eprintln("doom: that is not a net: it should be 1326 bytes (or 942, the first shape)");
         ret EXIT_DATA;
     }
 
     val s: *game.Session = bot_session(?a, ?w, ?d, number(argv[3], 1)::i32);
     if (s == nil) { ret EXIT_MAP; }
-    game.set_bot(s, 0, bot.KIND_NET, weights.ok.data:~*i8, 17);
-    game.set_bot(s, 1, bot.KIND_NET, weights.ok.data:~*i8, 7936);
+    game.set_bot(s, 0, bot.KIND_NET, botnet, 17);
+    game.set_bot(s, 1, bot.KIND_NET, botnet, 7936);
     game.set_bot(s, 2, bot.KIND_SCRIPT, nil, 15855);
     game.set_bot(s, 3, bot.KIND_SCRIPT, nil, 23774);
 
@@ -2531,12 +2532,12 @@ fun botmatch(argc: i64, argv: **u8) i64 {
             print.eprintln("doom: the net could not be read");
             ret EXIT_DATA;
         }
-        if (file.ok.len != bot.NETSIZE::usize) {
-            print.eprintln("doom: that is not a net: it should be 942 bytes");
+        weights = read_net(file.ok.data, file.ok.len);
+        if (weights == nil) {
+            print.eprintln("doom: that is not a net: it should be 1326 bytes (or 942, the first shape)");
             ret EXIT_DATA;
         }
         kind    = bot.KIND_NET;
-        weights = file.ok.data:~*i8;
     }
     var i: i32 = 0;
     for (i < 4) {
@@ -2689,8 +2690,8 @@ fun coopmatch(argc: i64, argv: **u8) i64 {
     if (argc >= 6 && !traced_mode && !calm && !str_equals(argv[5], "script")) {
         val file: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, argv[5]);
         if (sel file.err) { ret EXIT_WAD; }
-        if (file.ok.len != bot.NETSIZE::usize) { ret EXIT_DATA; }
-        net  = file.ok.data:~*i8;
+        net = read_net(file.ok.data, file.ok.len);
+        if (net == nil) { ret EXIT_DATA; }
         kind = bot.KIND_NET;
     }
 
@@ -3393,8 +3394,28 @@ val BETWEEN:            i32 = -3;
 # what the league writes as each level of a campaign begins (arena.mach,
 # publish): its head, four seats, and what the players carried in
 val NOW_HEAD:  i32 = 20;
-val NOW_SEAT:  i32 = 974;
-val NOW_BYTES: i32 = 20 + 4 * 974 + 1040;
+val NOW_SEAT:  i32 = 32 + 1326;
+val NOW_BYTES: i32 = 20 + 4 * (32 + 1326) + 1040;
+
+# a net read from a file: of this shape, or of the first (942 bytes, widened
+# to decide just as it did); nil for anything else. The bytes are kept here,
+# so a second read replaces the first.
+var netbuf: [1326]i8;
+fun read_net(data: *u8, len: usize) *i8 {
+    if (len == bot.NETSIZE::usize) {
+        var k: i32 = 0;
+        for (k < bot.NETSIZE) {
+            netbuf[k] = data[k]:~i8;
+            k         = k + 1;
+        }
+        ret ?netbuf[0];
+    }
+    if (len == bot.NETSIZE_V1::usize) {
+        bot.widen(data:~*i8, ?netbuf[0]);
+        ret ?netbuf[0];
+    }
+    ret nil;
+}
 
 # the place the newest program and the league's files are kept:
 # UPDATE_URL, or DOOM_UPDATE_URL if that is set
@@ -3449,7 +3470,7 @@ fun fetch_league(a: *allocator.Allocator, name: str, into: *u8, room: i32) i32 {
 # ret:   the level joined, or 0 if there is no campaign to join,
 #        UNREACHED, or ANOTHER_SIMULATION
 fun join_league_begin(a: *allocator.Allocator, s: *game.Session, names: *u8, j: *LeagueJoin) i32 {
-    var now:  [4956]u8;
+    var now:  [6492]u8;
     var tick: [16]u8;
     var done: [20]u8;
     val got:  i32 = fetch_league(a, "coopnow.bin", ?now[0], NOW_BYTES);
@@ -3466,7 +3487,7 @@ fun join_league_begin(a: *allocator.Allocator, s: *game.Session, names: *u8, j: 
 }
 
 fun join_league(a: *allocator.Allocator, s: *game.Session, names: *u8) i32 {
-    var now:  [4956]u8;
+    var now:  [6492]u8;
     var tick: [16]u8;
     val got:  i32 = fetch_league(a, "coopnow.bin", ?now[0], NOW_BYTES);
     if (got < 0) { ret UNREACHED; }
@@ -3653,10 +3674,10 @@ fun resumecheck(argv: **u8) i64 {
     if (levels > 9) { levels = 9; }
 
     # the bots: two nets of fixed weights, a brawler, the hand-written one
-    var net: [942]i8;
+    var net: [1326]i8;
     var seed: u32 = 0x1234567;
     var k: i32 = 0;
-    for (k < 942) {
+    for (k < bot.NETSIZE) {
         seed   = seed * 1103515245 + 12345;
         net[k] = (((seed >> 16) & 0x3f):~i32 - 32)::i8;
         k      = k + 1;
@@ -3669,7 +3690,7 @@ fun resumecheck(argv: **u8) i64 {
     var carry: [9 * 1040]u8;
     # and the net each bot began each level with — learning in a level is
     # carried into the next, so a level begun there wants the net it had
-    var nets:  [9 * 4 * 942]i8;
+    var nets:  [9 * 4 * 1326]i8;
     var cmds:  [4]defs.Ticcmd;
     if (!game.campaign_game(s, 4, 0, defs.SK_NIGHTMARE, cap)) { ret EXIT_MAP; }
     var i: i32 = 0;
@@ -3683,8 +3704,8 @@ fun resumecheck(argv: **u8) i64 {
         i = 0;
         for (i < 4) {
             k = 0;
-            for (k < 942) {
-                nets[n * 4 * 942 + i * 942 + k] = s.bots[i].net[k];
+            for (k < bot.NETSIZE) {
+                nets[(n * 4 + i) * bot.NETSIZE + k] = s.bots[i].net[k];
                 k                               = k + 1;
             }
             i = i + 1;
@@ -3708,7 +3729,7 @@ fun resumecheck(argv: **u8) i64 {
         if (!game.campaign_resume(s, 4, 0, defs.SK_NIGHTMARE, cap, maps[n], ?carry[(n - 1) * 1040])) { ret EXIT_MAP; }
         i = 0;
         for (i < 4) {
-            game.set_bot(s, i, kinds[i], ?nets[n * 4 * 942 + i * 942], (i * 7919 + 3)::u32);
+            game.set_bot(s, i, kinds[i], ?nets[(n * 4 + i) * bot.NETSIZE], (i * 7919 + 3)::u32);
             i = i + 1;
         }
         game.campaign_bots(s);
@@ -3787,7 +3808,7 @@ fun watch_setup(s: *game.Session, data: *u8, view: i32) i32 {
     }
     var i: i32 = 0;
     for (i < 4) {
-        val at: i32 = 16 + i * 986;
+        val at: i32 = 16 + i * relayproto.WATCHSEAT;
         game.set_bot(s, i, seat_kind(get32(data, at):~i32), (?data[at + 44]):~*i8, get32(data, at + 4));
         i = i + 1;
     }
@@ -3863,7 +3884,7 @@ fun watch(argc: i64, argv: **u8) i64 {
     var same: bool = 1;
     i = 0;
     for (i < 4) {
-        val at: i32 = 16 + i * 986;
+        val at: i32 = 16 + i * relayproto.WATCHSEAT;
         val p:  *defs.Player = ?s.g.players[i];
         var frags:  i32 = 0;
         var deaths: i32 = p.frags[i];

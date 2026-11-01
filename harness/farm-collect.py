@@ -27,7 +27,9 @@ MACHINES = {"pi-01": 4, "pi-02": 4, "mac": 6, "laptop": 8}
 # farm key, into C:/Users/nick/work/doomach (harness/farm-train.cmd)
 LAPTOP = "nick@192.168.1.233"
 COHORT = [5, 23, 41, 64]
-HEAD, MEMBER, AT_NET, NET = 16, 1932, 48, 942
+# the second shape of league file (MDL2: 1326-byte nets); the arena widens
+# first-shape files (MDL1, 942) as it reads them
+HEAD, MEMBER, AT_NET, NET = 16, 2700, 48, 1326
 BASH = r"C:\Program Files\Git\bin\bash.exe"
 
 
@@ -53,7 +55,7 @@ def collect():
 def runs():
     for path in sorted(RESULTS.glob("*/run*/coop.bin")):
         data = path.read_bytes()
-        if len(data) == HEAD + 100 * MEMBER and data[:4] == b"MDL1":
+        if len(data) == HEAD + 100 * MEMBER and data[:4] == b"MDL2":
             yield path.parent, data
 
 

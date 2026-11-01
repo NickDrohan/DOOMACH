@@ -64,7 +64,7 @@ pub rec BotSeat {
     kind:  i32;
     seed:  u32;
     name:  [24]u8;
-    net:   [942]i8;
+    net:   [1326]i8;
 }
 
 pub rec Net {
@@ -133,7 +133,7 @@ pub rec Net {
     joined:    i32;
     nonce:     u32;
     pace:      i32;
-    wrap:      [1100]u8;
+    wrap:      [1400]u8;
 
     # bots in the game, seated by the relay in the seats nobody took: a bit
     # a seat, and each one as the relay told it, which every machine is told
@@ -569,7 +569,7 @@ fun from_relay(n: *Net, len: i32) {
         }
         b.name[23] = 0;
         k = 0;
-        for (k < 942) {
+        for (k < rp.BOTBODY - 36) {
             b.net[k] = n.wrap[body + 36 + k]:~i8;
             k        = k + 1;
         }
@@ -606,7 +606,7 @@ pub fun receive(n: *Net) {
     for {
         var from: ip.Endpoint;
         if (n.relaymode) {
-            val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.wrap[0], 1100, ?from);
+            val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.wrap[0], 1400, ?from);
             if (sel got.err) { brk; }
             # only the relay speaks to a game that uses one
             if (same_peer(?n.relay, ?from)) { from_relay(n, got.ok::i32); }
@@ -847,8 +847,8 @@ pub rec Watch {
     opened: bool;
     relay:  Peer;
     # the file, which pieces of it have come, and the match they are of
-    data:  [4096]u8;
-    have:  [4]bool;
+    data:  [8192]u8;
+    have:  [8]bool;
     id:    u32;
     done:  bool;
     # the relay answered, but has no match to give
@@ -870,7 +870,7 @@ pub fun watch_open(w: *Watch, relay: *Peer) bool {
     w.asks        = 0;
     w.asked       = 0;
     var i: i32 = 0;
-    for (i < 4) {
+    for (i < 8) {
         w.have[i] = 0;
         i         = i + 1;
     }

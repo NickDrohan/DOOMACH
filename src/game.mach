@@ -307,7 +307,7 @@ pub fun campaign_bots(s: *Session) {
     var i: i32 = 0;
     for (i < defs.MAXPLAYERS) {
         if (s.bots[i].active) {
-            var net: [942]i8 = s.bots[i].net;
+            var net: [1326]i8 = s.bots[i].net;
             bot.start(?s.bots[i], s.botkind[i], ?net[0], level_seed(s.botseed[i], s.g.gamemap));
         }
         i = i + 1;
@@ -1174,10 +1174,10 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
 # Every program computes it the same on every machine, as it computes every
 # game. The session is left with the probe's game in it, to be replaced.
 pub fun fingerprint(s: *Session) u32 {
-    var net:  [942]i8;
+    var net:  [1326]i8;
     var seed: u32 = 0x2545f491;
     var k:    i32 = 0;
-    for (k < 942) {
+    for (k < bot.NETSIZE) {
         seed   = seed * 1103515245 + 12345;
         net[k] = (((seed >> 16) & 0x3f):~i32 - 32)::i8;
         k      = k + 1;

@@ -32,9 +32,26 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "harness"))
 import pathbench  # noqa: E402
 
-INPUTS, HIDDEN, OUTPUTS = 32, 24, 6
+INPUTS, HIDDEN, OUTPUTS = 48, 24, 6
 W2 = INPUTS * HIDDEN + HIDDEN
 NET = W2 + HIDDEN * OUTPUTS + OUTPUTS
+# the first shape of net: 32 senses
+INPUTS_V1 = 32
+NET_V1 = INPUTS_V1 * HIDDEN + HIDDEN + HIDDEN * OUTPUTS + OUTPUTS
+
+
+def widen(old):
+    """a first-shape net as this shape, deciding as it did (bot.widen)"""
+    if len(old) == NET:
+        return old
+    assert len(old) == NET_V1
+    new = bytearray(NET)
+    for j in range(HIDDEN):
+        new[j * INPUTS:j * INPUTS + INPUTS_V1] = old[j * INPUTS_V1:(j + 1) * INPUTS_V1]
+        new[INPUTS * HIDDEN + j] = old[INPUTS_V1 * HIDDEN + j]
+    rest = HIDDEN * OUTPUTS + OUTPUTS
+    new[W2:W2 + rest] = old[INPUTS_V1 * HIDDEN + HIDDEN:INPUTS_V1 * HIDDEN + HIDDEN + rest]
+    return bytes(new)
 LAPTOP = "nick@192.168.1.233"
 KEY = str(Path.home() / ".ssh/machete_farm")
 REMOTE = "C:/Users/nick/work/doomevolve"
@@ -68,7 +85,11 @@ def mutable(layers, outputs):
     # out+foe: the outputs, and how every hidden unit takes the enemy's kind
     if layers == "out+foe":
         at += [j * INPUTS + F_FOEKIND for j in range(HIDDEN)]
-    if layers in ("out", "all", "out+foe"):
+    # out+senses: the outputs, and how every hidden unit takes the senses the
+    # second shape added (32 to 47) and the enemy's kind
+    if layers == "out+senses":
+        at += [j * INPUTS + i for j in range(HIDDEN) for i in [F_FOEKIND] + list(range(INPUTS_V1, INPUTS))]
+    if layers in ("out", "all", "out+foe", "out+senses"):
         for k in outputs:
             at += range(W2 + k * HIDDEN, W2 + (k + 1) * HIDDEN)
             at.append(W2 + HIDDEN * OUTPUTS + k)
@@ -221,7 +242,7 @@ def main():
     ap.add_argument("--pop", type=int, default=23)
     ap.add_argument("--maps", default="2,3,4,9")
     ap.add_argument("--seeds-per-gen", type=int, default=2)
-    ap.add_argument("--layers", default="out", choices=["out", "hidden", "all", "out+foe"])
+    ap.add_argument("--layers", default="out", choices=["out", "hidden", "all", "out+foe", "out+senses"])
     ap.add_argument("--outputs", default="forward,side,turn,fire,use,switch")
     ap.add_argument("--rate", type=float, default=0.15)
     ap.add_argument("--sigma", type=float, default=6.0)
@@ -230,7 +251,7 @@ def main():
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     champ_path = OUT / "champion.net"
-    champion = champ_path.read_bytes() if champ_path.exists() else a.net.read_bytes()
+    champion = widen(champ_path.read_bytes() if champ_path.exists() else a.net.read_bytes())
     assert len(champion) == NET
     log = OUT / "log.jsonl"
     start = sum(1 for _ in log.open()) if log.exists() else 0

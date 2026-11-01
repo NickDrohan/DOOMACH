@@ -30,7 +30,11 @@ use p: doom.relayproto;
 
 pub val MAXROOMS:   i32 = 256;
 pub val MAXPLAYERS: i32 = 4;
-pub val MAXPACKET:  i32 = 1200;
+# (a seated bot's net goes in one datagram: within the 1472 bytes of a
+# 1500-byte link, so that nothing is ever split on the way)
+pub val MAXPACKET:  i32 = 1400;
+# room for a league file, as the arena writes it
+pub val LEAGUEROOM: i32 = 300000;
 val QUEUE:          i32 = 64;
 val RATESLOTS:      i32 = 64;
 
@@ -85,7 +89,7 @@ pub rec Seated {
     kind: i32;
     seed: u32;
     name: [24]u8;
-    net:  [942]i8;
+    net:  [1326]i8;
 }
 
 # what the relay needs to seat the league's bots: the league as the arena
@@ -94,11 +98,11 @@ pub rec Seated {
 # moves on. Too big for a stack: the process allocates it. Without it, or
 # without a league, the bots seated are the hand-written one.
 pub rec Bots {
-    league:    [200000]u8;
+    league:    [300000]u8;
     leaguelen: i32;
     # the co-op league, whose bots are seated in co-op games; without it
     # they are the deathmatch league's
-    coop:    [200000]u8;
+    coop:    [300000]u8;
     cooplen: i32;
     seated:    [1024]Seated;
 }
@@ -123,7 +127,7 @@ pub rec Train {
 pub rec Out {
     to:   Addr;
     len:  i32;
-    data: [1216]u8;
+    data: [1416]u8;
 }
 
 # something that happened to a room, for the log: no addresses, only the
@@ -176,7 +180,7 @@ pub rec Relay {
 
     # the deathmatch league's match the arena last left to be watched, if
     # any (the co-op league's campaign is joined from the site instead)
-    watch:    [4096]u8;
+    watch:    [8192]u8;
     watchlen: i32;
 
     # the time of the datagram or tick being handled
@@ -1189,7 +1193,7 @@ test relay__bots_take_the_empty_seats {
     var r: Relay;
     fresh(?r);
     r.fillwait = 60000;
-    var buf:  [1100]u8;
+    var buf:  [1400]u8;
     var host: Addr = Addr{ip: 1, port: 1};
 
     # a public room for three, with only its host
@@ -1262,7 +1266,7 @@ test relay__keeps_what_players_send_to_train_bots {
     # room for the head and four samples is all this needs
     var room: [512]u8;
     r.train = (?room[0]):~*Train;
-    var buf:  [1100]u8;
+    var buf:  [1400]u8;
     var host: Addr = Addr{ip: 1, port: 1};
     handle(?r, ?buf[0], create_req(?buf[0], 2, 5, 1), ?host, 0);
     val token: u64 = p.get64(?r.out[0].data[0], 8);
@@ -1361,7 +1365,7 @@ test relay__coop_seats_the_active_cohort_without_shy_bots {
     r.shyin = 1;
     r.bots.cooplen = lf.FILE_BYTES;
     r.bots.coop[0] = 'M'; r.bots.coop[1] = 'D';
-    r.bots.coop[2] = 'L'; r.bots.coop[3] = '1';
+    r.bots.coop[2] = 'L'; r.bots.coop[3] = '2';
     p.put32(?r.bots.coop[0], 4, lf.MEMBERS::u32);
     var i: i32 = 0;
     for (i < lf.MEMBERS) {

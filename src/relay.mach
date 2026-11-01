@@ -60,6 +60,7 @@ use std.process.env;
 use std.text.parse;
 
 use core: doom.relaycore;
+use lf: doom.leaguefile;
 
 fun number(s: str, fallback: i64) i64 {
     val r: res[i64, parse.ParseError] = parse.parse_i64(s, 10);
@@ -223,22 +224,31 @@ fun tell(r: *core.Relay) {
     r.nevents = 0;
 }
 
-# read a league, if there is one, for the core to seat its bots
+# read a league, if there is one, for the core to seat its bots: one of
+# the first shape of net is widened as it is read (leaguefile.upgrade), so
+# that a relay started before the arena has rewritten it still seats bots
 # ---
-# into: room for 200000 bytes
-# ret:  how many were read
+# into: room for core.LEAGUEROOM bytes
+# ret:  how many there are
+var leaguetmp: [300000]u8;
 fun read_league(into: *u8, path: str) i32 {
     val opened: res[fs.File, io_error.Error] = fs.open(path);
     if (sel opened.err) { ret 0; }
     var file: fs.File = opened.ok;
     var have: i32 = 0;
-    for (have < 200000) {
-        val got: res[usize, io_error.Error] = fs.read(file, ?into[have], (200000 - have)::usize);
+    for (have < core.LEAGUEROOM) {
+        val got: res[usize, io_error.Error] = fs.read(file, ?leaguetmp[have], (core.LEAGUEROOM - have)::usize);
         if (sel got.err) { brk; }
         if (got.ok == 0) { brk; }
         have = have + got.ok::i32;
     }
     fs.close(?file);
+    if (lf.upgrade(?leaguetmp[0], have, into)) { ret lf.FILE_BYTES; }
+    var k: i32 = 0;
+    for (k < have) {
+        into[k] = leaguetmp[k];
+        k       = k + 1;
+    }
     ret have;
 }
 
@@ -285,10 +295,10 @@ fun read_watch(r: *core.Relay, path: str) {
     val opened: res[fs.File, io_error.Error] = fs.open(path);
     if (sel opened.err) { ret; }
     var file: fs.File = opened.ok;
-    var data: [4096]u8;
+    var data: [8192]u8;
     var have: i32 = 0;
-    for (have < 4096) {
-        val got: res[usize, io_error.Error] = fs.read(file, ?data[have], (4096 - have)::usize);
+    for (have < 8192) {
+        val got: res[usize, io_error.Error] = fs.read(file, ?data[have], (8192 - have)::usize);
         if (sel got.err) { brk; }
         if (got.ok == 0) { brk; }
         have = have + got.ok::i32;

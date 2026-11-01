@@ -10,13 +10,21 @@
 #
 # Every fourth tic a bot senses: how far it can go along eight rays, the
 # nearest enemy it can see, the way through the map's sectors toward the
-# nearest opponent, its own state, the nearest pickup. From those 32
-# numbers it decides: forward, sideways, turn, fire, use, change weapon. Two
-# things can decide. The script is a hand-written fighter, a function of the
-# senses alone. The net is a small integer network, 32 inputs to 24 hidden
-# units to 6 outputs, in eight-bit weights: 942 bytes, which is what makes a
-# bot something to send to another machine, to mutate, and to keep a
-# hundred of. A net that imitates the script is where every bot begins.
+# nearest opponent, its own state, the nearest pickup; and, in co-op, the
+# next two enemies in sight, a fireball on its way, the nearest team-mate,
+# its armour, slime ahead and cover at hand. From those 48 numbers it
+# decides: forward, sideways, turn, fire, use, change weapon. Two things can
+# decide. The script is a hand-written fighter, a function of the senses
+# alone. The net is a small integer network, 48 inputs to 24 hidden units to
+# 6 outputs, in eight-bit weights: 1326 bytes, which is what makes a bot
+# something to send to another machine in one datagram, to mutate, and to
+# keep a hundred of. A net that imitates the script is where every bot
+# begins.
+#
+# The first nets had the first 32 senses only (942 bytes). One of them is
+# widened (widen) into a net of this shape that decides exactly as it did:
+# the new senses come in with no weight, so leagues and trained nets carry
+# over, and training finds a use for the new senses from there.
 
 use std.types.bool.bool;
 use std.types.size.usize;
@@ -36,11 +44,14 @@ use doom.render;
 use t: doom.tables;
 use doom.world;
 
-pub val INPUTS:  i32 = 32;
+pub val INPUTS:  i32 = 48;
 pub val HIDDEN:  i32 = 24;
 pub val OUTPUTS: i32 = 6;
 # input weights, hidden biases, output weights, output biases
-pub val NETSIZE: i32 = 32 * 24 + 24 + 24 * 6 + 6;
+pub val NETSIZE: i32 = 48 * 24 + 24 + 24 * 6 + 6;
+# the first nets' shape: 32 senses, the same hidden units and outputs
+pub val INPUTS_V1:  i32 = 32;
+pub val NETSIZE_V1: i32 = 32 * 24 + 24 + 24 * 6 + 6;
 
 pub val KIND_SCRIPT: i32 = 1;
 pub val KIND_NET:    i32 = 2;
@@ -104,6 +115,25 @@ pub val F_PHASE:     i32 = 28;
 pub val F_FOEKIND:   i32 = 29;
 pub val F_WAY:       i32 = 30;
 pub val F_BETTER:    i32 = 31;
+# the senses the second shape added, in co-op only (0 in a deathmatch): the
+# next two enemies in sight by threat, each its bearing, closeness and kind
+# (as F_FOEKIND); whether the enemy in sight is after this bot, and how much
+# of its health it has left; a monster's missile coming its way, its bearing
+# and how soon (127 now, 0 a second or more off); the nearest team-mate's
+# bearing and closeness; its armour; another enemy in the line of fire
+# beyond the one in sight; slime or worse ahead; cover at hand
+pub val F_FOE2:       i32 = 32;
+pub val F_FOE3:       i32 = 35;
+pub val F_AIMED:      i32 = 38;
+pub val F_FOEHEALTH:  i32 = 39;
+pub val F_MISSBEAR:   i32 = 40;
+pub val F_MISSSOON:   i32 = 41;
+pub val F_MATEBEAR:   i32 = 42;
+pub val F_MATECLOSE:  i32 = 43;
+pub val F_ARMOUR:     i32 = 44;
+pub val F_LINEUP:     i32 = 45;
+pub val F_SLIME:      i32 = 46;
+pub val F_COVER:      i32 = 47;
 
 # the decisions, by index
 pub val O_FORWARD: i32 = 0;
@@ -138,11 +168,11 @@ pub rec Bot {
     # its quirk (QUIRK_*), and its feelings as its kind carried them
     quirk:  i32;
     feels:  i32;
-    net:    [942]i8;
+    net:    [1326]i8;
     seed:   u32;
 
     # what it last sensed and decided
-    feat: [32]i32;
+    feat: [48]i32;
     out:  [6]i32;
 
     # what the senses remember between looks: tics since an enemy was seen
@@ -199,6 +229,15 @@ pub rec Bot {
     # a monster's missile coming its way: which side to step to, and until
     dodgeside: i32;
     dodgetill: i32;
+    # that missile's bearing, and how many tics off it is (0 for none)
+    missbear:  i32;
+    misssoon:  i32;
+    # in co-op, the next two enemies in sight after the one it fights: how
+    # many, where, and what they fight with (enemy_class)
+    foes:      i32;
+    foex:      [2]Fixed;
+    foey:      [2]Fixed;
+    foekind:   [2]i32;
     # co-op with a person who has died: it gets on with the level, short
     # of ending it, until they have come back and caught up with it
     regroup:   bool;
@@ -283,7 +322,7 @@ pub rec Bot {
     # had and what it made of them), the newest where tpos less one says,
     # so that what happens to it next can be laid at their door; and the
     # numbers a tic ago said the world gave it, for what has changed since
-    tfeat:   [256]i32;
+    tfeat:   [384]i32;
     tout:    [48]i32;
     tpos:    i32;
     tn:      i32;
@@ -488,12 +527,25 @@ fun find_enemy(g: *Game, me: *Mobj, b: *Bot, seat: i32) *Mobj {
         }
         th = th.next;
     }
+    # the first in sight is the one to fight; the next two are sensed
+    b.foes = 0;
+    var first: *Mobj = nil;
     var k: i32 = 0;
-    for (k < 8) {
-        if (near[k] != nil && dists[k] != 0x7fffffff && maputl.check_sight(g, me, near[k])) { ret near[k]; }
+    for (k < 8 && b.foes < 2) {
+        if (near[k] != nil && dists[k] != 0x7fffffff && maputl.check_sight(g, me, near[k])) {
+            if (first == nil) {
+                first = near[k];
+            }
+            or {
+                b.foex[b.foes]    = near[k].x;
+                b.foey[b.foes]    = near[k].y;
+                b.foekind[b.foes] = enemy_class(near[k].kind);
+                b.foes            = b.foes + 1;
+            }
+        }
         k = k + 1;
     }
-    ret nil;
+    ret first;
 }
 
 # how a monster fights: -1 with claws and teeth, 1 with fire it throws, 0
@@ -510,6 +562,8 @@ fun enemy_class(kind: i32) i32 {
 # A fireball is heard as it is thrown, so none of this asks for sight.
 fun dodge_bearing(g: *Game, me: *Mobj, b: *Bot) {
     b.dodgeside = 0;
+    b.misssoon  = 0;
+    var mbear: i32 = 0;
     var soonest: i64 = 36;
     var cx: i64 = 0;
     var cy: i64 = 0;
@@ -533,6 +587,7 @@ fun dodge_bearing(g: *Game, me: *Mobj, b: *Bot) {
                             val oy: i64 = ry - vy * tt / 256;
                             if (ox * ox + oy * oy < 52 * 52) {
                                 soonest = tt;
+                                mbear   = bearing(me, m.x, m.y);
                                 cx = ox;
                                 cy = oy;
                             }
@@ -544,6 +599,9 @@ fun dodge_bearing(g: *Game, me: *Mobj, b: *Bot) {
         th = th.next;
     }
     if (soonest >= 36) { ret; }
+    b.misssoon = soonest::i32;
+    if (b.misssoon < 1) { b.misssoon = 1; }
+    b.missbear = mbear;
     # its right, as the bot faces, and which side of the missile's line the
     # bot stands on: step further that way, or the other if that is walled
     val fine: u32 = me.angle >> t.ANGLETOFINESHIFT;
@@ -2740,6 +2798,71 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
     if (b.haveway) { f[F_WAY] = 127; }
     f[F_BETTER] = 0;
     if (best_weapon(p) != p.readyweapon) { f[F_BETTER] = 127; }
+
+    # the second shape's senses: none in a deathmatch, where the nets were
+    # made without them
+    var s: i32 = F_FOE2;
+    for (s < INPUTS) {
+        f[s] = 0;
+        s    = s + 1;
+    }
+    if (g.deathmatch != 0) { ret; }
+    var e: i32 = 0;
+    for (e < b.foes) {
+        f[F_FOE2 + 3 * e]     = clamp(bearing(me, b.foex[e], b.foey[e]), -127, 127);
+        f[F_FOE2 + 3 * e + 1] = clamp(127 - distance(me, b.foex[e], b.foey[e]) / 16, 0, 127);
+        if (b.foekind[e] < 0) { f[F_FOE2 + 3 * e + 2] = -127; }
+        or (b.foekind[e] > 0) { f[F_FOE2 + 3 * e + 2] = 127; }
+        or { f[F_FOE2 + 3 * e + 2] = 64; }
+        e = e + 1;
+    }
+    if (enemy != nil) {
+        if (enemy.target == me) { f[F_AIMED] = 127; }
+        val whole: i32 = info.mi(enemy.kind, info.MI_SPAWNHEALTH);
+        if (whole > 0) { f[F_FOEHEALTH] = clamp(enemy.health * 127 / whole, 0, 127); }
+        # another enemy beyond this one, near its line: shot at, the near
+        # one may be missed into the far one, and the far one's fire may
+        # take the near one in the back
+        val d1: i32 = distance(me, enemy.x, enemy.y);
+        val b1: i32 = bearing(me, enemy.x, enemy.y);
+        e = 0;
+        for (e < b.foes) {
+            var db: i32 = bearing(me, b.foex[e], b.foey[e]) - b1;
+            if (db < 0) { db = 0 - db; }
+            if (db < 6 && distance(me, b.foex[e], b.foey[e]) > d1) { f[F_LINEUP] = 127; }
+            e = e + 1;
+        }
+    }
+    if (b.misssoon > 0) {
+        f[F_MISSBEAR] = clamp(b.missbear, -127, 127);
+        f[F_MISSSOON] = clamp(127 - b.misssoon * 3, 0, 127);
+    }
+    var mated: i32 = 0x7fffffff;
+    var q: i32 = 0;
+    for (q < defs.MAXPLAYERS) {
+        val o: *Mobj = g.players[q].mo;
+        if (q != playernum && g.playeringame[q] && o != nil && o.health > 0) {
+            val d: i32 = distance(me, o.x, o.y);
+            if (d < mated) {
+                mated          = d;
+                f[F_MATEBEAR]  = clamp(bearing(me, o.x, o.y), -127, 127);
+                f[F_MATECLOSE] = clamp(127 - d / 16, 0, 127);
+            }
+        }
+        q = q + 1;
+    }
+    f[F_ARMOUR] = clamp(p.armorpoints / 2, 0, 127);
+    if (g.navgrid != nil && g.navserial == g.levelserial) {
+        val ahead: u32 = me.angle >> t.ANGLETOFINESHIFT;
+        var reach: i32 = 64;
+        for (reach <= 128) {
+            val ax: Fixed = me.x + t.FINESINE[ahead + 2048] * reach;
+            val ay: Fixed = me.y + t.FINESINE[ahead] * reach;
+            if (floor_hurts(g.lv.sectors[sector_at(g, ax, ay)].special::i32)) { f[F_SLIME] = 127; }
+            reach = reach + 64;
+        }
+    }
+    if (b.cover) { f[F_COVER] = 127; }
 }
 
 # ---------------------------------------------------------------- the script
@@ -2826,6 +2949,37 @@ pub fun script(f: *i32, out: *i32) {
 }
 
 # ------------------------------------------------------------------- the net
+
+# A first-shape net (NETSIZE_V1 bytes, 32 senses) as a net of this shape
+# that decides exactly as it did: its weights in their places, and nothing
+# on the senses it never had.
+# ---
+# old: NETSIZE_V1 weights
+# new: room for NETSIZE
+pub fun widen(old: *i8, new: *i8) {
+    var k: i32 = 0;
+    for (k < NETSIZE) {
+        new[k] = 0;
+        k      = k + 1;
+    }
+    var j: i32 = 0;
+    for (j < HIDDEN) {
+        var i: i32 = 0;
+        for (i < INPUTS_V1) {
+            new[j * INPUTS + i] = old[j * INPUTS_V1 + i];
+            i                   = i + 1;
+        }
+        new[INPUTS * HIDDEN + j] = old[INPUTS_V1 * HIDDEN + j];
+        j                        = j + 1;
+    }
+    # the hidden units to the outputs, and the outputs' biases, are the same
+    val rest: i32 = HIDDEN * OUTPUTS + OUTPUTS;
+    k = 0;
+    for (k < rest) {
+        new[INPUTS * HIDDEN + HIDDEN + k] = old[INPUTS_V1 * HIDDEN + HIDDEN + k];
+        k                                 = k + 1;
+    }
+}
 
 # the network: inputs to hidden units, clipped at 0 and 127, to outputs.
 # Weights are in 64ths; a bias counts as a weight on an input of 64.
@@ -3765,9 +3919,12 @@ fun rayline_of(g: *Game, mo: *Mobj) i32 {
 
 # What a person did, as a bot would have had to decide it: the senses a bot
 # in their place would have had, and their command put as a net's six
-# outputs. One sample is 38 signed bytes, 32 senses then 6 decisions, the
-# same as the hand-written bot's samples that the first net learned from.
+# outputs. One sample is 38 signed bytes, the first 32 senses then 6
+# decisions, the same as the hand-written bot's samples that the first net
+# learned from (the later senses are not sent: what people did is learned
+# into the part of the net that reads the first 32).
 pub val SAMPLE: i32 = 38;
+pub val SAMPLE_SENSES: i32 = 32;
 
 # Watch a player who is not a bot, on the tics a bot would look. This reads
 # the world and writes only to the watcher and to `out`; every machine in a
@@ -3786,23 +3943,23 @@ pub fun observe(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd, out: *u8) bool 
     walkhave = keys_of(g, p);
     sense(g, playernum, b);
     var i: i32 = 0;
-    for (i < INPUTS) {
+    for (i < SAMPLE_SENSES) {
         out[i] = clamp(b.feat[i], -127, 127)::i8:~u8;
         i      = i + 1;
     }
     # full speed is 50 forward and 40 sideways; a net's turn of 127 is 2540
-    out[INPUTS + O_FORWARD] = clamp(cmd.forwardmove::i32 * 127 / 50, -127, 127)::i8:~u8;
-    out[INPUTS + O_SIDE]    = clamp(cmd.sidemove::i32 * 127 / 40, -127, 127)::i8:~u8;
-    out[INPUTS + O_TURN]    = clamp(cmd.angleturn::i32 / 20, -127, 127)::i8:~u8;
+    out[SAMPLE_SENSES + O_FORWARD] = clamp(cmd.forwardmove::i32 * 127 / 50, -127, 127)::i8:~u8;
+    out[SAMPLE_SENSES + O_SIDE]    = clamp(cmd.sidemove::i32 * 127 / 40, -127, 127)::i8:~u8;
+    out[SAMPLE_SENSES + O_TURN]    = clamp(cmd.angleturn::i32 / 20, -127, 127)::i8:~u8;
     var fire:   i32 = -64;
     var use:    i32 = -64;
     var change: i32 = -64;
     if ((cmd.buttons::i32 & defs.BT_ATTACK) != 0) { fire = 64; }
     if ((cmd.buttons::i32 & defs.BT_USE) != 0)    { use = 64; }
     if ((cmd.buttons::i32 & defs.BT_CHANGE) != 0) { change = 64; }
-    out[INPUTS + O_FIRE]   = fire::i8:~u8;
-    out[INPUTS + O_USE]    = use::i8:~u8;
-    out[INPUTS + O_SWITCH] = change::i8:~u8;
+    out[SAMPLE_SENSES + O_FIRE]   = fire::i8:~u8;
+    out[SAMPLE_SENSES + O_USE]    = use::i8:~u8;
+    out[SAMPLE_SENSES + O_SWITCH] = change::i8:~u8;
     ret 1;
 }
 
@@ -3810,7 +3967,7 @@ pub fun observe(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd, out: *u8) bool 
 # ---
 # b:    the bot
 # kind: KIND_SCRIPT or KIND_NET
-# net:  for a net, its 942 weights; nil otherwise
+# net:  for a net, its NETSIZE weights; nil otherwise
 # seed: for its own noise
 pub fun start(b: *Bot, kind: i32, net: *i8, seed: u32) {
     var blank: Bot;
@@ -3854,7 +4011,7 @@ test feeling__goes_with_the_kind_and_none_is_fifty {
 }
 
 test script__faces_and_fires {
-    var f:   [32]i32;
+    var f:   [48]i32;
     var out: [6]i32;
     # an enemy to the left, far: turn left, come on, hold fire
     f[F_SEEN]    = 127;
@@ -3879,8 +4036,8 @@ test script__faces_and_fires {
 }
 
 test forward__zero_net_gives_zero {
-    var net: [942]i8;
-    var f:   [32]i32;
+    var net: [1326]i8;
+    var f:   [48]i32;
     var out: [6]i32;
     f[0] = 100;
     forward(?net[0], ?f[0], ?out[0]);
@@ -3895,6 +4052,58 @@ test forward__zero_net_gives_zero {
     net[INPUTS * HIDDEN + HIDDEN]       = 32;
     forward(?net[0], ?f[0], ?out[0]);
     if (out[0] != 50) { ret 2; }
+    ret 0;
+}
+
+test widen__decides_as_the_first_shape_did {
+    # a first-shape net of every weight different, and its forward pass done
+    # by hand on the first 32 senses
+    var old: [942]i8;
+    var k: i32 = 0;
+    for (k < NETSIZE_V1) {
+        old[k] = ((k * 37 + 11) % 23 - 11)::i8;
+        k      = k + 1;
+    }
+    var f: [48]i32;
+    k = 0;
+    for (k < INPUTS) {
+        f[k] = (k * 29) % 255 - 127;
+        k    = k + 1;
+    }
+    var want: [6]i32;
+    var hidden: [24]i32;
+    var j: i32 = 0;
+    for (j < HIDDEN) {
+        var sum: i32 = old[INPUTS_V1 * HIDDEN + j]::i32 * 64;
+        var i: i32 = 0;
+        for (i < INPUTS_V1) {
+            sum = sum + old[j * INPUTS_V1 + i]::i32 * f[i];
+            i   = i + 1;
+        }
+        hidden[j] = clamp(sum >> 6, 0, 127);
+        j         = j + 1;
+    }
+    val base: i32 = INPUTS_V1 * HIDDEN + HIDDEN;
+    var o: i32 = 0;
+    for (o < OUTPUTS) {
+        var sum: i32 = old[base + HIDDEN * OUTPUTS + o]::i32 * 64;
+        j = 0;
+        for (j < HIDDEN) {
+            sum = sum + old[base + o * HIDDEN + j]::i32 * hidden[j];
+            j   = j + 1;
+        }
+        want[o] = clamp(sum >> 6, -127, 127);
+        o       = o + 1;
+    }
+    var new: [1326]i8;
+    widen(?old[0], ?new[0]);
+    var got: [6]i32;
+    forward(?new[0], ?f[0], ?got[0]);
+    o = 0;
+    for (o < OUTPUTS) {
+        if (got[o] != want[o]) { ret 1 + o; }
+        o = o + 1;
+    }
     ret 0;
 }
 

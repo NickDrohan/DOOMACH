@@ -1,6 +1,6 @@
 # Bots, and the league they play in
 
-A hundred bots, each a 942-byte neural network, play deathmatches against each other on the
+A hundred bots, each a 1326-byte neural network, play deathmatches against each other on the
 server around the clock, and are rated on a public page. They all began as the same network.
 Each learns by its own lights, so they have not stayed the same: some are good, and some are
 very good at something that is not winning.
@@ -138,8 +138,14 @@ sight and fire when it is in the sights, keep a middling distance, sidestep by t
 toward whoever shot it; go for a pickup close by; otherwise follow the way to an opponent,
 pressing use at a wall dead ahead on the way (likely a door).
 
-**The net** is 32 inputs to 24 hidden units (clipped to 0..127) to 6 outputs, with weights in
-64ths as signed bytes: 942 bytes in all. Because the script uses nothing but the senses, a net
+**The net** is 48 inputs to 24 hidden units (clipped to 0..127) to 6 outputs, with weights in
+64ths as signed bytes: 1326 bytes in all, small enough to go to another machine in one datagram.
+The first 32 senses are the original ones; senses 32-47 (co-op only, zero in a deathmatch) are
+the next two enemies in sight, whether the enemy is after this bot and its health, an incoming
+missile, the nearest team-mate, armour, another enemy in the line of fire, slime ahead and cover
+at hand. Nets of the first shape (32 inputs, 942 bytes) are widened as they are read
+(`bot.widen`, `leaguefile.upgrade`): their weights keep their places and the new senses come in
+with none, so a widened net decides exactly as it did. Because the script uses nothing but the senses, a net
 can learn it exactly in principle. `doom botdata` records the script's decisions (292,000 of
 them from 70 matches) and `harness/trainbot.py` fits the net to them and judges it as the game
 runs it, in integers, on decisions held out: fire agrees 97% of the time, turn is off by 15 of
@@ -292,7 +298,7 @@ continuously. That is still thousands of matches a day. The league lives on a 1 
 ## The co-op league
 
 A second league, of a hundred other bots, plays co-op (`arena ... 0 coop`). It is the same
-program and the same kind of bot, a 942-byte net fed the same 32 senses, but its nets are its
+program and the same kind of bot, a 1326-byte net fed the same senses, but its nets are its
 own: what wins a deathmatch (find the others, shoot them) is not what gets a team through a
 level, so the two leagues keep separate files and never exchange a weight. Both began from the
 same imitation of the hand-written bot (`fixtures/bot0.net`) and go their own ways from there.

@@ -9,7 +9,7 @@ use std.types.bool.bool;
 use std.types.string.str;
 
 pub val MEMBERS: i32 = 100;
-pub val NET:     i32 = 942;
+pub val NET:     i32 = 1326;
 pub val COHORT: [4]i32 = [4]i32{5, 23, 41, 64};
 
 pub fun cohort_member(who: i32) bool {
@@ -24,8 +24,13 @@ pub fun cohort_member(who: i32) bool {
 # the file: sixteen bytes, then each member as twelve numbers, its net, and
 # the mutant it is trying
 pub val HEAD:         i32 = 16;
-pub val MEMBER_BYTES: i32 = 12 * 4 + 942 * 2;
-pub val FILE_BYTES:   i32 = 16 + 100 * (12 * 4 + 942 * 2);
+pub val MEMBER_BYTES: i32 = 12 * 4 + 1326 * 2;
+pub val FILE_BYTES:   i32 = 16 + 100 * (12 * 4 + 1326 * 2);
+# the first shape's file ("MDL1"): nets of 942 bytes, 32 senses to 24
+# hidden units to 6 outputs; this shape's ("MDL2") reads 48 senses
+pub val NET_V1:          i32 = 942;
+pub val MEMBER_BYTES_V1: i32 = 12 * 4 + 942 * 2;
+pub val FILE_BYTES_V1:   i32 = 16 + 100 * (12 * 4 + 942 * 2);
 # within a member: its kind, its style, and where its net begins
 pub val AT_KIND:  i32 = 0;
 pub val AT_STYLE: i32 = 4;
@@ -84,7 +89,68 @@ pub fun name_of(i: i32, out: *u8) {
 
 # whether a file's bytes are a league
 pub fun valid(p: *u8, len: i32) bool {
-    ret len == FILE_BYTES && p[0] == 'M' && p[1] == 'D' && p[2] == 'L' && p[3] == '1';
+    ret len == FILE_BYTES && p[0] == 'M' && p[1] == 'D' && p[2] == 'L' && p[3] == '2';
+}
+
+# whether they are a league of the first shape, for upgrade
+pub fun valid_v1(p: *u8, len: i32) bool {
+    ret len == FILE_BYTES_V1 && p[0] == 'M' && p[1] == 'D' && p[2] == 'L' && p[3] == '1';
+}
+
+# A first-shape net in place of this shape's, deciding exactly as it did
+# (as bot.widen does it: the module order keeps the relay from reaching it):
+# its weights where they were, and none on the senses it never had.
+pub fun widen_net(old: *u8, new: *u8) {
+    val INPUTS: i32 = 48;
+    val V1: i32 = 32;
+    val HIDDEN: i32 = 24;
+    var k: i32 = 0;
+    for (k < NET) {
+        new[k] = 0;
+        k      = k + 1;
+    }
+    var j: i32 = 0;
+    for (j < HIDDEN) {
+        var i: i32 = 0;
+        for (i < V1) {
+            new[j * INPUTS + i] = old[j * V1 + i];
+            i                   = i + 1;
+        }
+        new[INPUTS * HIDDEN + j] = old[V1 * HIDDEN + j];
+        j                        = j + 1;
+    }
+    k = 0;
+    for (k < HIDDEN * 6 + 6) {
+        new[INPUTS * HIDDEN + HIDDEN + k] = old[V1 * HIDDEN + HIDDEN + k];
+        k                                 = k + 1;
+    }
+}
+
+# A league of the first shape as one of this shape: every member's numbers,
+# and its net and trial widened, so that nothing is lost and every bot
+# plays as it did. `out` has room for FILE_BYTES; ret is whether `p` was one.
+pub fun upgrade(p: *u8, len: i32, out: *u8) bool {
+    if (!valid_v1(p, len)) { ret 0; }
+    var k: i32 = 0;
+    for (k < HEAD) {
+        out[k] = p[k];
+        k      = k + 1;
+    }
+    out[3] = '2';
+    var m: i32 = 0;
+    for (m < MEMBERS) {
+        val from: i32 = HEAD + m * MEMBER_BYTES_V1;
+        val to:   i32 = HEAD + m * MEMBER_BYTES;
+        k = 0;
+        for (k < AT_NET) {
+            out[to + k] = p[from + k];
+            k           = k + 1;
+        }
+        widen_net(?p[from + AT_NET], ?out[to + AT_NET]);
+        widen_net(?p[from + AT_NET + NET_V1], ?out[to + AT_NET + NET]);
+        m = m + 1;
+    }
+    ret 1;
 }
 
 test cohort__four_distinct_steady_learners {
