@@ -22,6 +22,35 @@ GitHub `main` includes code release `acc2408`; the older `v0.3.0` tag is histori
 Unqualified per-level experiments are preserved separately on the local WIP branch.
 Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
 
+## 0.4.0: where the co-op bots stand (2026-10-31)
+
+Released as v0.4.0 and live. The bots are a route-following controller with a small net
+for fighting; the net is trained by evolution across the whole farm, not by the league.
+
+- **In-level learning is off** (`LEARN_IN_LEVEL` in bot.mach). Measured, it made nets
+  worse within a level: frozen, bot0 finished 8 of 16 Nightmare test levels; nudged, 2.
+- **Which outputs matter** (`harness/ablate.py`, `COOP_ABLATE`): turn and fire decide
+  everything, side and weapon switch some; forward and use are the controller's.
+- **Training**: `harness/evolve.py` (champion plus 23 mutants a generation, two fresh
+  seeds, maps 3,4,5,6,7,9, all four bots one net, frozen, Nightmare). Games run on every
+  farm machine: the laptop through doom.exe (`farm-eval.ps1`), the Mac and Pis through
+  `arena <wad> <net> eval <map> <seed>` (`eval-batch.sh`), which plays coopmatch's very
+  game. Champion and log in `out/farm/evolve/`. Judge on unseen seeds with
+  `harness/holdout.py` (seeds 900+). The old per-copy league training is retired.
+- **Result so far**: on seeds 900-907 (E1M2-4, E1M9) the evolved net finished 29 of 32
+  against bot0's 14, with 24 deaths a game against 42.
+- **Hand-coded since 0.3.0**: completion-first routing; lifts boarded once called; corners
+  cut only through what is open now; cover when hit; standing by a person; carrying on
+  while a person respawns (45 s at most); flat-out running, but not toward slime; E1M8
+  barons hunted; missiles dodged (10 of 16 against 7, a quarter fewer deaths); enemies
+  ranked by threat among the eight nearest; F_FOEKIND (slot 29, once noise) tells the
+  net what its enemy fights with.
+- **Co-op rules since 0.3.0**: the dead drop their keys; a lock once opened stays open and
+  its colour's keys leave the level.
+- **Next**: let the evolution run use F_FOEKIND (`--layers out+foe`, running); add E1M8 to
+  its maps; a second-enemy input for infighting; push champions live after a holdout win
+  (swap the four cohort nets in /data/league/coop.bin, see out/triage/swap-cohort.sh).
+
 ## Home farm co-op training
 
 - `6d67c81` is pushed and deployed (Fly backup `/data/league-before-6d67c81.tar`, also in

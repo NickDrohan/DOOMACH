@@ -630,7 +630,11 @@ fun find_item(g: *Game, p: *Player) *Mobj {
         if (th.kind == defs.TH_MOBJ) {
             val mo: *Mobj = th:~*Mobj;
             if ((mo.flags & defs.MF_SPECIAL) != 0) {
-                val score: i32 = worth(g, p, mo) * 8 - distance(me, mo.x, mo.y);
+                # (in a deathmatch, the nearest within 768, as it was: worth
+                # sent bots with fists alone 2400 units after a weapon left
+                # where it lies, and a bot hunting another after armour)
+                var score: i32 = worth(g, p, mo) * 8 - distance(me, mo.x, mo.y);
+                if (g.deathmatch != 0) { score = 768 - distance(me, mo.x, mo.y); }
                 if (score > bestscore && takes(g, p, mo) && !lost(g, mo.x, mo.y)) {
                     best      = mo;
                     bestscore = score;
@@ -2720,10 +2724,12 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
     # turns; and noise
     f[F_PHASE] = -127;
     if (((g.leveltime + playernum * 23) & 64) != 0) { f[F_PHASE] = 127; }
-    # what the enemy in sight fights with (it was noise once: the draw is
-    # kept, so that the bot's own dice fall as they did)
-    next_random(b);
-    f[F_FOEKIND] = 0;
+    # what the enemy in sight fights with, in co-op; in a deathmatch, where
+    # every enemy is a player, it is still the noise it always was there
+    # (the deathmatch nets were made with it, and fight worse without)
+    f[F_FOEKIND] = next_random(b) - 128;
+    if (f[F_FOEKIND] < -127) { f[F_FOEKIND] = -127; }
+    if (g.deathmatch == 0) { f[F_FOEKIND] = 0; }
     if (enemy != nil && g.deathmatch == 0) {
         val kind: i32 = enemy_class(enemy.kind);
         if (kind < 0) { f[F_FOEKIND] = -127; }
