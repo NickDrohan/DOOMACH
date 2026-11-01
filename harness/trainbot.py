@@ -4,7 +4,9 @@
     python harness/trainbot.py botdata.bin fixtures/bot0.net
 
 botdata.bin is the script's decisions: 38 signed bytes each, 32 senses then 6
-decisions. The net is bot.mach's: 32 inputs, 24 hidden units clipped to
+decisions. The net is bot.mach's first shape (942 bytes; the game and the
+arena widen it to the 48-input shape as they read it, deciding as it did):
+32 inputs, 24 hidden units clipped to
 0..127, 6 outputs clipped to -127..127, weights in 64ths as signed bytes and
 biases as signed bytes. It is trained in floating point with the same
 clipping, rounded to bytes, and then judged as the game will run it, in

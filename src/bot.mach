@@ -326,8 +326,6 @@ pub rec Bot {
     tout:    [48]i32;
     tpos:    i32;
     tn:      i32;
-    # learns nothing as it plays (a diagnostic's control)
-    frozen:  bool;
     # outputs a diagnostic has silenced, a bit each (O_FORWARD first)
     ablate:  i32;
     wstate:  i32;
@@ -3110,7 +3108,7 @@ fun learn(g: *Game, b: *Bot, r: i32) {
     # unlearned walking within minutes. Nets now change only by mutations
     # that win a trial.
     if (!LEARN_IN_LEVEL) { ret; }
-    if (r == 0 || b.kind != KIND_NET || b.shy || g.deathmatch != 0 || b.tn == 0 || b.frozen) { ret; }
+    if (r == 0 || b.kind != KIND_NET || b.shy || g.deathmatch != 0 || b.tn == 0) { ret; }
     # the change to make is gathered over every decision remembered before
     # any of it is made: the newest counts most, the oldest a ninth of it
     var acc: [150]i32;

@@ -72,45 +72,20 @@ for fighting; the net is trained by evolution across the whole farm, not by the 
   its maps; a second-enemy input for infighting; push champions live after a holdout win
   (swap the four cohort nets in /data/league/coop.bin, see out/triage/swap-cohort.sh).
 
-## Home farm co-op training
+## Retired: per-copy league training on the farm (2026-10-30 to 11-01)
 
-- `6d67c81` is pushed and deployed (Fly backup `/data/league-before-6d67c81.tar`, also in
-  ignored `out/triage/`). The relay had 29,688 human samples (E1M1 11,712, E1M2 17,976).
-- The arena now also builds for `linux-aarch64` (the Pis) and `darwin-x86_64` (the Mac);
-  the simulation fingerprint matched Windows on both (`2227431163`).
-- `harness/farm-train.sh` runs in `~/work/doomach` on each machine (nothing else there:
-  arena binary, WAD, bot0.net, the league snapshot in `seed/`). It waits for the chess
-  project's stockfish/gen jobs to finish, then runs independent copies of the four-learner
-  cohort in `run1..N` at full speed: pi-01 3 (seeds 1001-1003), pi-02 3 (2001-2003), mac 5
-  (3001-3005); later pi-01/pi-02 run4 (1004/2004) and mac run6 (3006). The owner keeps
-  this PC for the chess project.
-- The owner's laptop (`nick@192.168.1.233`, Windows, i7-11800H, the farm key works) runs
-  eight more copies via `harness/farm-train.cmd` in `C:\Users\nick\work\doomach`,
-  started below normal priority through `Win32_Process Create` so they survive ssh and
-  yield to its own `m-probe` jobs (seeds 4001-4008). Its 4 GB GPU is unused: the bots'
-  nets are 942-byte integer networks inside a deterministic integer simulation, so
-  training is all game simulation on the CPU. Stop: `Stop-Process -Name arena` there.
-- `python harness/farm-collect.py collect|summary|consolidate` fetches results, reports
-  them, and benchmarks every run's learners (and the seed's) to write the best four into
-  `out/farm/consolidated/coop.bin`. Installing that into Fly, or redistributing it to the
-  farm as the next seed, is done ad hoc with the owner. To stop: `farm.sh stop <m> arena`
-  and `farm.sh stop <m> farm-train.sh`.
+Twenty-two independent copies of the co-op league (`farm-train.sh`, `farm-train.cmd`,
+consolidated by `farm-collect.py`) trained the cohort for two days. They were retired, and
+the scripts and every run folder deleted on 2026-11-02, for what they taught:
 
-- Overnight 2026-10-30/31 (22 copies; consolidation benchmarked on the laptop with
-  `farm-collect.py prepare` / `score`, then a check of the top picks on held-out seeds
-  2-4 in `C:\Users\nick\work\doomverify`):
-  - The arena seeds collapse 2k and 2k+1 (`seed | 1`); seven copies were duplicates until
-    restarted with odd seeds. Scripts now use odd seeds only.
-  - Gen 1 (after ~1.5 h): two learners were ~10% closer to the exits than the live
-    cohort on held-out seeds (mean nearest 56.3 and 58.3 vs 59.9-64.3). Consolidated
-    with the two best live nets (`out/farm/seed/coop.bin`, previous kept as
-    `coop.gen1.bin`) and every copy restarted from it (`redistribute 1`; old runs kept as
-    `gen1-runN` on each machine).
-  - Gen 2 (3 h later): no candidate beat the gen-1 nets on held-out seeds, so it was not
-    redistributed (`out/farm/consolidated/coop.bin` from that pass is unused).
-  - Across all copies campaigns still clear about one level each (E1M1); nothing has
-    finished E1M2-E1M9 on Nightmare. Mutation training improves how far the bots get, a
-    little; it has not yet changed what they finish. The consolidated cohort is not on Fly.
+- In-level learning made nets worse; one-game trials keep the luckiest mutant, so the
+  cohort drifted (the live league did the same: see `COOP_KEEP_MUTANTS` in arena.mach).
+- The arena seeds collapse 2k and 2k+1 (`seed | 1`): give independent runs odd seeds.
+- The laptop's 4 GB GPU is no use: the nets are small integer networks inside a
+  deterministic integer simulation, so training is all game simulation on the CPU.
+
+What replaced it is `harness/evolve.py` (see 0.4.0 above). The farm machines now hold only
+`~/work/doomach/{arena,DOOM1.WAD,bot0.net,eval-batch.sh,evolve/}`.
 
 ## Local survival and finish-line work (now deployed)
 
