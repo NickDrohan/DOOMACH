@@ -99,7 +99,9 @@ pub val F_ITEMBEAR:  i32 = 25;
 pub val F_ITEMCLOSE: i32 = 26;
 pub val F_STUCK:     i32 = 27;
 pub val F_PHASE:     i32 = 28;
-pub val F_NOISE:     i32 = 29;
+# what the enemy in sight fights with: -127 claws, 64 bullets, 127 fire it
+# throws, 0 none (in a deathmatch, always 0)
+pub val F_FOEKIND:   i32 = 29;
 pub val F_WAY:       i32 = 30;
 pub val F_BETTER:    i32 = 31;
 
@@ -194,6 +196,9 @@ pub rec Bot {
     cover:     bool;
     hidetill:  i32;
     nearperson: bool;
+    # a monster's missile coming its way: which side to step to, and until
+    dodgeside: i32;
+    dodgetill: i32;
     # co-op with a person who has died: it gets on with the level, short
     # of ending it, until they have come back and caught up with it
     regroup:   bool;
@@ -442,8 +447,13 @@ fun find_enemy(g: *Game, me: *Mobj, b: *Bot, seat: i32) *Mobj {
     # person counts as a quarter as far off as it is, and one that is merely
     # near a person as half, so that a bot shoots what threatens its people
     # before what threatens itself.
-    var near:  [4]*Mobj;
-    var dists: [4]i32 = [4]i32{0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+    # In co-op it looks all round and further, at the eight nearest within
+    # 2048, and ranks them by threat as well as distance: one after the bot
+    # itself counts as two thirds as far, and a thing that only bites, while
+    # still far off, half as far again, so that the imp throwing fire is
+    # shot before the demon still crossing the room.
+    var near:  [8]*Mobj;
+    var dists: [8]i32 = [8]i32{0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
     var th: *defs.Thinker = g.thinkercap.next;
     for (th != ?g.thinkercap) {
         if (th.kind == defs.TH_MOBJ) {
@@ -451,16 +461,18 @@ fun find_enemy(g: *Game, me: *Mobj, b: *Bot, seat: i32) *Mobj {
             if ((mo.flags & defs.MF_COUNTKILL) != 0 && mo.health > 0) {
                 var d: i32   = distance(me, mo.x, mo.y);
                 var m: *Mobj = mo;
-                if (d < 1536) {
+                if (d < 2048) {
+                    if (mo.target == me) { d = d * 2 / 3; }
+                    if (enemy_class(mo.kind) < 0 && d > 512) { d = d * 3 / 2; }
                     if (hunts_a_person(g, mo)) {
                         d = d / 4;
                     }
                     or (by_a_person(g, mo.x, mo.y)) {
                         d = d / 2;
                     }
-                    # insert into the four, nearest first
+                    # insert into the eight, nearest first
                     var k: i32 = 0;
-                    for (k < 4) {
+                    for (k < 8) {
                         if (d < dists[k]) {
                             val td: i32   = dists[k];
                             val tm: *Mobj = near[k];
@@ -477,11 +489,80 @@ fun find_enemy(g: *Game, me: *Mobj, b: *Bot, seat: i32) *Mobj {
         th = th.next;
     }
     var k: i32 = 0;
-    for (k < 4) {
+    for (k < 8) {
         if (near[k] != nil && dists[k] != 0x7fffffff && maputl.check_sight(g, me, near[k])) { ret near[k]; }
         k = k + 1;
     }
     ret nil;
+}
+
+# how a monster fights: -1 with claws and teeth, 1 with fire it throws, 0
+# with bullets (and 0 for anything else)
+fun enemy_class(kind: i32) i32 {
+    if (kind == info.MT_SERGEANT || kind == info.MT_SHADOWS || kind == info.MT_SKULL) { ret -1; }
+    if (kind == info.MT_TROOP || kind == info.MT_BRUISER || kind == info.MT_HEAD || kind == info.MT_KNIGHT || kind == info.MT_BABY || kind == info.MT_FATSO || kind == info.MT_UNDEAD || kind == info.MT_CYBORG) { ret 1; }
+    ret 0;
+}
+
+# A monster's missile that will pass within reach of the bot in the next
+# second: which way to step out of its line (1 right, -1 left, 0 none),
+# held for a third of a second at a time. The nearest such pass decides.
+# A fireball is heard as it is thrown, so none of this asks for sight.
+fun dodge_bearing(g: *Game, me: *Mobj, b: *Bot) {
+    b.dodgeside = 0;
+    var soonest: i64 = 36;
+    var cx: i64 = 0;
+    var cy: i64 = 0;
+    var th: *defs.Thinker = g.thinkercap.next;
+    for (th != ?g.thinkercap) {
+        if (th.kind == defs.TH_MOBJ) {
+            val m: *Mobj = th:~*Mobj;
+            if ((m.flags & defs.MF_MISSILE) != 0 && m.target != nil && m.target.player == nil) {
+                # in units, and the speed in 256ths of a unit a tic
+                val rx: i64 = ((me.x - m.x) >> 16)::i64;
+                val ry: i64 = ((me.y - m.y) >> 16)::i64;
+                if (rx > -1024 && rx < 1024 && ry > -1024 && ry < 1024) {
+                    val vx: i64 = (m.momx >> 8)::i64;
+                    val vy: i64 = (m.momy >> 8)::i64;
+                    val vv: i64 = vx * vx + vy * vy;
+                    if (vv > 0) {
+                        # the tic of closest approach, and how close
+                        val tt: i64 = (rx * vx + ry * vy) * 256 / vv;
+                        if (tt > 0 && tt < soonest) {
+                            val ox: i64 = rx - vx * tt / 256;
+                            val oy: i64 = ry - vy * tt / 256;
+                            if (ox * ox + oy * oy < 52 * 52) {
+                                soonest = tt;
+                                cx = ox;
+                                cy = oy;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        th = th.next;
+    }
+    if (soonest >= 36) { ret; }
+    # its right, as the bot faces, and which side of the missile's line the
+    # bot stands on: step further that way, or the other if that is walled
+    val fine: u32 = me.angle >> t.ANGLETOFINESHIFT;
+    val rgx: i64 = (t.FINESINE[fine] >> 4)::i64;
+    val rgy: i64 = (0 - t.FINESINE[fine + 2048] >> 4)::i64;
+    var dir: i32 = 1;
+    if (cx * rgx + cy * rgy < 0) { dir = -1; }
+    var tries: i32 = 0;
+    for (tries < 2) {
+        val px: Fixed = me.x + t.FINESINE[fine] * 56 * dir;
+        val py: Fixed = me.y - t.FINESINE[fine + 2048] * 56 * dir;
+        if (g.navgrid == nil || (walks_now(g, me.x, me.y, px, py) && !floor_hurts(g.lv.sectors[sector_at(g, px, py)].special::i32))) {
+            b.dodgeside = dir;
+            b.dodgetill = g.leveltime + 12;
+            ret;
+        }
+        dir   = 0 - dir;
+        tries = tries + 1;
+    }
 }
 
 # whether a player walking onto a thing would pick it up: not health when
@@ -2559,6 +2640,7 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
         }
     }
     if (enemy == nil) { b.cover = 0; }
+    if (g.deathmatch == 0) { dodge_bearing(g, me, b); }
     f[F_SEEN]    = 0;
     f[F_BEARING] = 0;
     f[F_CLOSE]   = 0;
@@ -2638,8 +2720,16 @@ fun sense(g: *Game, playernum: i32, b: *Bot) {
     # turns; and noise
     f[F_PHASE] = -127;
     if (((g.leveltime + playernum * 23) & 64) != 0) { f[F_PHASE] = 127; }
-    f[F_NOISE] = next_random(b) - 128;
-    if (f[F_NOISE] < -127) { f[F_NOISE] = -127; }
+    # what the enemy in sight fights with (it was noise once: the draw is
+    # kept, so that the bot's own dice fall as they did)
+    next_random(b);
+    f[F_FOEKIND] = 0;
+    if (enemy != nil && g.deathmatch == 0) {
+        val kind: i32 = enemy_class(enemy.kind);
+        if (kind < 0) { f[F_FOEKIND] = -127; }
+        or (kind > 0) { f[F_FOEKIND] = 127; }
+        or { f[F_FOEKIND] = 64; }
+    }
     f[F_WAY] = 0;
     if (b.haveway) { f[F_WAY] = 127; }
     f[F_BETTER] = 0;
@@ -3341,6 +3431,17 @@ pub fun think(g: *Game, playernum: i32, b: *Bot, cmd: *Ticcmd) {
             }
             pathing = 1;
         }
+    }
+
+    # A fireball on its way: step out of its line. Every missile a monster
+    # has thrown is heard as it is thrown, so no sight is needed; one that
+    # will pass within reach of the bot in the next second is dodged at full
+    # sideways pace, to the side it would pass on already (or the clear one),
+    # still facing and shooting whatever it was.
+    if (g.deathmatch == 0 && !b.shy && b.dodgeside != 0 && b.dodgetill > g.leveltime && (b.ablate & 64) == 0) {
+        side    = b.dodgeside * 127;
+        forward = forward / 2;
+        pathing = 1;
     }
 
     # Badly hurt, with something that fights with claws or teeth at arm's

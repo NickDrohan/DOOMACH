@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "harness"))
 import pathbench  # noqa: E402
-OUTPUTS = [("full", 0), ("forward", 1), ("side", 2), ("turn", 4), ("fire", 8), ("use", 16), ("switch", 32), ("all moving", 7)]
+OUTPUTS = [("full", 0), ("forward", 1), ("side", 2), ("turn", 4), ("fire", 8), ("use", 16), ("switch", 32), ("all moving", 7), ("dodge", 64)]
 
 
 def play(exe, net, m, seed, mask, tics):
@@ -40,7 +40,11 @@ def main():
     ap.add_argument("--tics", type=int, default=16800)
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--report", type=Path)
+    ap.add_argument("--only", default=None, help="comma-separated names from the table, e.g. full,dodge")
     a = ap.parse_args()
+    global OUTPUTS
+    if a.only:
+        OUTPUTS = [o for o in OUTPUTS if o[0] in a.only.split(",")]
     maps = [int(x) for x in a.maps.split(",")]
     seeds = [int(x) for x in a.seeds.split(",")]
     work = [(name, mask, m, s) for name, mask in OUTPUTS for m in maps for s in seeds]

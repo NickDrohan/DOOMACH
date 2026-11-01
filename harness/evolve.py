@@ -21,6 +21,7 @@ out/farm/evolve/. Run it detached; it picks up from champion.net if stopped.
 import argparse
 import base64
 import json
+import os
 import random
 import subprocess
 import sys
@@ -56,11 +57,18 @@ def ps(script):
     return ssh("powershell -NoProfile -EncodedCommand " + base64.b64encode(script.encode("utf-16-le")).decode())
 
 
+# the input a net reads the enemy's kind from (see F_FOEKIND in bot.mach)
+F_FOEKIND = 29
+
+
 def mutable(layers, outputs):
     at = []
     if layers in ("hidden", "all"):
         at += range(W2)
-    if layers in ("out", "all"):
+    # out+foe: the outputs, and how every hidden unit takes the enemy's kind
+    if layers == "out+foe":
+        at += [j * INPUTS + F_FOEKIND for j in range(HIDDEN)]
+    if layers in ("out", "all", "out+foe"):
         for k in outputs:
             at += range(W2 + k * HIDDEN, W2 + (k + 1) * HIDDEN)
             at.append(W2 + HIDDEN * OUTPUTS + k)
@@ -168,7 +176,10 @@ def play(nets, maps, seeds, parallel):
     ssh("if not exist {0} mkdir {0}".format(REMOTE_W))
     ssh("if exist {0}\\games rmdir /s /q {0}\\games".format(REMOTE_W))
     ssh("if exist {0}\\candidates rmdir /s /q {0}\\candidates".format(REMOTE_W))
-    for local in (ROOT / "out/windows-x86_64/release/bin/doom.exe", ROOT / "data/DOOM1.WAD", ROOT / "harness/farm-eval.ps1"):
+    # (DOOM_EVAL_EXE: another build of doom to judge with, as to compare)
+    exe = Path(os.environ.get("DOOM_EVAL_EXE", str(ROOT / "out/windows-x86_64/release/bin/doom.exe")))
+    scp(str(exe), "{}:{}/doom.exe".format(LAPTOP, REMOTE))
+    for local in (ROOT / "data/DOOM1.WAD", ROOT / "harness/farm-eval.ps1"):
         scp(str(local), "{}:{}/{}".format(LAPTOP, REMOTE, local.name))
     scp("-r", str(cand), "{}:{}/".format(LAPTOP, REMOTE))
     # run it there and wait: in its own process, so a dropped ssh does not stop it
@@ -210,7 +221,7 @@ def main():
     ap.add_argument("--pop", type=int, default=23)
     ap.add_argument("--maps", default="2,3,4,9")
     ap.add_argument("--seeds-per-gen", type=int, default=2)
-    ap.add_argument("--layers", default="out", choices=["out", "hidden", "all"])
+    ap.add_argument("--layers", default="out", choices=["out", "hidden", "all", "out+foe"])
     ap.add_argument("--outputs", default="forward,side,turn,fire,use,switch")
     ap.add_argument("--rate", type=float, default=0.15)
     ap.add_argument("--sigma", type=float, default=6.0)

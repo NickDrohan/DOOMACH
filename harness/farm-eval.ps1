@@ -28,15 +28,22 @@ foreach ($net in Get-ChildItem candidates -Filter *.net) {
 }
 $running = @()
 while ($queue.Count -gt 0 -or $running.Count -gt 0) {
-    foreach ($p in @($running | Where-Object { $_.HasExited })) {
-        if (Test-Path "$($p.Out).part") { Move-Item -Force "$($p.Out).part" $p.Out; Remove-Item -Force "$($p.Out).part.err" -ErrorAction SilentlyContinue }
+    # one look at each: a game that ended between two looks was dropped
+    $still = @()
+    foreach ($p in $running) {
+        if ($p.HasExited) {
+            if (Test-Path "$($p.Out).part") { Move-Item -Force "$($p.Out).part" $p.Out; Remove-Item -Force "$($p.Out).part.err" -ErrorAction SilentlyContinue }
+        }
+        else { $still += $p }
     }
-    $running = @($running | Where-Object { -not $_.HasExited })
+    $running = $still
     while ($queue.Count -gt 0 -and $running.Count -lt $Parallel) {
         $job = $queue.Dequeue()
         $tmp = "$($job[3]).part"
         $args = "coopmatch DOOM1.WAD $($job[1]) 16800 `"$($job[0])`" $($job[2])"
         $p = Start-Process -FilePath .\doom.exe -ArgumentList $args -RedirectStandardOutput $tmp -RedirectStandardError "$tmp.err" -NoNewWindow -PassThru
+        # (holding the handle keeps HasExited true to the process)
+        $null = $p.Handle
         $p | Add-Member -NotePropertyName Out -NotePropertyValue $job[3]
         $running += $p
     }
