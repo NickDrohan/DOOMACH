@@ -130,15 +130,34 @@ def unixpath(p):
     return str(p).replace("\\", "/")
 
 
-def share(names):
-    """the candidates each machine plays, in proportion to how many games it runs at once"""
-    total = sum(WORKERS.values())
-    out, at = {}, 0
-    for k, (m, w) in enumerate(WORKERS.items()):
-        n = len(names) - at if k == len(WORKERS) - 1 else round(len(names) * w / total)
+def reachable(machine):
+    """whether a machine answers now (the laptop, on Wi-Fi, drops off; so does pi-02)"""
+    try:
+        if machine == "laptop":
+            return ssh("echo ok", 30).returncode == 0
+        return "ok" in farm("run", machine, "echo ok", timeout=60).stdout
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def share(names, live):
+    """the candidates each machine that answered plays, in proportion to how many games it runs at once"""
+    total = sum(WORKERS[m] for m in live)
+    out, at = {m: [] for m in WORKERS}, 0
+    for k, m in enumerate(live):
+        n = len(names) - at if k == len(live) - 1 else round(len(names) * WORKERS[m] / total)
         out[m] = names[at:at + n]
         at += n
     return out
+
+
+def quietly(fn, *args):
+    """a step that may meet a machine gone away: its games are then missing, not the run"""
+    try:
+        return fn(*args)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print("  ({} failed: {})".format(fn.__name__, e), flush=True)
+        return None
 
 
 def unix_start(machine, names, nets, maps, seeds):
@@ -181,16 +200,59 @@ def unix_fetch(machine, games):
 
 def play(nets, maps, seeds, parallel):
     """every net on every map and seed, across the farm; {name: [rows]}"""
-    shares = share(sorted(nets))
+    live = [m for m in WORKERS if reachable(m)]
+    if not live:
+        print("  no machine answers; waiting a minute", flush=True)
+        time.sleep(60)
+        return {}
+    shares = share(sorted(nets), live)
     for machine in WORKERS:
         if machine != "laptop" and shares[machine]:
-            unix_start(machine, shares[machine], nets, maps, seeds)
+            quietly(unix_start, machine, shares[machine], nets, maps, seeds)
+    if shares["laptop"] and quietly(laptop_start, shares["laptop"], nets, maps, seeds) is None:
+        shares["laptop"] = []
+    kit = OUT / "kit"
+    # at most half an hour: a machine that has gone away leaves its games missing
+    waiting = {m for m in WORKERS if shares[m]}
+    for _ in range(180):
+        time.sleep(10)
+        for m in list(waiting):
+            done = quietly(laptop_done) if m == "laptop" else quietly(unix_done, m)
+            if done:
+                waiting.discard(m)
+        if not waiting:
+            break
+    games = kit / "games"
+    games.mkdir(parents=True, exist_ok=True)
+    for old in games.glob("*"):
+        old.unlink()
+    if shares["laptop"]:
+        quietly(scp, "-r", "{}:{}/games".format(LAPTOP, REMOTE), str(kit))
+    for machine in WORKERS:
+        if machine != "laptop" and shares[machine]:
+            quietly(unix_fetch, machine, games)
+    rows = {}
+    for g in games.glob("*.txt"):
+        name, m, s = g.stem.rsplit("_", 2)
+        try:
+            row = pathbench.parse(g.read_text(encoding="utf-8", errors="replace"))
+        except ValueError:
+            continue
+        rows.setdefault(name, []).append(dict(row, map=int(m), seed=int(s)))
+    return rows
+
+
+def laptop_done():
+    return "True" in ssh('powershell -NoProfile -Command "Test-Path {}\\games\\DONE"'.format(REMOTE_W), 60).stdout
+
+
+def laptop_start(names, nets, maps, seeds):
     kit = OUT / "kit"
     cand = kit / "candidates"
     cand.mkdir(parents=True, exist_ok=True)
     for old in cand.glob("*.net"):
         old.unlink()
-    for name in shares["laptop"]:
+    for name in names:
         (cand / (name + ".net")).write_bytes(nets[name])
     parallel = WORKERS["laptop"]
     # (one command each: cmd takes what follows an `if` and an & as the if's)
@@ -207,32 +269,7 @@ def play(nets, maps, seeds, parallel):
     ps("$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{{PriorityClass = [uint32]32; ShowWindow = [uint16]0}}; "
        "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine = 'powershell -NoProfile -ExecutionPolicy Bypass -File {0}\\farm-eval.ps1 -Kit {0} -Parallel {1} -Maps {2} -Seeds {3}'; "
        "CurrentDirectory = '{0}'; ProcessStartupInformation = $si}} | Out-Null".format(REMOTE_W, parallel, ",".join(map(str, maps)), ",".join(map(str, seeds))))
-    waiting = {m for m in WORKERS if shares[m]}
-    for _ in range(720):
-        time.sleep(10)
-        if "laptop" in waiting and "True" in ssh('powershell -NoProfile -Command "Test-Path {}\\games\\DONE"'.format(REMOTE_W), 60).stdout:
-            waiting.discard("laptop")
-        for m in [m for m in waiting if m != "laptop"]:
-            if unix_done(m):
-                waiting.discard(m)
-        if not waiting:
-            break
-    games = kit / "games"
-    if games.exists():
-        for old in games.glob("*"):
-            old.unlink()
-    if shares["laptop"]:
-        scp("-r", "{}:{}/games".format(LAPTOP, REMOTE), str(kit))
-    games.mkdir(parents=True, exist_ok=True)
-    for machine in WORKERS:
-        if machine != "laptop" and shares[machine]:
-            unix_fetch(machine, games)
-    rows = {}
-    for g in games.glob("*.txt"):
-        name, m, s = g.stem.rsplit("_", 2)
-        row = pathbench.parse(g.read_text(encoding="utf-8", errors="replace"))
-        rows.setdefault(name, []).append(dict(row, map=int(m), seed=int(s)))
-    return rows
+    return True
 
 
 def main():
@@ -247,6 +284,17 @@ def main():
     ap.add_argument("--rate", type=float, default=0.15)
     ap.add_argument("--sigma", type=float, default=6.0)
     ap.add_argument("--margin", type=float, default=0.03, help="a mutant must beat the champion by this share of its score")
+    # the first-layer weights a layer setting opens are mutated more gently: a
+    # weight on a sense of 127 moves a hidden unit twice as far as one on the
+    # hidden layer's output, and with the outputs' own rate and size the
+    # 2026-11-01 run (out+senses) ran from 7 of 12 levels to none in 30
+    # generations
+    ap.add_argument("--in-rate", type=float, default=0.04)
+    ap.add_argument("--in-sigma", type=float, default=2.0)
+    # and the generation's winner must win again, on two seeds of its own,
+    # before it takes over: among 23 mutants on 12 games the best is often
+    # only the luckiest, and luck accepted every generation is a slide
+    ap.add_argument("--confirm-seeds", type=int, default=2)
     ap.add_argument("--parallel", type=int, default=6)
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
@@ -256,13 +304,16 @@ def main():
     log = OUT / "log.jsonl"
     start = sum(1 for _ in log.open()) if log.exists() else 0
     maps = [int(m) for m in a.maps.split(",")]
-    at = mutable(a.layers, [OUTPUT_BITS[o] for o in a.outputs.split(",")])
+    outs = [OUTPUT_BITS[o] for o in a.outputs.split(",")]
+    at = mutable(a.layers, outs)
+    at_out = sorted(set(at) & set(mutable("out", outs)))
+    at_in = sorted(set(at) - set(at_out))
     rng = random.Random(1234 + start)
     for gen in range(start, start + a.gens):
         seeds = [100 + gen * a.seeds_per_gen + k for k in range(a.seeds_per_gen)]
         nets = {"champion": champion}
         for i in range(a.pop):
-            nets["m{}".format(i)] = mutate(champion, at, rng, a.rate, a.sigma)
+            nets["m{}".format(i)] = mutate(mutate(champion, at_out, rng, a.rate, a.sigma), at_in, rng, a.in_rate, a.in_sigma)
         began = time.time()
         rows = play(nets, maps, seeds, a.parallel)
         full = len(maps) * len(seeds)
@@ -273,12 +324,22 @@ def main():
         best = max(table, key=lambda n: table[n][0])
         cs = table["champion"][0]
         took = best != "champion" and table[best][0] > cs + abs(cs) * a.margin + 10
+        confirm = None
+        if took and a.confirm_seeds > 0:
+            again = [5000 + gen * a.confirm_seeds + k for k in range(a.confirm_seeds)]
+            rerows = play({"champion": champion, best: nets[best]}, maps, again, a.parallel)
+            want = len(maps) * len(again)
+            if len(rerows.get("champion", [])) == want and len(rerows.get(best, [])) == want:
+                confirm = [sum(score(r) for r in rerows["champion"]), sum(score(r) for r in rerows[best])]
+                took = confirm[1] > confirm[0]
+            else:
+                took = False
         if took:
             champion = nets[best]
             champ_path.write_bytes(champion)
             (OUT / "champion-gen{}.net".format(gen)).write_bytes(champion)
         entry = {"gen": gen, "seeds": seeds, "champion": table["champion"], "best": best, "best_score": table[best],
-                 "took": took, "minutes": round((time.time() - began) / 60, 1), "layers": a.layers, "outputs": a.outputs}
+                 "took": took, "confirm": confirm, "minutes": round((time.time() - began) / 60, 1), "layers": a.layers, "outputs": a.outputs}
         with log.open("a") as f:
             f.write(json.dumps(entry) + "\n")
         print(json.dumps(entry), flush=True)
