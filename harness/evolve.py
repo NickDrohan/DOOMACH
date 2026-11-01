@@ -234,13 +234,20 @@ def play(nets, maps, seeds, parallel):
         if machine != "laptop" and shares[machine]:
             quietly(unix_fetch, machine, games)
     rows = {}
+    broken = 0
     for g in games.glob("*.txt"):
         name, m, s = g.stem.rsplit("_", 2)
         try:
             row = pathbench.parse(g.read_text(encoding="utf-8", errors="replace"))
         except ValueError:
+            broken += 1
             continue
         rows.setdefault(name, []).append(dict(row, map=int(m), seed=int(s)))
+    # what each machine was given and what came back, for evolve-status.py:
+    # games go missing, and which machine loses them says why
+    per = {m: [len(shares[m]) * len(maps) * len(seeds), sum(len(rows.get(n, [])) for n in shares[m])] for m in WORKERS if shares[m]}
+    with (OUT / "machines.jsonl").open("a") as f:
+        f.write(json.dumps({"t": int(time.time()), "seeds": seeds, "games": per, "unreadable": broken, "stillwaiting": sorted(waiting)}) + "\n")
     return rows
 
 
@@ -302,7 +309,7 @@ def main():
     # trained on, apart from the final test's 900 up); losing, it is replaced
     # by the anchor. On 2026-11-02 the out+senses run, confirmations and all,
     # finished 8 of 36 unseen levels where the net it began from finished 16.
-    ap.add_argument("--validate-every", type=int, default=10)
+    ap.add_argument("--validate-every", type=int, default=5)
     ap.add_argument("--validate-seeds", type=int, default=4)
     ap.add_argument("--parallel", type=int, default=6)
     a = ap.parse_args()
