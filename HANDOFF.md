@@ -22,6 +22,27 @@ GitHub `main` includes code release `acc2408`; the older `v0.3.0` tag is histori
 Unqualified per-level experiments are preserved separately on the local WIP branch.
 Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
 
+## 0.5.0: the second shape of net (2026-11-01)
+
+- **Nets are 48 inputs, 24 hidden, 6 outputs: 1326 bytes** (bot.mach INPUTS/NETSIZE). Inputs
+  0-31 are the original senses in their original places; 32-47 (F_FOE2 .. F_COVER) are co-op
+  only and zero in a deathmatch: next two enemies in sight (bearing, closeness, kind), enemy
+  after this bot, enemy health, incoming missile bearing and time, nearest team-mate,
+  armour, another enemy in the line of fire, slime ahead, cover at hand.
+- **Nothing was thrown away.** A first-shape net (942 bytes) is widened on read
+  (`bot.widen`, root `read_net`, arena first net, `evolve.widen`): its weights keep their
+  places, new inputs get none, so it decides identically (tested; every replay fixture is
+  unchanged). League files are MDL2; an MDL1 file is upgraded on load by the arena and on
+  read by the relay (`leaguefile.upgrade`, tested member by member). The live leagues were
+  upgraded in place on deploy; backup `/data/league-before-net-v2.tar` (copy in out/triage).
+- **Wire and files**: relay protocol VERSION 2 (old games refused at the door), watch RECIPE
+  3 (5500 bytes), coopnow 6492 bytes. A seated bot (BOTSIZE 1378) still fits one datagram:
+  MAXPACKET 1400, under the 1472 of a 1500-byte link. Human training samples are unchanged
+  (38 bytes, the first 32 senses): imitation trains the part of the net that reads them.
+- **Training**: `harness/evolve.py --layers out+senses` mutates the outputs and how every
+  hidden unit reads the new senses (and F_FOEKIND). `--layers all` opens the whole first
+  layer. The next shape change should be grown the same way (widen, then train), not reset.
+
 ## 0.4.0: where the co-op bots stand (2026-10-31)
 
 Released as v0.4.0 and live. The bots are a route-following controller with a small net
