@@ -105,12 +105,23 @@ def mutate(net, at, rng, rate, sigma):
     return bytes(out)
 
 
+# How long a game may run. Eight minutes, but twenty for E1M6: with its
+# long walk and its door that shuts for thirty seconds, the round-204 net
+# finished it 5 of 6 times in twenty minutes and 1 of 6 in eight, so at
+# eight it taught nothing. The league allows thirty.
+LONG_MAPS = {6: 42000}
+
+
+def tics_for(m):
+    return LONG_MAPS.get(m, 16800)
+
+
 def score(row):
     # (no bot that ever set out for the exit reports 0: as far as can be)
     near = int(row["nearest"]) or 200
     s = 2 * (200 - min(near, 200)) - 3 * int(row["deaths"])
     if row["finished"]:
-        s += 1000 + (16800 - int(row["tics"])) // 100
+        s += 1000 + max(0, 16800 - int(row["tics"])) // 100
     return s
 
 
@@ -173,7 +184,7 @@ def unix_start(machine, names, nets, maps, seeds):
     jobs = []
     for name in names:
         (kit / "candidates" / (name + ".net")).write_bytes(nets[name])
-        jobs += ["{} {} {}".format(name, m, s) for m in maps for s in seeds]
+        jobs += ["{} {} {} {}".format(name, m, s, tics_for(m)) for m in maps for s in seeds]
     (kit / "jobs.txt").write_bytes(("\n".join(jobs) + "\n").encode())
     tar = OUT / "kit" / (machine + ".tar")
     with tarfile.open(tar, "w") as t:
@@ -287,8 +298,9 @@ def laptop_start(names, nets, maps, seeds):
     scp("-r", str(cand), "{}:{}/".format(LAPTOP, REMOTE))
     # run it there and wait: in its own process, so a dropped ssh does not stop it
     ps("$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{{PriorityClass = [uint32]32; ShowWindow = [uint16]0}}; "
-       "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine = 'powershell -NoProfile -ExecutionPolicy Bypass -File {0}\\farm-eval.ps1 -Kit {0} -Parallel {1} -Maps {2} -Seeds {3}'; "
-       "CurrentDirectory = '{0}'; ProcessStartupInformation = $si}} | Out-Null".format(REMOTE_W, parallel, ",".join(map(str, maps)), ",".join(map(str, seeds))))
+       "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine = 'powershell -NoProfile -ExecutionPolicy Bypass -File {0}\\farm-eval.ps1 -Kit {0} -Parallel {1} -Maps {2} -Seeds {3} -LongMaps {4} -LongTics {5}'; "
+       "CurrentDirectory = '{0}'; ProcessStartupInformation = $si}} | Out-Null".format(REMOTE_W, parallel, ",".join(map(str, maps)), ",".join(map(str, seeds)),
+                                                                                 ",".join(map(str, LONG_MAPS)) or "0", max(LONG_MAPS.values(), default=16800)))
     return True
 
 

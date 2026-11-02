@@ -10,8 +10,12 @@ param(
     [string]$Kit = 'C:\Users\nick\work\doomeval',
     [int]$Parallel = 6,
     [string]$Maps = '2,3,4,5,7,9',
-    [string]$Seeds = '1'
+    [string]$Seeds = '1',
+    # maps given LongTics instead of eight minutes (harness/evolve.py LONG_MAPS)
+    [string]$LongMaps = '0',
+    [int]$LongTics = 16800
 )
+$LongList = @($LongMaps -split ',' | ForEach-Object { [int]$_ })
 # (seeds as text, "2,3,4": an array does not survive powershell -File)
 $SeedList = @($Seeds -split ',' | ForEach-Object { [int]$_ })
 $MapList = @($Maps -split ',' | ForEach-Object { [int]$_ })
@@ -57,7 +61,9 @@ while ($queue.Count -gt 0 -or $running.Count -gt 0 -or $pending.Count -gt 0) {
     while ($queue.Count -gt 0 -and $running.Count -lt $Parallel) {
         $job = $queue.Dequeue()
         $tmp = "$($job[3]).part"
-        $args = "coopmatch DOOM1.WAD $($job[1]) 16800 `"$($job[0])`" $($job[2])"
+        $tics = 16800
+        if ($LongList -contains $job[1]) { $tics = $LongTics }
+        $args = "coopmatch DOOM1.WAD $($job[1]) $tics `"$($job[0])`" $($job[2])"
         $p = Start-Process -FilePath .\doom.exe -ArgumentList $args -RedirectStandardOutput $tmp -RedirectStandardError "$tmp.err" -NoNewWindow -PassThru
         # (holding the handle keeps HasExited true to the process)
         $null = $p.Handle
