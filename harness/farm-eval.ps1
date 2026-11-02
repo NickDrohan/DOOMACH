@@ -4,8 +4,8 @@
 #
 # The kit holds doom.exe, DOOM1.WAD and candidates\*.net. Every candidate
 # plays as all four bots on each map and seed below, on Nightmare; each game's
-# report goes to games\<candidate>_<map>_<seed>.txt for harness/farm-collect.py
-# to score. Games already played are skipped, so a stopped run can resume.
+# report goes to games\<candidate>_<map>_<seed>.txt for harness/evolve.py to
+# score. Games already played are skipped, so a stopped run can resume.
 param(
     [string]$Kit = 'C:\Users\nick\work\doomeval',
     [int]$Parallel = 6,
@@ -26,17 +26,34 @@ foreach ($net in Get-ChildItem candidates -Filter *.net) {
         }
     }
 }
+# A finished game's report is moved into place; Windows can hold the file a
+# moment after the game ends, so a move that fails is tried again later
+# rather than lost (it lost one game in forty this way).
+function Publish([string]$out) {
+    if (-not (Test-Path "$out.part")) { return $true }
+    try {
+        Move-Item -Force "$out.part" $out -ErrorAction Stop
+        Remove-Item -Force "$out.part.err" -ErrorAction SilentlyContinue
+        return $true
+    }
+    catch { return $false }
+}
 $running = @()
-while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+$pending = @()
+while ($queue.Count -gt 0 -or $running.Count -gt 0 -or $pending.Count -gt 0) {
     # one look at each: a game that ended between two looks was dropped
     $still = @()
     foreach ($p in $running) {
-        if ($p.HasExited) {
-            if (Test-Path "$($p.Out).part") { Move-Item -Force "$($p.Out).part" $p.Out; Remove-Item -Force "$($p.Out).part.err" -ErrorAction SilentlyContinue }
-        }
+        if ($p.HasExited) { $pending += ,@($p.Out, 0) }
         else { $still += $p }
     }
     $running = $still
+    # (for a minute at most: then the final sweep has its turn)
+    $left = @()
+    foreach ($item in $pending) {
+        if (-not (Publish $item[0]) -and $item[1] -lt 120) { $left += ,@($item[0], $item[1] + 1) }
+    }
+    $pending = $left
     while ($queue.Count -gt 0 -and $running.Count -lt $Parallel) {
         $job = $queue.Dequeue()
         $tmp = "$($job[3]).part"
@@ -48,5 +65,12 @@ while ($queue.Count -gt 0 -or $running.Count -gt 0) {
         $running += $p
     }
     Start-Sleep -Milliseconds 500
+}
+# and anything a report was left as, if it is a whole one
+foreach ($part in Get-ChildItem games -Filter *.txt.part) {
+    if (Select-String -Path $part.FullName -Pattern '^end tic' -Quiet) {
+        $out = $part.FullName.Substring(0, $part.FullName.Length - 5)
+        for ($try = 0; $try -lt 20 -and -not (Publish $out); $try++) { Start-Sleep -Milliseconds 250 }
+    }
 }
 'done' | Set-Content games\DONE
