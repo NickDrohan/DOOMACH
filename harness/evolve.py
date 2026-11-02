@@ -179,6 +179,10 @@ def unix_start(machine, names, nets, maps, seeds):
     with tarfile.open(tar, "w") as t:
         t.add(kit / "jobs.txt", "jobs.txt")
         t.add(kit / "candidates", "candidates")
+    # a batch left running by a stopped controller would write into this
+    # one's folder and lose its games: stop it first (ours alone run there)
+    farm("stop", machine, "xargs")
+    farm("stop", machine, "arena")
     farm("put", machine, unixpath(ROOT / "harness/eval-batch.sh"), "work/doomach/eval-batch.sh")
     farm("put", machine, unixpath(tar), "work/doomach/evolve.tar")
     farm("run", machine, "cd work/doomach && rm -rf evolve && mkdir evolve && tar -xf evolve.tar -C evolve")
@@ -255,7 +259,14 @@ def laptop_done():
     return "True" in ssh('powershell -NoProfile -Command "Test-Path {}\\games\\DONE"'.format(REMOTE_W), 60).stdout
 
 
+def laptop_stop():
+    """the evaluator and its games, if a stopped controller left them running there"""
+    return ps("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'doomevolve' } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+
+
 def laptop_start(names, nets, maps, seeds):
+    laptop_stop()
     kit = OUT / "kit"
     cand = kit / "candidates"
     cand.mkdir(parents=True, exist_ok=True)
