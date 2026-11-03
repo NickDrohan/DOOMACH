@@ -142,7 +142,11 @@ def main():
             proven = [e for e in kept if len(e["scores"]) >= 2]
             if proven and proven[0]["net"] != anchor:
                 best = proven[0]
-                vseeds = [700 + k for k in range(a.validate_seeds)]
+                # fresh seeds every check: the same four, night after night,
+                # were learned (2026-11-03: an anchor that won four checks on
+                # seeds 700-703 finished 22 of 36 unseen levels to the live
+                # net's 27)
+                vseeds = [50000 + gen * a.validate_seeds + k for k in range(a.validate_seeds)]
                 vrows = ev.play({"best": best["net"], "anchor": anchor}, maps, vseeds, 0)
                 want = len(maps) * len(vseeds)
                 if len(vrows.get("best", [])) == want and len(vrows.get("anchor", [])) == want:
