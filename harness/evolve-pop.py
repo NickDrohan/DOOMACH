@@ -76,7 +76,9 @@ def main():
     ap.add_argument("--outputs", default="turn,fire,side,switch")
     ap.add_argument("--rate", type=float, default=0.15)
     ap.add_argument("--validate-every", type=int, default=5)
-    ap.add_argument("--validate-seeds", type=int, default=4)
+    # eight seeds a check (48 games), and three more levels finished to win it
+    ap.add_argument("--validate-seeds", type=int, default=8)
+    ap.add_argument("--validate-margin", type=int, default=3)
     a = ap.parse_args()
     maps = [int(m) for m in a.maps.split(",")]
     outs = [ev.OUTPUT_BITS[o] for o in a.outputs.split(",")]
@@ -154,8 +156,13 @@ def main():
                     va = sum(ev.score(r) for r in vrows["anchor"])
                     fb = sum(bool(r["finished"]) for r in vrows["best"])
                     fa = sum(bool(r["finished"]) for r in vrows["anchor"])
-                    entry["validate"] = {"elite": best["name"], "finished": [fb, fa], "score": [vb, va], "new_anchor": vb > va}
-                    if vb > va:
+                    # a new anchor must finish clearly more levels, not merely
+                    # score higher: on 2026-11-03 twenty of forty checks moved
+                    # the anchor, many on ties in levels (16 to 16) won by a
+                    # few hundred points, which on 24 games is luck
+                    better = fb >= fa + a.validate_margin and vb > va
+                    entry["validate"] = {"elite": best["name"], "finished": [fb, fa], "score": [vb, va], "new_anchor": better}
+                    if better:
                         anchor = best["net"]
                         anchor_path.write_bytes(anchor)
                         (ev.OUT / "anchor-pop-gen{}.net".format(gen)).write_bytes(anchor)
