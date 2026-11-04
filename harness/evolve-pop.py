@@ -76,9 +76,11 @@ def main():
     ap.add_argument("--outputs", default="turn,fire,side,switch")
     ap.add_argument("--rate", type=float, default=0.15)
     ap.add_argument("--validate-every", type=int, default=5)
-    # eight seeds a check (48 games), and three more levels finished to win it
-    ap.add_argument("--validate-seeds", type=int, default=8)
-    ap.add_argument("--validate-margin", type=int, default=3)
+    # sixteen seeds a check (96 games), and eight more levels finished to win
+    # it. Three on 48 games was under one standard deviation of luck: the net
+    # that won 39 to 26 (round 529) then lost the unseen-seed test 20 to 27.
+    ap.add_argument("--validate-seeds", type=int, default=16)
+    ap.add_argument("--validate-margin", type=int, default=8)
     a = ap.parse_args()
     maps = [int(m) for m in a.maps.split(",")]
     outs = [ev.OUTPUT_BITS[o] for o in a.outputs.split(",")]
