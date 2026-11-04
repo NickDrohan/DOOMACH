@@ -128,7 +128,9 @@ def score(row):
 # every machine of the farm judges: games at once on each, and its share of
 # the candidates in proportion. The arena's eval plays the very game doom's
 # coopmatch does, on any of them.
-WORKERS = {"laptop": 12, "mac": 5, "pi-01": 3, "pi-02": 3}
+# (the laptop at 12 got half of every round and finished last, the Pis and
+# the Mac waiting on it; at 9 the shares end nearer together)
+WORKERS = {"laptop": 9, "mac": 5, "pi-01": 3, "pi-02": 3}
 BASH = r"C:\Program Files\Git\bin\bash.exe"
 FARM = str(Path.home() / ".claude/skills/farm-machines/farm.sh").replace("\\", "/")
 
