@@ -156,6 +156,10 @@ def reachable(machine):
 def share(names, live):
     """the candidates each machine that answered plays, in proportion to how many games it runs at once"""
     total = sum(WORKERS[m] for m in live)
+    # the share rounding leaves over goes to the machine that runs the most
+    # at once: given to the last-listed Pi, it kept pi-02 at work while every
+    # other machine waited idle for it
+    live = sorted(live, key=lambda m: WORKERS[m])
     out, at = {m: [] for m in WORKERS}, 0
     for k, m in enumerate(live):
         n = len(names) - at if k == len(live) - 1 else round(len(names) * WORKERS[m] / total)
@@ -185,6 +189,8 @@ def unix_start(machine, names, nets, maps, seeds):
     for name in names:
         (kit / "candidates" / (name + ".net")).write_bytes(nets[name])
         jobs += ["{} {} {} {}".format(name, m, s, tics_for(m)) for m in maps for s in seeds]
+    # the longest games first, so no machine ends a round on one long game
+    jobs.sort(key=lambda j: -int(j.split()[3]))
     (kit / "jobs.txt").write_bytes(("\n".join(jobs) + "\n").encode())
     tar = OUT / "kit" / (machine + ".tar")
     with tarfile.open(tar, "w") as t:
