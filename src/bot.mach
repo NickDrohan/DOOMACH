@@ -278,6 +278,8 @@ pub rec Bot {
     keyx:     Fixed;
     keyy:     Fixed;
     keyuntil: i32;
+    # and whether only a lift worked from its switch led to it
+    keyride:  bool;
     # a goal that is no secret — a monster, a key, a friend — by where it
     # lay, since when it has been after it, and the nearest it has been to
     # it; and the place it has given up on, and until when
@@ -1783,6 +1785,12 @@ var keepfy: Fixed;
 # solve_to found no walk it could vouch for, and fell back on trust
 var unsure: bool;
 var solving:    bool;
+# activator may send a bot to the switch of a lift whose walk-over edge
+# is in the way; solve_to tries that last, and only when looking for a key
+# and a search met such a lift
+var rideover:   bool;
+var rideable:   bool;
+var keyride:    bool;
 var solvedepth: i32;
 var solved:     bool;
 var solvex:  Fixed;
@@ -1818,7 +1826,9 @@ fun activator(g: *Game, me: *Mobj, b: *Bot, blocked: i32) bool {
         for (l < g.lv.numlines) {
             val line: *level.Line = ?g.lv.lines[l];
             if (line.tagnum::i32 == tag && line.special != 0) {
-                if (l == blocked) { ret 0; }
+                if (l == blocked && walked_over(line.special::i32)) { rideable = 1; }
+                if (l == blocked && (!rideover || !walked_over(line.special::i32))) { ret 0; }
+                if (l == blocked) { l = l + 1; cnt; }
                 val mx: Fixed = g.lv.vertexes[line.v1].x / 2 + g.lv.vertexes[line.v2].x / 2;
                 val my: Fixed = g.lv.vertexes[line.v1].y / 2 + g.lv.vertexes[line.v2].y / 2;
                 var d:  i32   = maputl.aprox_distance(mx - wx, my - wy) >> 16;
@@ -1897,12 +1907,20 @@ fun solve_to(g: *Game, me: *Mobj, b: *Bot, tox: Fixed, toy: Fixed, fx_in: Fixed,
     # (A reckless bot does not look for the careful way at all: the short
     # way through the slime is the way, and if it kills it, it comes back.)
     careful = b.quirk != QUIRK_RECKLESS;
+    rideable = 0;
     var to: i32 = solve_pass(g, me, b, tox, toy, fx_in, fy_in, have);
     careful = 0;
     b.wades = 0;
     if (!b.haveway || unsure) {
         to      = solve_pass(g, me, b, tox, toy, fx_in, fy_in, have);
         b.wades = 1;
+    }
+    # Still none, for a key: a lift whose own far edge is a walk-over
+    # trigger, worked instead from its switch
+    if ((!b.haveway || unsure) && keyride && rideable) {
+        rideover = 1;
+        to       = solve_pass(g, me, b, tox, toy, fx_in, fy_in, have);
+        rideover = 0;
     }
     ret to;
 }
@@ -2066,6 +2084,7 @@ fun goal_bearing(g: *Game, playernum: i32, b: *Bot, had: i32) i32 {
         b.gavetill   = 0;
         b.gavekeys   = had;
         b.keyuntil   = 0;
+        b.keyride    = 0;
     }
     # A bot-only team may leave even while secrets remain. Human-led
     # routing removes KEY_EXIT in path_bearing instead.
@@ -2315,24 +2334,43 @@ fun mission_bearing(g: *Game, playernum: i32, me: *Mobj, b: *Bot, have: i32) i32
     var k: i32 = 0;
     for (k < n && g.leveltime < b.keyuntil) {
         if (keys[k].x == b.keyx && keys[k].y == b.keyy && !lost(g, b.keyx, b.keyy)) {
+            keyride = b.keyride;
             val to: i32 = solve_pickup(g, me, b, keys[k], have);
+            keyride = 0;
             if (b.haveway && !unsure && !stalling(g, b, me, b.keyx, b.keyy)) { ret to; }
             give_up(g, b, b.keyx, b.keyy);
         }
         k = k + 1;
     }
-    k = 0;
-    for (k < n) {
-        if (given_up(g, b, keys[k].x, keys[k].y) || lost(g, keys[k].x, keys[k].y)) { k = k + 1; cnt; }
-        val to: i32 = solve_pickup(g, me, b, keys[k], have);
-        if (b.haveway && !unsure && !stalling(g, b, me, keys[k].x, keys[k].y)) {
-            b.keyx     = keys[k].x;
-            b.keyy     = keys[k].y;
-            b.keyuntil = g.leveltime + 45 * 35;
-            ret to;
+    # A key no walk leads to as the level stands may yet lie beyond a lift
+    # whose far edge is a walk-over trigger, worked from its switch: E1M7's
+    # blue key. Tried only when no key has a walk otherwise, for four bots
+    # crowding onto a lift is slow where there is another way, as E1M5's.
+    var tried: [6]bool;
+    var pass: i32 = 0;
+    for (pass < 2) {
+        val ride: bool = pass == 1;
+        k = 0;
+        for (k < n) {
+            if (!ride) { tried[k] = 0; }
+            if (lost(g, keys[k].x, keys[k].y) || (given_up(g, b, keys[k].x, keys[k].y) && !(ride && tried[k]))) { k = k + 1; cnt; }
+            keyride = ride;
+            val to: i32 = solve_pickup(g, me, b, keys[k], have);
+            keyride = 0;
+            if (b.haveway && !unsure && !stalling(g, b, me, keys[k].x, keys[k].y)) {
+                b.keyx     = keys[k].x;
+                b.keyy     = keys[k].y;
+                b.keyuntil = g.leveltime + 45 * 35;
+                b.keyride  = ride;
+                ret to;
+            }
+            if (!ride) {
+                give_up(g, b, keys[k].x, keys[k].y);
+                tried[k] = 1;
+            }
+            k = k + 1;
         }
-        give_up(g, b, keys[k].x, keys[k].y);
-        k = k + 1;
+        pass = pass + 1;
     }
     # none: the exit anyway, on trust
     b.after = 3;
