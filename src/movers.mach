@@ -783,6 +783,21 @@ pub fun do_door(g: *Game, tag: i32, kind: i32) bool {
         if (secnum < 0) { brk; }
         val sector: *level.Sector = sec(g, secnum);
         if (sector.specialdata != nil) { cnt; }
+        # co-op: a door opened to stay open stays open. E1M6's exit door is
+        # opened for good by a switch, and a line beside it shut it again for
+        # thirty seconds whenever anyone walked over it, locking the team out
+        val coop: bool = g.netgame && g.deathmatch == 0;
+        var kept: bool = 0;
+        var k: i32 = 0;
+        for (k < g.nkeptopen) {
+            if (g.keptopen[k] == secnum) { kept = 1; }
+            k = k + 1;
+        }
+        if (coop && kept && (kind == CLOSE || kind == CLOSE_30_THEN_OPEN || kind == BLAZE_CLOSE)) { cnt; }
+        if (coop && !kept && (kind == OPEN || kind == BLAZE_OPEN) && g.nkeptopen < 16) {
+            g.keptopen[g.nkeptopen] = secnum;
+            g.nkeptopen             = g.nkeptopen + 1;
+        }
 
         # new door thinker
         rtn = 1;

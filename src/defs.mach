@@ -421,6 +421,10 @@ pub rec Game {
     # level's keys have been taken away for already.
     unlocked:        i32;
     unlockswept:     i32;
+    # co-op: doors opened to stay open this level (movers.do_door), which
+    # nothing shuts again
+    keptopen:        [16]i32;
+    nkeptopen:       i32;
     respawnmonsters: bool;
     fastparm:        bool;
     nomonsters:      bool;
