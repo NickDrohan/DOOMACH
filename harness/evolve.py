@@ -135,7 +135,8 @@ WORKERS = {"laptop": 9, "mac": 5, "pi-01": 3, "pi-02": 3}
 if os.environ.get("EVOLVE_MACHINES"):
     WORKERS = {m: n for m, n in WORKERS.items() if m in os.environ["EVOLVE_MACHINES"].split(",")}
 BASH = r"C:\Program Files\Git\bin\bash.exe"
-FARM = str(Path.home() / ".claude/skills/farm-machines/farm.sh").replace("\\", "/")
+FARM = str(next((p for p in (Path.home() / d / "skills/farm-machines/farm.sh" for d in (".agents", ".claude")) if p.exists()),
+                Path.home() / ".claude/skills/farm-machines/farm.sh")).replace("\\", "/")
 
 
 def farm(*args, timeout=600):
