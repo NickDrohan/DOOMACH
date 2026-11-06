@@ -131,6 +131,9 @@ def score(row):
 # (the laptop at 12 got half of every round and finished last, the Pis and
 # the Mac waiting on it; at 9 the shares end nearer together)
 WORKERS = {"laptop": 9, "mac": 5, "pi-01": 3, "pi-02": 3}
+# EVOLVE_MACHINES=pi-01,pi-02: only those (the owner wants the others back)
+if os.environ.get("EVOLVE_MACHINES"):
+    WORKERS = {m: n for m, n in WORKERS.items() if m in os.environ["EVOLVE_MACHINES"].split(",")}
 BASH = r"C:\Program Files\Git\bin\bash.exe"
 FARM = str(Path.home() / ".claude/skills/farm-machines/farm.sh").replace("\\", "/")
 
