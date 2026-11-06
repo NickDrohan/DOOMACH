@@ -237,7 +237,7 @@ def play(nets, maps, seeds, parallel):
     for machine in WORKERS:
         if machine != "laptop" and shares[machine]:
             quietly(unix_start, machine, shares[machine], nets, maps, seeds)
-    if shares["laptop"] and quietly(laptop_start, shares["laptop"], nets, maps, seeds) is None:
+    if shares.get("laptop") and quietly(laptop_start, shares["laptop"], nets, maps, seeds) is None:
         shares["laptop"] = []
     kit = OUT / "kit"
     # at most half an hour: a machine that has gone away leaves its games missing
@@ -254,7 +254,7 @@ def play(nets, maps, seeds, parallel):
     games.mkdir(parents=True, exist_ok=True)
     for old in games.glob("*"):
         old.unlink()
-    if shares["laptop"]:
+    if shares.get("laptop"):
         quietly(scp, "-r", "{}:{}/games".format(LAPTOP, REMOTE), str(kit))
     for machine in WORKERS:
         if machine != "laptop" and shares[machine]:
