@@ -49,6 +49,12 @@ def load():
     s = json.loads(state.read_text())
     for e in s["elites"]:
         e["net"] = (POP / (e["name"] + ".net")).read_bytes()
+    # scores judged by other rules than score()'s now are forgotten, every
+    # elite then judged afresh alongside the children
+    if s.get("scoring", 1) != ev.SCORING:
+        for e in s["elites"]:
+            e["scores"] = []
+        s["scoring"] = ev.SCORING
     return s
 
 
@@ -96,7 +102,7 @@ def main():
         elites = [{"name": "e0", "net": anchor, "sigma": 4.0, "scores": [], "born": 0, "parent": "anchor"}]
         for k in range(1, a.elites):
             elites.append({"name": "e{}".format(k), "net": ev.mutate(anchor, at, rng, a.rate, 6.0), "sigma": 2.0 + k, "scores": [], "born": 0, "parent": "e0"})
-        s = {"gen": 0, "next": a.elites, "elites": elites}
+        s = {"gen": 0, "next": a.elites, "elites": elites, "scoring": ev.SCORING}
         save(s)
     rng = random.Random(9000 + s["gen"])
     log = POP / "log.jsonl"
@@ -127,10 +133,11 @@ def main():
         # the next elites: best mean first, none too like one kept before it.
         # A child judged on one generation is ranked by that one, and is
         # judged again next time as an elite; an elite judged on none (its
-        # games lost) keeps its old scores
+        # games lost) keeps its old scores, or, its scores forgotten for a
+        # change of rules, is kept last while there is room
         kept = []
         for e in sorted(everyone, key=mean, reverse=True):
-            if not e["scores"]:
+            if not e["scores"] and e in children:
                 continue
             if all(distance(e["net"], k["net"], at) >= a.diverse for k in kept):
                 kept.append(e)
