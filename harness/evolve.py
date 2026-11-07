@@ -108,8 +108,10 @@ def mutate(net, at, rng, rate, sigma):
 # How long a game may run. Eight minutes, but twenty for E1M6: with its
 # long walk and its door that shuts for thirty seconds, the round-204 net
 # finished it 5 of 6 times in twenty minutes and 1 of 6 in eight, so at
-# eight it taught nothing. The league allows thirty.
-LONG_MAPS = {6: 42000}
+# eight it taught nothing. And twenty for E1M7: three keys, each lost to a
+# death, and teams cut off at eight minutes on their way to its exit. The
+# league allows thirty.
+LONG_MAPS = {6: 42000, 7: 42000}
 
 
 def tics_for(m):
@@ -120,8 +122,11 @@ def score(row):
     # (no bot that ever set out for the exit reports 0: as far as can be)
     near = int(row["nearest"]) or 200
     s = 2 * (200 - min(near, 200)) - 3 * int(row["deaths"])
+    # and up to 168 more the sooner it finished, in proportion to the time
+    # the map is given, so a long map's teams are still pressed to be quick
     if row["finished"]:
-        s += 1000 + max(0, 16800 - int(row["tics"])) // 100
+        limit = tics_for(int(row.get("map", 0)))
+        s += 1000 + 168 * max(0, limit - int(row["tics"])) // limit
     return s
 
 
