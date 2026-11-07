@@ -2377,9 +2377,20 @@ fun mission_bearing(g: *Game, playernum: i32, me: *Mobj, b: *Bot, have: i32) i32
     val trusted: i32 = solve_to(g, me, b, x, y, fx, fy, have);
     if (b.haveway || n == 0) { ret trusted; }
     # And when not even trust finds a way out, for the way out is behind a
-    # door its key opens, the nearest key, on trust, given up on or not. A
-    # team without it once wandered the last two minutes of every E1M2.
+    # door its key opens: the nearest key with a sure walk, though given up
+    # on for stalling, for under fire on E1M7 the red key was dropped and
+    # the blue key beyond its door chased instead; else the nearest key, on
+    # trust, given up on or not. A team without it once wandered the last
+    # two minutes of every E1M2.
     b.after = 4;
+    k = 0;
+    for (k < n) {
+        if (!lost(g, keys[k].x, keys[k].y)) {
+            val to: i32 = solve_pickup(g, me, b, keys[k], have);
+            if (b.haveway && !unsure) { ret to; }
+        }
+        k = k + 1;
+    }
     ret solve_pickup(g, me, b, keys[0], have);
 }
 
