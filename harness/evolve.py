@@ -114,6 +114,12 @@ def mutate(net, at, rng, rate, sigma):
 LONG_MAPS = {6: 42000, 7: 42000}
 
 
+# which rules score() and tics_for() judge by: raised whenever either changes,
+# so a saved population's scores, judged by the old rules, are not ranked
+# against new ones (harness/evolve-pop.py)
+SCORING = 2
+
+
 def tics_for(m):
     return LONG_MAPS.get(m, 16800)
 
