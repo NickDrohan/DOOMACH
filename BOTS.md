@@ -5,7 +5,7 @@ server around the clock, and are rated on a public page. They all began as the s
 Each learns by its own lights, so they have not stayed the same: some are good, and some are
 very good at something that is not winning.
 
-Standings: <https://mach-doom-relay.fly.dev/league.html>
+Standings: <https://doomach.fly.dev/league.html>
 
 ## A bot is part of the simulation
 

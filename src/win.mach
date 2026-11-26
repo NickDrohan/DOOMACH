@@ -91,56 +91,56 @@ rec BITMAPINFO8 {
     colors: [1024]u8;
 }
 
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun GetModuleHandleA(name: *u8) isize;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun Sleep(ms: u32);
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun QueryPerformanceCounter(count: *i64) i32;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun QueryPerformanceFrequency(frequency: *i64) i32;
 
-#[library("user32.dll")]
+#[library("user32")]
 ext fun RegisterClassExA(class: *WNDCLASSEXA) u16;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun CreateWindowExA(exstyle: u32, class: *u8, title: *u8, style: u32, x: i32, y: i32, w: i32, h: i32, parent: isize, menu: isize, instance: isize, param: ptr) isize;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun DefWindowProcA(hwnd: isize, msg: u32, wparam: usize, lparam: isize) isize;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun PeekMessageA(msg: *MSG, hwnd: isize, first: u32, last: u32, remove: u32) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun TranslateMessage(msg: *MSG) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun DispatchMessageA(msg: *MSG) isize;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun DestroyWindow(hwnd: isize) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun AdjustWindowRect(rect: *RECT, style: u32, menu: i32) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun GetClientRect(hwnd: isize, rect: *RECT) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun GetDC(hwnd: isize) isize;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun LoadCursorA(instance: isize, name: usize) isize;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun GetAsyncKeyState(key: i32) i16;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun GetForegroundWindow() isize;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun SetWindowTextA(hwnd: isize, text: *u8) i32;
 
-#[library("user32.dll")]
+#[library("user32")]
 ext fun GetCursorPos(point: *POINT) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun SetCursorPos(x: i32, y: i32) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun ClientToScreen(hwnd: isize, point: *POINT) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun ShowCursor(show: i32) i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun ClipCursor(rect: *RECT) i32;
 
-#[library("gdi32.dll")]
+#[library("gdi32")]
 ext fun StretchDIBits(hdc: isize, xd: i32, yd: i32, wd: i32, hd: i32, xs: i32, ys: i32, ws: i32, hs: i32, bits: *u8, info: *BITMAPINFO8, usage: u32, rop: u32) i32;
 
 # what the window procedure has seen since the window opened. Windows calls
@@ -368,15 +368,15 @@ rec WAVEHDR {
     reserved:        usize;
 }
 
-#[library("winmm.dll")]
+#[library("winmm")]
 ext fun waveOutOpen(handle: *isize, device: u32, format: *WAVEFORMATEX, callback: usize, instance: usize, flags: u32) u32;
-#[library("winmm.dll")]
+#[library("winmm")]
 ext fun waveOutPrepareHeader(handle: isize, header: *WAVEHDR, size: u32) u32;
-#[library("winmm.dll")]
+#[library("winmm")]
 ext fun waveOutWrite(handle: isize, header: *WAVEHDR, size: u32) u32;
-#[library("winmm.dll")]
+#[library("winmm")]
 ext fun waveOutReset(handle: isize) u32;
-#[library("winmm.dll")]
+#[library("winmm")]
 ext fun waveOutClose(handle: isize) u32;
 
 # fills a buffer with interleaved 16-bit stereo: the buffer, and how many
@@ -452,9 +452,9 @@ pub fun audio_close(au: *Audio) {
 
 # ------------------------------------------------------------------- timer
 
-#[library("winmm.dll")]
+#[library("winmm")]
 ext fun timeBeginPeriod(ms: u32) u32;
-#[library("winmm.dll")]
+#[library("winmm")]
 ext fun timeEndPeriod(ms: u32) u32;
 
 # ask Windows for a 1 ms timer for the life of the game, so that a short
@@ -484,11 +484,11 @@ rec ADDRINFOA {
     ai_next:      *ADDRINFOA;
 }
 
-#[library("ws2_32.dll")]
+#[library("ws2_32")]
 ext fun getaddrinfo(node: *u8, service: *u8, hints: *ADDRINFOA, out: **ADDRINFOA) i32;
-#[library("ws2_32.dll")]
+#[library("ws2_32")]
 ext fun freeaddrinfo(info: *ADDRINFOA);
-#[library("ws2_32.dll")]
+#[library("ws2_32")]
 ext fun WSAStartup(version: u16, data: *u8) i32;
 
 # the IPv4 address of a host name, as Windows' own resolver finds it
@@ -526,13 +526,13 @@ pub fun micros_now() i64 {
 
 # ------------------------------------------------------- started by a click
 
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun GetModuleFileNameA(module: isize, path: *u8, size: u32) u32;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun GetConsoleProcessList(list: *u32, count: u32) u32;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun FreeConsole() i32;
-#[library("user32.dll")]
+#[library("user32")]
 ext fun MessageBoxA(hwnd: isize, text: *u8, caption: *u8, kind: u32) i32;
 
 # this program's own path
@@ -565,9 +565,9 @@ pub fun beside_exe(name: str, out: *u8) bool {
     ret 1;
 }
 
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun GetStdHandle(which: u32) isize;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun GetFileType(handle: isize) u32;
 
 # whether the program was started by a double click: Windows then gives it a
@@ -588,9 +588,9 @@ pub fun drop_console() {
 
 # ---------------------------------------------------------------- updating
 
-#[library("urlmon.dll")]
+#[library("urlmon")]
 ext fun URLDownloadToFileA(caller: ptr, url: *u8, file: *u8, reserved: u32, callback: ptr) i32;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun WinExec(command: *u8, show: u32) u32;
 
 # fetch a URL into a file, by Windows' own means: its certificate checks

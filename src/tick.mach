@@ -18,6 +18,7 @@ use doom.fixed.Fixed;
 use doom.info;
 use doom.movers;
 use doom.pspr;
+use doom.rpg;
 use doom.spec;
 use t: doom.tables;
 use doom.world;
@@ -45,6 +46,14 @@ fun run_action(g: *Game, actor: *Mobj, player: *Player, psp: *Pspdef, action: i3
 pub fun install_hooks(g: *Game) {
     g.run_action   = run_action;
     g.line_special = spec.line_special;
+
+    # the character system's hooks; each first checks g.rpg_on
+    g.rpg_out   = rpg.scale_out;
+    g.rpg_in    = rpg.scale_in;
+    g.rpg_kill  = rpg.killed;
+    g.rpg_hit   = rpg.hit;
+    g.rpg_cmd   = rpg.command;
+    g.rpg_spawn = rpg.spawned;
 }
 
 # ----------------------------------------------------------------- p_user.c
@@ -195,7 +204,11 @@ fun player_think(g: *Game, player: *Player) {
     # check for weapon change
 
     # a special event has no other buttons
-    if ((cmd.buttons::i32 & defs.BT_SPECIAL) != 0) { cmd.buttons = 0; }
+    if ((cmd.buttons::i32 & defs.BT_SPECIAL) != 0) {
+        # the character system's commands: spend a point, blink, stim
+        if (g.rpg_on) { g.rpg_cmd(g, player, cmd.buttons::i32 & 127); }
+        cmd.buttons = 0;
+    }
 
     if ((cmd.buttons::i32 & defs.BT_CHANGE) != 0) {
         # the actual changing of the weapon is done when the weapon psprite

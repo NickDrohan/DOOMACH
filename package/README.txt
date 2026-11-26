@@ -126,7 +126,7 @@ THE BOT LEAGUE
 A hundred neural-network bots play deathmatches against each other on the
 server, day and night, each learning in its own way. To watch one: Esc,
 "Play online", then "Watch the co-op bots" or "Watch the deathmatch bots". Keys 1 to 4 choose whose eyes you
-see through. The standings are at https://mach-doom-relay.fly.dev/league.html
+see through. The standings are at https://doomach.fly.dev/league.html
 
 LICENCE AND SOURCE
 ------------------

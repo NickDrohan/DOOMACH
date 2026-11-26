@@ -52,8 +52,12 @@ use std.crypto.rand;
 use std.net.dns;
 use dnstypes: std.net.resolve.types;
 use std.net.ip;
+use std.sync.cancel;
 use std.allocator;
 use std.allocator.page;
+use std.compat.sha1;
+use socket_api: std.net.socket;
+use std.net.tcp;
 use std.net.udp;
 use std.types.error.err;
 use std.process.env;
@@ -109,7 +113,136 @@ fun chance(m: *Impair) i32 {
     ret ((m.seed >> 33) % 100)::i32;
 }
 
+val MAX_TCP:    i32 = 64;
+val STATE_FREE: i32 = 0;
+val STATE_HTTP: i32 = 1;
+val STATE_WS:   i32 = 2;
+
+rec TcpClient {
+    state:   i32;
+    gen:     u16;
+    stream:  tcp.Stream;
+    last_ms: i64;
+    rlen:    i32;
+    rbuf:    [4096]u8;
+}
+
+val MAX_BOXES: i32 = 32;
+
+rec HttpBox {
+    used:    bool;
+    addr:    core.Addr;
+    last_ms: i64;
+    len:     i32;
+    data:    [4096]u8;
+}
+
+var tcp_clients: [64]TcpClient;
+var next_gen:    u16 = 1;
+var http_boxes:  [32]HttpBox;
+
+fun write_all(s: *tcp.Stream, buf: *u8, len: i32) bool {
+    var off:   i32 = 0;
+    var tries: i32 = 0;
+    for (off < len && tries < 32) {
+        val wrote: res[usize, io_error.Error] = tcp.stream_write(s, ?buf[off], (len - off)::usize);
+        if (sel wrote.ok) {
+            if (wrote.ok == 0) { ret 0; }
+            off = off + wrote.ok::i32;
+        }
+        or {
+            if (wrote.err.kind != io_error.WOULD_BLOCK) { ret 0; }
+            tries = tries + 1;
+        }
+    }
+    ret off == len;
+}
+
+fun close_tcp_client(slot: i32) {
+    if (tcp_clients[slot].state == STATE_FREE) { ret; }
+    tcp.stream_close(?tcp_clients[slot].stream);
+    tcp_clients[slot].state = STATE_FREE;
+    tcp_clients[slot].rlen  = 0;
+}
+
+fun ws_send_frame(slot: i32, opcode: u8, payload: *u8, len: i32) {
+    if (slot < 0 || slot >= MAX_TCP || tcp_clients[slot].state != STATE_WS) { ret; }
+    if (len < 0 || len > 1500) { ret; }
+    var frame: [1508]u8;
+    frame[0] = 0x80 | opcode;
+    var hlen: i32 = 2;
+    if (len < 126) {
+        frame[1] = len::u8;
+    }
+    or {
+        frame[1] = 126;
+        frame[2] = (len >> 8)::u8;
+        frame[3] = (len & 0xff)::u8;
+        hlen     = 4;
+    }
+    var k: i32 = 0;
+    for (k < len) {
+        frame[hlen + k] = payload[k];
+        k               = k + 1;
+    }
+    if (!write_all(?tcp_clients[slot].stream, ?frame[0], hlen + len)) {
+        close_tcp_client(slot);
+    }
+}
+
+fun box_queue(to: core.Addr, payload: *u8, len: i32) {
+    if (len <= 0 || len > 1500) { ret; }
+    val now:    i64 = millis();
+    var target: i32 = -1;
+    var oldest: i32 = 0;
+    var i:      i32 = 0;
+    for (i < MAX_BOXES) {
+        if (http_boxes[i].used && http_boxes[i].addr.ip == to.ip && http_boxes[i].addr.port == to.port) {
+            target = i;
+            brk;
+        }
+        if (!http_boxes[i].used && target < 0) {
+            target = i;
+        }
+        if (http_boxes[i].last_ms < http_boxes[oldest].last_ms) {
+            oldest = i;
+        }
+        i = i + 1;
+    }
+    if (target < 0) {
+        target              = oldest;
+        http_boxes[target].len = 0;
+    }
+    val b: *HttpBox = ?http_boxes[target];
+    if (!b.used || b.addr.ip != to.ip || b.addr.port != to.port) {
+        b.used = 1;
+        b.addr = to;
+        b.len  = 0;
+    }
+    b.last_ms = now;
+    if (b.len + 2 + len > 4096) { ret; }
+    b.data[b.len]     = (len & 0xff)::u8;
+    b.data[b.len + 1] = ((len >> 8) & 0xff)::u8;
+    var k: i32 = 0;
+    for (k < len) {
+        b.data[b.len + 2 + k] = payload[k];
+        k                     = k + 1;
+    }
+    b.len = b.len + 2 + len;
+}
+
 fun send_now(sock: *udp.Socket, o: *core.Out) {
+    if ((o.to.ip & 0xffffff00) == 0x7f000000) {
+        val slot: i32 = (o.to.ip & 0xff)::i32;
+        if (slot >= 0 && slot < MAX_TCP && tcp_clients[slot].state == STATE_WS && tcp_clients[slot].gen == o.to.port) {
+            ws_send_frame(slot, 2, ?o.data[0], o.len);
+        }
+        ret;
+    }
+    if ((o.to.ip & 0xff000000) == 0x7e000000) {
+        box_queue(o.to, ?o.data[0], o.len);
+        ret;
+    }
     val ep: ip.Endpoint = ip.endpoint((o.to.ip >> 24)::u8, (o.to.ip >> 16)::u8, (o.to.ip >> 8)::u8, o.to.ip::u8, o.to.port);
     udp.send_to(sock, ?o.data[0], o.len::usize, ep);
 }
@@ -312,6 +445,379 @@ fun report(r: *core.Relay) {
         core.open_rooms(r), r.created, r.started, r.closed, r.forwarded, r.refused, r.dropped);
 }
 
+fun lower_ascii(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun hex_val(c: u8) i32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a' + 10)::i32; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A' + 10)::i32; }
+    ret -1;
+}
+
+fun base64_20(src: *u8, out: *u8) {
+    val tab: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var i:   i32 = 0;
+    var j:   i32 = 0;
+    for (i < 18) {
+        val v: u32 = (src[i]::u32 << 16) | (src[i + 1]::u32 << 8) | src[i + 2]::u32;
+        out[j]     = tab[(v >> 18) & 63];
+        out[j + 1] = tab[(v >> 12) & 63];
+        out[j + 2] = tab[(v >> 6) & 63];
+        out[j + 3] = tab[v & 63];
+        i          = i + 3;
+        j          = j + 4;
+    }
+    val tail: u32 = (src[18]::u32 << 16) | (src[19]::u32 << 8);
+    out[24] = tab[(tail >> 18) & 63];
+    out[25] = tab[(tail >> 12) & 63];
+    out[26] = tab[(tail >> 6) & 63];
+    out[27] = '=';
+    out[28] = 0;
+}
+
+fun find_header_end(buf: *u8, len: i32) i32 {
+    var i: i32 = 0;
+    for (i + 3 < len) {
+        if (buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10) {
+            ret i + 4;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun find_ws_key(buf: *u8, hlen: i32, key_out: *u8) i32 {
+    val needle: str = "sec-websocket-key:";
+    var i:      i32 = 0;
+    for (i + 18 < hlen) {
+        var match: bool = 1;
+        var k:     i32  = 0;
+        for (k < 18) {
+            if (lower_ascii(buf[i + k]) != needle[k]) {
+                match = 0;
+                brk;
+            }
+            k = k + 1;
+        }
+        if (match) {
+            var at: i32 = i + 18;
+            for (at < hlen && (buf[at] == ' ' || buf[at] == 9)) { at = at + 1; }
+            var n: i32 = 0;
+            for (at + n < hlen && buf[at + n] != 13 && buf[at + n] != 10 && buf[at + n] != ' ' && n < 60) {
+                key_out[n] = buf[at + n];
+                n          = n + 1;
+            }
+            key_out[n] = 0;
+            ret n;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun shift_rbuf(c: *TcpClient, consumed: i32) {
+    if (consumed >= c.rlen) {
+        c.rlen = 0;
+        ret;
+    }
+    val rem: i32 = c.rlen - consumed;
+    var i:   i32 = 0;
+    for (i < rem) {
+        c.rbuf[i] = c.rbuf[consumed + i];
+        i         = i + 1;
+    }
+    c.rlen = rem;
+}
+
+fun append_str(dst: *u8, at: i32, s: str) i32 {
+    var i: i32 = 0;
+    for (s[i] != 0) {
+        dst[at + i] = s[i];
+        i           = i + 1;
+    }
+    ret at + i;
+}
+
+fun append_dec(dst: *u8, at: i32, val_in: i32) i32 {
+    var digits: [16]u8;
+    var n:      i32 = 0;
+    var v:      i32 = val_in;
+    if (v <= 0) {
+        dst[at] = '0';
+        ret at + 1;
+    }
+    for (v > 0) {
+        digits[n] = ('0' + (v % 10))::u8;
+        n         = n + 1;
+        v         = v / 10;
+    }
+    var pos: i32 = at;
+    for (n > 0) {
+        n        = n - 1;
+        dst[pos] = digits[n];
+        pos      = pos + 1;
+    }
+    ret pos;
+}
+
+fun handle_http_net(slot: i32, hlen: i32, sock: *udp.Socket, r: *core.Relay, m: *Impair, now: i64) bool {
+    val c:   *TcpClient = ?tcp_clients[slot];
+    val buf: *u8        = ?c.rbuf[0];
+    # GET /net/<8-hex-cid>/<hex-packets> HTTP/1.1
+    var at: i32 = 9;
+    if (at + 8 > hlen) { ret 0; }
+    var cid: u32 = 0;
+    var k:   i32 = 0;
+    for (k < 8) {
+        val hv: i32 = hex_val(buf[at + k]);
+        if (hv < 0) { ret 0; }
+        cid = (cid << 4) | hv::u32;
+        k   = k + 1;
+    }
+    at = at + 8;
+    var addr: core.Addr;
+    addr.ip   = 0x7e000000 | ((cid >> 16) & 0xffff);
+    addr.port = (cid & 0xffff)::u16;
+
+    if (at < hlen && buf[at] == '/') {
+        at = at + 1;
+        var pkt:  [1500]u8;
+        var plen: i32 = 0;
+        for (at + 1 < hlen && buf[at] != ' ' && buf[at] != '?' && buf[at] != 13 && buf[at] != 10) {
+            if (buf[at] == '.' || buf[at] == '-') {
+                if (plen >= 16) {
+                    core.handle(r, ?pkt[0], plen, ?addr, now);
+                    flush(sock, r, m, now);
+                }
+                plen = 0;
+                at   = at + 1;
+                cnt;
+            }
+            val hi: i32 = hex_val(buf[at]);
+            val lo: i32 = hex_val(buf[at + 1]);
+            if (hi < 0 || lo < 0) { brk; }
+            if (plen < 1500) {
+                pkt[plen] = ((hi << 4) | lo)::u8;
+                plen      = plen + 1;
+            }
+            at = at + 2;
+        }
+        if (plen >= 16) {
+            core.handle(r, ?pkt[0], plen, ?addr, now);
+            flush(sock, r, m, now);
+        }
+    }
+
+    var resp: [4300]u8;
+    var body_ptr: *u8 = nil;
+    var body_len: i32 = 0;
+    var i: i32 = 0;
+    for (i < MAX_BOXES) {
+        if (http_boxes[i].used && http_boxes[i].addr.ip == addr.ip && http_boxes[i].addr.port == addr.port) {
+            body_ptr          = ?http_boxes[i].data[0];
+            body_len          = http_boxes[i].len;
+            http_boxes[i].len = 0;
+            http_boxes[i].last_ms = now;
+            brk;
+        }
+        i = i + 1;
+    }
+
+    var pos: i32 = append_str(?resp[0], 0, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ");
+    pos = append_dec(?resp[0], pos, body_len);
+    pos = append_str(?resp[0], pos, "\r\n\r\n");
+    if (body_len > 0 && body_ptr != nil) {
+        k = 0;
+        for (k < body_len) {
+            resp[pos + k] = body_ptr[k];
+            k             = k + 1;
+        }
+        pos = pos + body_len;
+    }
+    ret write_all(?c.stream, ?resp[0], pos);
+}
+
+fun step_tcp_client(slot: i32, sock: *udp.Socket, r: *core.Relay, m: *Impair, now: i64) {
+    val c: *TcpClient = ?tcp_clients[slot];
+    if (c.state == STATE_FREE) { ret; }
+
+    if (c.rlen < 4096) {
+        val got: res[usize, io_error.Error] = tcp.stream_read(?c.stream, ?c.rbuf[c.rlen], (4096 - c.rlen)::usize);
+        if (sel got.ok) {
+            if (got.ok == 0) {
+                close_tcp_client(slot);
+                ret;
+            }
+            c.rlen    = c.rlen + got.ok::i32;
+            c.last_ms = now;
+        }
+        or {
+            if (got.err.kind != io_error.WOULD_BLOCK && got.err.kind != io_error.TIMEOUT) {
+                close_tcp_client(slot);
+                ret;
+            }
+        }
+    }
+
+    if (c.state == STATE_HTTP) {
+        for (c.rlen > 0) {
+            val hlen: i32 = find_header_end(?c.rbuf[0], c.rlen);
+            if (hlen < 0) {
+                if (c.rlen >= 4096) { close_tcp_client(slot); }
+                ret;
+            }
+            var key: [64]u8;
+            val klen: i32 = find_ws_key(?c.rbuf[0], hlen, ?key[0]);
+            if (klen > 0) {
+                val guid: str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+                var g:    i32 = 0;
+                for (g < 36) {
+                    key[klen + g] = guid[g];
+                    g             = g + 1;
+                }
+                var digest: [20]u8;
+                sha1.hash(?key[0], (klen + 36)::usize, ?digest[0]);
+                var accept: [32]u8;
+                base64_20(?digest[0], ?accept[0]);
+
+                var resp: [256]u8;
+                var pos:  i32 = append_str(?resp[0], 0, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+                pos = append_str(?resp[0], pos, ?accept[0]);
+                pos = append_str(?resp[0], pos, "\r\n\r\n");
+                if (!write_all(?c.stream, ?resp[0], pos)) {
+                    close_tcp_client(slot);
+                    ret;
+                }
+                c.state = STATE_WS;
+                shift_rbuf(c, hlen);
+                brk;
+            }
+            if (hlen >= 17 && c.rbuf[0] == 'G' && c.rbuf[1] == 'E' && c.rbuf[2] == 'T' && c.rbuf[3] == ' ' && c.rbuf[4] == '/' && c.rbuf[5] == 'n' && c.rbuf[6] == 'e' && c.rbuf[7] == 't' && c.rbuf[8] == '/') {
+                if (!handle_http_net(slot, hlen, sock, r, m, now)) {
+                    close_tcp_client(slot);
+                    ret;
+                }
+                shift_rbuf(c, hlen);
+                cnt;
+            }
+            close_tcp_client(slot);
+            ret;
+        }
+    }
+
+    if (c.state == STATE_WS) {
+        for (c.rlen >= 2) {
+            val b0:     u8   = c.rbuf[0];
+            val b1:     u8   = c.rbuf[1];
+            val opcode: u8   = b0 & 0x0f;
+            val masked: bool = (b1 & 0x80) != 0;
+            var plen:   i32  = (b1 & 0x7f)::i32;
+            var hlen:   i32  = 2;
+            if (plen == 126) {
+                if (c.rlen < 4) { brk; }
+                plen = (c.rbuf[2]::i32 << 8) | c.rbuf[3]::i32;
+                hlen = 4;
+            }
+            or (plen == 127) {
+                close_tcp_client(slot);
+                ret;
+            }
+            if (masked) { hlen = hlen + 4; }
+            if (plen > 1500) {
+                close_tcp_client(slot);
+                ret;
+            }
+            if (c.rlen < hlen + plen) { brk; }
+
+            var pkt: [1500]u8;
+            var k:   i32 = 0;
+            if (masked) {
+                val moff: i32 = hlen - 4;
+                for (k < plen) {
+                    pkt[k] = c.rbuf[hlen + k] ^ c.rbuf[moff + (k & 3)];
+                    k      = k + 1;
+                }
+            }
+            or {
+                for (k < plen) {
+                    pkt[k] = c.rbuf[hlen + k];
+                    k      = k + 1;
+                }
+            }
+            shift_rbuf(c, hlen + plen);
+
+            if (opcode == 8) {
+                close_tcp_client(slot);
+                ret;
+            }
+            if (opcode == 9) {
+                ws_send_frame(slot, 10, ?pkt[0], plen);
+                cnt;
+            }
+            if ((opcode == 1 || opcode == 2) && plen >= 16) {
+                var a: core.Addr;
+                a.ip   = 0x7f000000 | slot::u32;
+                a.port = c.gen;
+                core.handle(r, ?pkt[0], plen, ?a, now);
+                flush(sock, r, m, now);
+            }
+        }
+    }
+}
+
+fun poll_tcp(ln: *tcp.Listener, has_ln: bool, sock: *udp.Socket, r: *core.Relay, m: *Impair, now: i64) i32 {
+    if (has_ln) {
+        for {
+            val acc: res[tcp.Stream, io_error.Error] = tcp.accept_with_flags(ln, socket_api.async_flags());
+            if (sel acc.err) { brk; }
+            var stream: tcp.Stream = acc.ok;
+            socket_api.set_bool(stream.handle, socket_api.NO_DELAY, 1);
+            var slot:   i32 = -1;
+            var oldest: i32 = 0;
+            var i:      i32 = 0;
+            for (i < MAX_TCP) {
+                if (tcp_clients[i].state == STATE_FREE) {
+                    slot = i;
+                    brk;
+                }
+                if (tcp_clients[i].last_ms < tcp_clients[oldest].last_ms) {
+                    oldest = i;
+                }
+                i = i + 1;
+            }
+            if (slot < 0) {
+                close_tcp_client(oldest);
+                slot = oldest;
+            }
+            next_gen = next_gen + 1;
+            if (next_gen == 0) { next_gen = 1; }
+            tcp_clients[slot].state   = STATE_HTTP;
+            tcp_clients[slot].gen     = next_gen;
+            tcp_clients[slot].stream  = stream;
+            tcp_clients[slot].last_ms = now;
+            tcp_clients[slot].rlen    = 0;
+        }
+    }
+    var active: i32 = 0;
+    var i:      i32 = 0;
+    for (i < MAX_TCP) {
+        if (tcp_clients[i].state != STATE_FREE) {
+            if (now - tcp_clients[i].last_ms > 60000) {
+                close_tcp_client(i);
+            }
+            or {
+                step_tcp_client(i, sock, r, m, now);
+                if (tcp_clients[i].state != STATE_FREE) { active = active + 1; }
+            }
+        }
+        i = i + 1;
+    }
+    ret active;
+}
+
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     var hostbuf: [256]u8;
@@ -385,7 +891,9 @@ fun main(argc: i64, argv: **u8) i64 {
         addr = parsed.ok;
     }
     or {
-        val looked: res[bool, dnstypes.Error] = dns.resolve(bindhost, ?addr);
+        var scope: cancel.Scope;
+        cancel.make_root(?scope, opt[time.Instant].none{});
+        val looked: res[bool, dnstypes.Error] = dns.resolve(?scope, bindhost, ?addr);
         if (sel looked.err) {
             print.eprintlnf("relay: cannot resolve {}", bindhost);
             ret 1;
@@ -402,10 +910,22 @@ fun main(argc: i64, argv: **u8) i64 {
         ret 1;
     }
     var sock: udp.Socket = bound.ok;
-    # a held datagram must not wait on a quiet socket
-    var timeout: u64 = 100;
+    var timeout: u64 = 10;
     if (m.delay > 0 || m.jitter > 0) { timeout = 1; }
     udp.socket_set_recv_timeout(?sock, timeout);
+
+    var tcpportbuf: [32]u8;
+    var tcpport:    i64 = 5030;
+    val tcpportenv: str = setting("RELAY_TCP_PORT", ?tcpportbuf[0], 32);
+    if (tcpportenv != nil) { tcpport = number(tcpportenv, 5030); }
+    var tcp_ln:     tcp.Listener;
+    var has_tcp:    bool = 0;
+    val tcp_bound:  res[tcp.Listener, io_error.Error] = tcp.listen_with_flags(ip.endpoint(0, 0, 0, 0, tcpport::u16), 64, socket_api.async_flags());
+    if (sel tcp_bound.ok) {
+        tcp_ln  = tcp_bound.ok;
+        has_tcp = 1;
+        print.printlnf("relay: WebSocket and HTTP bridge listening on 0.0.0.0:{}", tcpport);
+    }
 
     var r: core.Relay;
     r.maxrooms = maxrooms::i32;
@@ -434,12 +954,13 @@ fun main(argc: i64, argv: **u8) i64 {
     if (m.on) { print.printlnf("relay: impaired: drop {}% duplicate {}% reorder {}%", m.drop, m.dup, m.reorder); }
     if (m.delay > 0 || m.jitter > 0) { print.printlnf("relay: delayed: {} ms plus up to {} ms", m.delay, m.jitter); }
 
-    var buf:      [1500]u8;
-    var lasttick: i64 = millis();
-    var lastlog:  i64 = lasttick;
-    var lastread: i64 = 0;
+    var buf:        [1500]u8;
+    var lasttick:   i64 = millis();
+    var lastlog:    i64 = lasttick;
+    var lastread:   i64 = 0;
     var lastleague: i64 = -60000;
-    var lastrooms: i32 = 0;
+    var lastrooms:  i32 = 0;
+    var curtimeout: u64 = timeout;
     for {
         var from: ip.Endpoint;
         val got:  res[usize, io_error.Error] = udp.recv_from(?sock, ?buf[0], 1500, ?from);
@@ -454,6 +975,13 @@ fun main(argc: i64, argv: **u8) i64 {
                 core.handle(?r, ?buf[0], got.ok::i32, ?a, now);
                 flush(?sock, ?r, ?m, now);
             }
+        }
+        val tcp_active: i32 = poll_tcp(?tcp_ln, has_tcp, ?sock, ?r, ?m, now);
+        var want_to:    u64 = 10;
+        if (tcp_active > 0 || lastrooms > 0 || m.delay > 0 || m.jitter > 0) { want_to = 1; }
+        if (want_to != curtimeout) {
+            curtimeout = want_to;
+            udp.socket_set_recv_timeout(?sock, curtimeout);
         }
 
         if (now - lasttick >= 250) {

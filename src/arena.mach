@@ -1991,6 +1991,719 @@ fun rest(began: i64, duty: i64) {
     }
 }
 
+# ----------------------------------------- population evolution and holdout
+#
+# Evolve a population of co-op nets and judge candidates on unseen holdout
+# seeds in pure Mach, using the arena's own deterministic simulation in
+# process without external scripts.
+#
+#   arena <wad> <first net> evolve <directory> [<gens> [<elites> [<children>]]]
+#   arena <wad> <net> holdout [<other net> ...] [<seeds>]
+
+val EVOLVE_W2:      i32 = 48 * 24 + 24;
+val EVOLVE_ELITES:  i32 = 6;
+val EVOLVE_CHILDS:  i32 = 10;
+val EVOLVE_POOL:    i32 = 16;
+val EVOLVE_WINDOW:  i32 = 4;
+val EVOLVE_DIVERSE: i32 = 60;
+val EVOLVE_SCORING: i32 = 2;
+# side (1), turn (2), fire (3), switch (5)
+val EVOLVE_OUTMASK: i32 = 46;
+
+val LAYERS_OUT:        i32 = 0;
+val LAYERS_OUT_FOE:    i32 = 1;
+val LAYERS_OUT_SENSES: i32 = 2;
+val LAYERS_ALL:        i32 = 3;
+
+val EVOLVE_DEFAULT_MAPS: [6]i32 = [6]i32{3, 4, 5, 6, 7, 9};
+
+rec PopElite {
+    id:       i32;
+    born:     i32;
+    parent:   i32;
+    sigma:    i32;
+    nscores:  i32;
+    scores:   [4]i32;
+    last:     i32;
+    is_child: bool;
+    net:      [1326]i8;
+}
+
+rec PopState {
+    gen:     i32;
+    next_id: i32;
+    scoring: i32;
+    nelites: i32;
+    elites:  [6]PopElite;
+    anchor:  [1326]i8;
+}
+
+val POP_ELITE_BYTES: i32 = 40 + 1326;
+val POP_HEAD_BYTES:  i32 = 20 + 1326;
+val POP_FILE_BYTES:  i32 = 20 + 1326 + 6 * (40 + 1326);
+
+# how long a judging game may run: eight minutes, or twenty for E1M6 and E1M7
+fun eval_tics(map: i32) i32 {
+    if (map == 6 || map == 7) { ret 42000; }
+    ret 16800;
+}
+
+# what one judging game is worth: 1000 for finishing (plus up to 168 more
+# in proportion to time remaining), 2 per step of closest approach to the
+# exit below 200, less 3 per death
+fun eval_score(map: i32, finished: bool, tics: i32, nearest: i32, deaths: i32) i32 {
+    var near: i32 = nearest;
+    if (near <= 0 || near > 200) { near = 200; }
+    var sc: i32 = 2 * (200 - near) - 3 * deaths;
+    if (finished) {
+        var limit: i32 = eval_tics(map);
+        if (limit <= 0) { limit = 16800; }
+        var left: i32 = limit - tics;
+        if (left < 0) { left = 0; }
+        sc = sc + 1000 + (168 * left) / limit;
+    }
+    ret sc;
+}
+
+fun evolve_is_out_weight(idx: i32, out_mask: i32) bool {
+    if (idx < EVOLVE_W2 || idx >= NET) { ret 0; }
+    var k: i32 = 0;
+    if (idx < EVOLVE_W2 + bot.HIDDEN * bot.OUTPUTS) {
+        k = (idx - EVOLVE_W2) / bot.HIDDEN;
+    }
+    or {
+        k = idx - (EVOLVE_W2 + bot.HIDDEN * bot.OUTPUTS);
+    }
+    ret (out_mask & (1 << k)) != 0;
+}
+
+fun evolve_is_in_weight(idx: i32, layer_mode: i32) bool {
+    if (idx < 0 || idx >= EVOLVE_W2) { ret 0; }
+    if (layer_mode == LAYERS_ALL) { ret 1; }
+    if (idx >= bot.INPUTS * bot.HIDDEN) { ret 0; }
+    val sense: i32 = idx % bot.INPUTS;
+    if (layer_mode == LAYERS_OUT_FOE) { ret sense == bot.F_FOEKIND; }
+    if (layer_mode == LAYERS_OUT_SENSES) {
+        ret sense == bot.F_FOEKIND || (sense >= bot.INPUTS_V1 && sense < bot.INPUTS);
+    }
+    ret 0;
+}
+
+fun evolve_distance(a: *i8, b: *i8, layer_mode: i32, out_mask: i32) i32 {
+    var sum: i32 = 0;
+    var i:   i32 = 0;
+    for (i < NET) {
+        if (evolve_is_out_weight(i, out_mask) || evolve_is_in_weight(i, layer_mode)) {
+            var d: i32 = a[i]::i32 - b[i]::i32;
+            if (d < 0) { d = -d; }
+            sum = sum + d;
+        }
+        i = i + 1;
+    }
+    ret sum;
+}
+
+fun evolve_mutate(from: *i8, to: *i8, sigma: i32, rate_pct: i32, layer_mode: i32, out_mask: i32) {
+    var out_sig: i32 = sigma;
+    if (out_sig < 1)  { out_sig = 1; }
+    if (out_sig > 12) { out_sig = 12; }
+    var in_sig: i32 = out_sig / 3;
+    if (in_sig < 1) { in_sig = 1; }
+    var in_rate: i32 = rate_pct / 4;
+    if (in_rate < 1) { in_rate = 1; }
+    var i: i32 = 0;
+    for (i < NET) {
+        var w: i32 = from[i]::i32;
+        if (evolve_is_out_weight(i, out_mask)) {
+            if (below(100) < rate_pct) {
+                w = w + below(2 * out_sig + 1) + below(2 * out_sig + 1) - 2 * out_sig;
+                if (w > 127)  { w = 127; }
+                if (w < -127) { w = -127; }
+            }
+        }
+        or (evolve_is_in_weight(i, layer_mode)) {
+            if (below(100) < in_rate) {
+                w = w + below(2 * in_sig + 1) + below(2 * in_sig + 1) - 2 * in_sig;
+                if (w > 127)  { w = 127; }
+                if (w < -127) { w = -127; }
+            }
+        }
+        to[i] = w::i8;
+        i     = i + 1;
+    }
+}
+
+fun elite_mean(e: *PopElite) i32 {
+    if (e.nscores <= 0) { ret -1000000000; }
+    var sum: i32 = 0;
+    var i:   i32 = 0;
+    for (i < e.nscores) {
+        sum = sum + e.scores[i];
+        i   = i + 1;
+    }
+    ret sum / e.nscores;
+}
+
+fun elite_record_score(e: *PopElite, sc: i32, finished: i32) {
+    if (e.nscores < EVOLVE_WINDOW) {
+        e.scores[e.nscores] = sc;
+        e.nscores           = e.nscores + 1;
+    }
+    or {
+        var i: i32 = 0;
+        for (i < EVOLVE_WINDOW - 1) {
+            e.scores[i] = e.scores[i + 1];
+            i           = i + 1;
+        }
+        e.scores[EVOLVE_WINDOW - 1] = sc;
+    }
+    e.last = finished;
+}
+
+fun evolve_select(pool: *PopElite, npool: i32, out_elites: *PopElite, max_elites: i32, diverse: i32, layer_mode: i32, out_mask: i32, out_children_kept: *i32) i32 {
+    var order: [16]i32;
+    var i:     i32 = 0;
+    for (i < npool) {
+        order[i] = i;
+        i        = i + 1;
+    }
+    i = 1;
+    for (i < npool) {
+        val who:   i32 = order[i];
+        val wmean: i32 = elite_mean(?pool[who]);
+        var j:     i32 = i;
+        for (j > 0 && elite_mean(?pool[order[j - 1]]) < wmean) {
+            order[j] = order[j - 1];
+            j        = j - 1;
+        }
+        order[j] = who;
+        i        = i + 1;
+    }
+    var kept_count:    i32 = 0;
+    var children_kept: i32 = 0;
+    i = 0;
+    for (i < npool && kept_count < max_elites) {
+        val cand: *PopElite = ?pool[order[i]];
+        if (cand.nscores <= 0 && cand.is_child) {
+            i = i + 1;
+            cnt;
+        }
+        var distinct: bool = 1;
+        var k:        i32  = 0;
+        for (k < kept_count) {
+            if (evolve_distance(?cand.net[0], ?out_elites[k].net[0], layer_mode, out_mask) < diverse) {
+                distinct = 0;
+                brk;
+            }
+            k = k + 1;
+        }
+        if (distinct) {
+            out_elites[kept_count]          = @cand;
+            out_elites[kept_count].is_child = 0;
+            if (cand.is_child) { children_kept = children_kept + 1; }
+            kept_count = kept_count + 1;
+        }
+        i = i + 1;
+    }
+    @out_children_kept = children_kept;
+    ret kept_count;
+}
+
+fun elite_name(id: i32, born: i32, out: *u8) i32 {
+    if (id < 0) { ret join(out, 0, "anchor"); }
+    var prefix: str = "c";
+    if (born == 0 && id < EVOLVE_ELITES) { prefix = "e"; }
+    var at: i32 = join(out, 0, prefix);
+    at = join_number(out, at, id::i64);
+    ret at;
+}
+
+fun read_net_file(a: *allocator.Allocator, path: str, out: *i8) bool {
+    val raw: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel raw.err) { ret 0; }
+    if (raw.ok.len == NET::usize) {
+        var c: i32 = 0;
+        for (c < NET) {
+            out[c] = raw.ok.data[c]:~i8;
+            c      = c + 1;
+        }
+        ret 1;
+    }
+    if (raw.ok.len == bot.NETSIZE_V1::usize) {
+        bot.widen(raw.ok.data:~*i8, out);
+        ret 1;
+    }
+    ret 0;
+}
+
+fun parse_maps(text: str, out: *i32, max_maps: i32) i32 {
+    var n:   i32  = 0;
+    var i:   i32  = 0;
+    var cur: i32  = 0;
+    var has: bool = 0;
+    for (text[i] != 0) {
+        val ch: u8 = text[i];
+        if (ch >= '0' && ch <= '9') {
+            cur = cur * 10 + (ch - '0')::i32;
+            has = 1;
+        }
+        or (ch == ',') {
+            if (has && cur >= 1 && cur <= 9 && n < max_maps) {
+                out[n] = cur;
+                n      = n + 1;
+            }
+            cur = 0;
+            has = 0;
+        }
+        i = i + 1;
+    }
+    if (has && cur >= 1 && cur <= 9 && n < max_maps) {
+        out[n] = cur;
+        n      = n + 1;
+    }
+    ret n;
+}
+
+fun save_pop(ps: *PopState, dir: str, buf: *u8) bool {
+    buf[0] = 'M';
+    buf[1] = 'D';
+    buf[2] = 'P';
+    buf[3] = '2';
+    var at: i32 = put32(buf, 4, ps.gen);
+    at = put32(buf, at, ps.next_id);
+    at = put32(buf, at, ps.scoring);
+    at = put32(buf, at, ps.nelites);
+    var k: i32 = 0;
+    for (k < NET) {
+        buf[at + k] = ps.anchor[k]:~u8;
+        k           = k + 1;
+    }
+    at = at + NET;
+    var i: i32 = 0;
+    for (i < ps.nelites) {
+        val e: *PopElite = ?ps.elites[i];
+        at = put32(buf, at, e.id);
+        at = put32(buf, at, e.born);
+        at = put32(buf, at, e.parent);
+        at = put32(buf, at, e.sigma);
+        at = put32(buf, at, e.nscores);
+        var sidx: i32 = 0;
+        for (sidx < EVOLVE_WINDOW) {
+            at   = put32(buf, at, e.scores[sidx]);
+            sidx = sidx + 1;
+        }
+        at = put32(buf, at, e.last);
+        k  = 0;
+        for (k < NET) {
+            buf[at + k] = e.net[k]:~u8;
+            k           = k + 1;
+        }
+        at = at + NET;
+        i  = i + 1;
+    }
+    if (!replace(dir, "pop.bin", buf, at)) { ret 0; }
+    replace(dir, "anchor.net", (?ps.anchor[0]):~*u8, NET);
+    if (ps.nelites > 0) {
+        replace(dir, "champion.net", (?ps.elites[0].net[0]):~*u8, NET);
+    }
+    var jbuf: [8192]u8;
+    var jat:  i32 = join(?jbuf[0], 0, "{\"gen\":");
+    jat = join_number(?jbuf[0], jat, ps.gen::i64);
+    jat = join(?jbuf[0], jat, ",\"next\":");
+    jat = join_number(?jbuf[0], jat, ps.next_id::i64);
+    jat = join(?jbuf[0], jat, ",\"scoring\":");
+    jat = join_number(?jbuf[0], jat, ps.scoring::i64);
+    jat = join(?jbuf[0], jat, ",\"elites\":[");
+    i = 0;
+    for (i < ps.nelites) {
+        val e: *PopElite = ?ps.elites[i];
+        var ename: [32]u8;
+        var pname: [32]u8;
+        var fname: [40]u8;
+        val elen: i32 = elite_name(e.id, e.born, ?ename[0]);
+        elite_name(e.parent, 0, ?pname[0]);
+        var fat: i32 = join(?fname[0], 0, ?ename[0]);
+        fat = join(?fname[0], fat, ".net");
+        replace(dir, ?fname[0], (?e.net[0]):~*u8, NET);
+        if (i > 0) { jat = join(?jbuf[0], jat, ","); }
+        jat = join(?jbuf[0], jat, "{\"name\":\"");
+        if (elen > 0) { jat = join(?jbuf[0], jat, ?ename[0]); }
+        jat = join(?jbuf[0], jat, "\",\"sigma\":");
+        jat = join_number(?jbuf[0], jat, e.sigma::i64);
+        jat = join(?jbuf[0], jat, ",\"scores\":[");
+        var sidx: i32 = 0;
+        for (sidx < e.nscores) {
+            if (sidx > 0) { jat = join(?jbuf[0], jat, ","); }
+            jat  = join_number(?jbuf[0], jat, e.scores[sidx]::i64);
+            sidx = sidx + 1;
+        }
+        jat = join(?jbuf[0], jat, "],\"born\":");
+        jat = join_number(?jbuf[0], jat, e.born::i64);
+        jat = join(?jbuf[0], jat, ",\"parent\":\"");
+        jat = join(?jbuf[0], jat, ?pname[0]);
+        jat = join(?jbuf[0], jat, "\",\"last\":");
+        jat = join_number(?jbuf[0], jat, e.last::i64);
+        jat = join(?jbuf[0], jat, "}");
+        i = i + 1;
+    }
+    jat = join(?jbuf[0], jat, "]}\n");
+    replace(dir, "state.json", ?jbuf[0], jat);
+    ret 1;
+}
+
+fun load_pop(ps: *PopState, a: *allocator.Allocator, dir: str) bool {
+    var path: [512]u8;
+    var at:   i32 = join(?path[0], 0, dir);
+    at = join(?path[0], at, "/pop.bin");
+    val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    if (sel bytes.err) { ret 0; }
+    val p:   *u8 = bytes.ok.data;
+    val len: i32 = bytes.ok.len::i32;
+    if (len < POP_HEAD_BYTES) { ret 0; }
+    if (p[0] != 'M' || p[1] != 'D' || p[2] != 'P' || p[3] != '2') { ret 0; }
+    val nel: i32 = get32(p, 16);
+    if (nel < 1 || nel > EVOLVE_ELITES) { ret 0; }
+    if (len != POP_HEAD_BYTES + nel * POP_ELITE_BYTES) { ret 0; }
+    ps.gen     = get32(p, 4);
+    ps.next_id = get32(p, 8);
+    ps.scoring = get32(p, 12);
+    ps.nelites = nel;
+    var k: i32 = 0;
+    for (k < NET) {
+        ps.anchor[k] = p[20 + k]:~i8;
+        k            = k + 1;
+    }
+    at = POP_HEAD_BYTES;
+    var i: i32 = 0;
+    for (i < nel) {
+        val e: *PopElite = ?ps.elites[i];
+        e.id       = get32(p, at);
+        e.born     = get32(p, at + 4);
+        e.parent   = get32(p, at + 8);
+        e.sigma    = get32(p, at + 12);
+        e.nscores  = get32(p, at + 16);
+        if (e.nscores < 0)             { e.nscores = 0; }
+        if (e.nscores > EVOLVE_WINDOW) { e.nscores = EVOLVE_WINDOW; }
+        var sidx: i32 = 0;
+        for (sidx < EVOLVE_WINDOW) {
+            e.scores[sidx] = get32(p, at + 20 + sidx * 4);
+            sidx           = sidx + 1;
+        }
+        e.last     = get32(p, at + 36);
+        e.is_child = 0;
+        at = at + 40;
+        k  = 0;
+        for (k < NET) {
+            e.net[k] = p[at + k]:~i8;
+            k        = k + 1;
+        }
+        at = at + NET;
+        i  = i + 1;
+    }
+    if (ps.scoring != EVOLVE_SCORING) {
+        i = 0;
+        for (i < ps.nelites) {
+            ps.elites[i].nscores = 0;
+            i                    = i + 1;
+        }
+        ps.scoring = EVOLVE_SCORING;
+    }
+    var apath: [512]u8;
+    var aat:   i32 = join(?apath[0], 0, dir);
+    aat = join(?apath[0], aat, "/anchor.net");
+    if (!read_net_file(a, ?apath[0], ?ps.anchor[0])) {
+        var ppath: [512]u8;
+        var pat:   i32 = join(?ppath[0], 0, dir);
+        pat = join(?ppath[0], pat, "/../anchor.net");
+        read_net_file(a, ?ppath[0], ?ps.anchor[0]);
+    }
+    ret 1;
+}
+
+fun append_line(dir: str, name: str, data: *u8, len: i32) bool {
+    var path: [512]u8;
+    var at:   i32 = join(?path[0], 0, dir);
+    at = join(?path[0], at, "/");
+    at = join(?path[0], at, name);
+    var handle: usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(os.working_dir(), ?path[0], os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644, ?handle);
+    if (opened < 0) { ret 0; }
+    os.write(handle, data, len::usize);
+    var nl: [2]u8;
+    nl[0] = '\n';
+    os.write(handle, ?nl[0], 1);
+    os.close(handle);
+    ret 1;
+}
+
+fun json_find_key(buf: *u8, start: i32, end: i32, key: str) i32 {
+    var klen: i32 = 0;
+    for (key[klen] != 0) { klen = klen + 1; }
+    var i: i32 = start;
+    for (i + klen < end) {
+        var ok: bool = 1;
+        var j:  i32  = 0;
+        for (j < klen) {
+            if (buf[i + j] != key[j]) {
+                ok = 0;
+                brk;
+            }
+            j = j + 1;
+        }
+        if (ok) {
+            var p: i32 = i + klen;
+            for (p < end && (buf[p] == ' ' || buf[p] == '\t' || buf[p] == '\r' || buf[p] == '\n')) { p = p + 1; }
+            if (p < end && buf[p] == ':') {
+                p = p + 1;
+                for (p < end && (buf[p] == ' ' || buf[p] == '\t' || buf[p] == '\r' || buf[p] == '\n')) { p = p + 1; }
+                ret p;
+            }
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun json_read_int(buf: *u8, at: i32, end: i32, fallback: i32) i32 {
+    var p: i32 = at;
+    for (p < end && (buf[p] == ' ' || buf[p] == '\t' || buf[p] == '\r' || buf[p] == '\n' || buf[p] == '"' || buf[p] == 'c' || buf[p] == 'e')) {
+        p = p + 1;
+    }
+    var sign: i32 = 1;
+    if (p < end && buf[p] == '-') {
+        sign = -1;
+        p    = p + 1;
+    }
+    var cur: i32  = 0;
+    var has: bool = 0;
+    for (p < end && buf[p] >= '0' && buf[p] <= '9') {
+        cur = cur * 10 + (buf[p] - '0')::i32;
+        has = 1;
+        p   = p + 1;
+    }
+    if (!has) { ret fallback; }
+    if (p < end && buf[p] == '.' && p + 1 < end && buf[p + 1] >= '5' && buf[p + 1] <= '9') {
+        cur = cur + 1;
+    }
+    ret cur * sign;
+}
+
+fun json_read_str(buf: *u8, at: i32, end: i32, out: *u8, max_len: i32) i32 {
+    var p: i32 = at;
+    for (p < end && buf[p] != '"') { p = p + 1; }
+    if (p >= end) {
+        out[0] = 0;
+        ret 0;
+    }
+    p = p + 1;
+    var n: i32 = 0;
+    for (p < end && buf[p] != '"' && n < max_len - 1) {
+        out[n] = buf[p];
+        n      = n + 1;
+        p      = p + 1;
+    }
+    out[n] = 0;
+    ret n;
+}
+
+fun load_pop_json(ps: *PopState, a: *allocator.Allocator, dir: str, first: *i8) bool {
+    var path: [512]u8;
+    var at:   i32 = join(?path[0], 0, dir);
+    at = join(?path[0], at, "/state.json");
+    val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    if (sel bytes.err) { ret 0; }
+    val p:   *u8 = bytes.ok.data;
+    val len: i32 = bytes.ok.len::i32;
+    val gat: i32 = json_find_key(p, 0, len, "\"gen\"");
+    val nat: i32 = json_find_key(p, 0, len, "\"next\"");
+    val eat: i32 = json_find_key(p, 0, len, "\"elites\"");
+    if (gat < 0 || nat < 0 || eat < 0) { ret 0; }
+
+    ps.gen     = json_read_int(p, gat, len, 0);
+    ps.next_id = json_read_int(p, nat, len, EVOLVE_ELITES);
+    ps.scoring = EVOLVE_SCORING;
+    ps.nelites = 0;
+
+    var k: i32 = 0;
+    for (k < NET) {
+        ps.anchor[k] = first[k];
+        k            = k + 1;
+    }
+    var apath: [512]u8;
+    var aat:   i32 = join(?apath[0], 0, dir);
+    aat = join(?apath[0], aat, "/anchor.net");
+    if (!read_net_file(a, ?apath[0], ?ps.anchor[0])) {
+        var ppath: [512]u8;
+        var pat:   i32 = join(?ppath[0], 0, dir);
+        pat = join(?ppath[0], pat, "/../anchor.net");
+        read_net_file(a, ?ppath[0], ?ps.anchor[0]);
+    }
+
+    var cur: i32 = eat;
+    for (cur < len && ps.nelites < EVOLVE_ELITES) {
+        for (cur < len && p[cur] != '{' && p[cur] != ']') { cur = cur + 1; }
+        if (cur >= len || p[cur] == ']') { brk; }
+        var obj_end: i32 = cur + 1;
+        var depth:   i32 = 1;
+        for (obj_end < len && depth > 0) {
+            if (p[obj_end] == '{') { depth = depth + 1; }
+            if (p[obj_end] == '}') { depth = depth - 1; }
+            obj_end = obj_end + 1;
+        }
+        val nkey: i32 = json_find_key(p, cur, obj_end, "\"name\"");
+        val skey: i32 = json_find_key(p, cur, obj_end, "\"sigma\"");
+        val bkey: i32 = json_find_key(p, cur, obj_end, "\"born\"");
+        val pkey: i32 = json_find_key(p, cur, obj_end, "\"parent\"");
+        val lkey: i32 = json_find_key(p, cur, obj_end, "\"last\"");
+        val ckey: i32 = json_find_key(p, cur, obj_end, "\"scores\"");
+        if (nkey >= 0) {
+            var ename: [32]u8;
+            val nlen:  i32 = json_read_str(p, nkey, obj_end, ?ename[0], 32);
+            if (nlen > 0) {
+                var npath: [512]u8;
+                var npat:  i32 = join(?npath[0], 0, dir);
+                npat = join(?npath[0], npat, "/");
+                npat = join(?npath[0], npat, ?ename[0]);
+                npat = join(?npath[0], npat, ".net");
+                val e: *PopElite = ?ps.elites[ps.nelites];
+                var blank: PopElite;
+                @e = blank;
+                if (read_net_file(a, ?npath[0], ?e.net[0])) {
+                    e.id = json_read_int(?ename[0], 0, nlen, ps.nelites);
+                    e.sigma = 4;
+                    if (skey >= 0) { e.sigma = json_read_int(p, skey, obj_end, 4); }
+                    if (e.sigma < 1)  { e.sigma = 1; }
+                    if (e.sigma > 12) { e.sigma = 12; }
+                    if (bkey >= 0) { e.born = json_read_int(p, bkey, obj_end, 0); }
+                    if (lkey >= 0) { e.last = json_read_int(p, lkey, obj_end, 0); }
+                    e.parent = -1;
+                    if (pkey >= 0) {
+                        var pname: [32]u8;
+                        val plen:  i32 = json_read_str(p, pkey, obj_end, ?pname[0], 32);
+                        if (plen > 0 && pname[0] != 'a') {
+                            e.parent = json_read_int(?pname[0], 0, plen, 0);
+                        }
+                    }
+                    e.nscores = 0;
+                    if (ckey >= 0) {
+                        var sp: i32 = ckey;
+                        for (sp < obj_end && p[sp] != '[') { sp = sp + 1; }
+                        if (sp < obj_end && p[sp] == '[') {
+                            sp = sp + 1;
+                            for (sp < obj_end && p[sp] != ']' && e.nscores < EVOLVE_WINDOW) {
+                                for (sp < obj_end && (p[sp] == ' ' || p[sp] == '\t' || p[sp] == '\r' || p[sp] == '\n' || p[sp] == ',')) { sp = sp + 1; }
+                                if (sp >= obj_end || p[sp] == ']') { brk; }
+                                e.scores[e.nscores] = json_read_int(p, sp, obj_end, 0);
+                                e.nscores           = e.nscores + 1;
+                                for (sp < obj_end && p[sp] != ',' && p[sp] != ']') { sp = sp + 1; }
+                            }
+                        }
+                    }
+                    ps.nelites = ps.nelites + 1;
+                }
+            }
+        }
+        cur = obj_end;
+    }
+    ret ps.nelites > 0;
+}
+
+fun fresh_pop(ps: *PopState, first: *i8, nelites: i32, rate_pct: i32, layer_mode: i32, out_mask: i32) {
+    ps.gen     = 0;
+    ps.next_id = nelites;
+    ps.scoring = EVOLVE_SCORING;
+    ps.nelites = nelites;
+    var k: i32 = 0;
+    for (k < NET) {
+        ps.anchor[k]          = first[k];
+        ps.elites[0].net[k]   = first[k];
+        k                     = k + 1;
+    }
+    ps.elites[0].id       = 0;
+    ps.elites[0].born     = 0;
+    ps.elites[0].parent   = -1;
+    ps.elites[0].sigma    = 4;
+    ps.elites[0].nscores  = 0;
+    ps.elites[0].last     = 0;
+    ps.elites[0].is_child = 0;
+    var i: i32 = 1;
+    for (i < nelites) {
+        val e: *PopElite = ?ps.elites[i];
+        e.id       = i;
+        e.born     = 0;
+        e.parent   = 0;
+        e.sigma    = 2 + i;
+        e.nscores  = 0;
+        e.last     = 0;
+        e.is_child = 0;
+        evolve_mutate(?ps.anchor[0], ?e.net[0], 6, rate_pct, layer_mode, out_mask);
+        var tries: i32 = 0;
+        for (tries < 6) {
+            var far_enough: bool = 1;
+            var j:          i32  = 0;
+            for (j < i) {
+                if (evolve_distance(?e.net[0], ?ps.elites[j].net[0], layer_mode, out_mask) < EVOLVE_DIVERSE) {
+                    far_enough = 0;
+                    brk;
+                }
+                j = j + 1;
+            }
+            if (far_enough) { brk; }
+            evolve_mutate(?e.net[0], ?e.net[0], 6, rate_pct, layer_mode, out_mask);
+            tries = tries + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# play one level on an existing Session for evaluation or training
+fun eval_run(s: *game.Session, net: *i8, map: i32, gseed: u32, tics: i32, out_done: *bool, out_deaths: *i32, out_nearest: *i32, out_tics: *i32, out_acid: *i32) bool {
+    if (!game.coop_game(s, 4, 0, defs.SK_NIGHTMARE, map)) { ret 0; }
+    var skip: u32 = gseed & 255;
+    for (skip > 0) { defs.p_random(?s.g); skip = skip - 1; }
+    var i: i32 = 0;
+    for (i < 4) {
+        game.set_bot(s, i, bot.KIND_NET, net, ((0x9e3779b9 * (i + 1):~u32) ^ (gseed * 0x85ebca6b)) | 1);
+        i = i + 1;
+    }
+    var cmds:   [4]defs.Ticcmd;
+    var deaths: [4]i32;
+    var dead:   [4]bool;
+    var acid:   i32 = 0;
+    var tic:    i32 = 0;
+    for (tic < tics && !s.completed && !s.broken) {
+        game.ticker_cmds(s, ?cmds[0]);
+        i = 0;
+        for (i < 4) {
+            val now: bool = s.g.players[i].playerstate == defs.PST_DEAD;
+            val pm: *defs.Mobj = s.g.players[i].mo;
+            if (!now && pm != nil && s.g.players[i].powers[defs.PW_IRONFEET] == 0 && pm.z <= pm.floorz) {
+                val special: i32 = s.g.lv.sectors[s.g.lv.subsectors[pm.subsector].sector].special::i32;
+                if (special == 4 || special == 5 || special == 7 || special == 16) { acid = acid + 1; }
+            }
+            if (now && !dead[i]) { deaths[i] = deaths[i] + 1; }
+            dead[i] = now;
+            i = i + 1;
+        }
+        tic = tic + 1;
+    }
+    var total_deaths: i32 = 0;
+    var best_near:    i32 = 0;
+    i = 0;
+    for (i < 4) {
+        total_deaths = total_deaths + deaths[i];
+        val gb: i32 = s.bots[i].goalbest;
+        if (gb > 0 && (best_near == 0 || gb < best_near)) { best_near = gb; }
+        i = i + 1;
+    }
+    @out_done    = s.completed && !s.capped;
+    @out_deaths  = total_deaths;
+    @out_nearest = best_near;
+    @out_tics    = tic;
+    @out_acid    = acid;
+    ret 1;
+}
+
 # one level for judging a net (see main): seeded as doom's coopmatch seeds
 # it, so the same net, map and seed play the same game on every machine
 fun evalmatch(a: *allocator.Allocator, w: *wad.Wad, d: *rdata.Data, net: *i8, map: i32, seed: u32, tics: i32) i64 {
@@ -2040,10 +2753,505 @@ fun evalmatch(a: *allocator.Allocator, w: *wad.Wad, d: *rdata.Data, net: *i8, ma
     ret 0;
 }
 
+# judge one or more nets on unseen holdout seeds (900 and up)
+fun run_holdout(a: *allocator.Allocator, w: *wad.Wad, d: *rdata.Data, argc: i64, argv: **u8) i64 {
+    val sg: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](a, 1);
+    if (sel sg.err) { ret 2; }
+    val s: *game.Session = sg.ok;
+    game.init(s, a, w, d);
+
+    var maps:  [9]i32;
+    var nmaps: i32 = 0;
+    var mapbuf: [64]u8;
+    val mapenv: res[opt[usize], env.EnvError] = env.get("EVOLVE_MAPS", ?mapbuf[0], 64);
+    if (sel mapenv.ok) {
+        if (sel mapenv.ok.some) {
+            nmaps = parse_maps(?mapbuf[0], ?maps[0], 9);
+        }
+    }
+    if (nmaps == 0) {
+        var mi: i32 = 0;
+        for (mi < 6) {
+            maps[mi] = EVOLVE_DEFAULT_MAPS[mi];
+            mi       = mi + 1;
+        }
+        nmaps = 6;
+    }
+
+    var nseeds:   i32 = 6;
+    var last_arg: i64 = argc;
+    if (argc >= 5) {
+        val tail: str = argv[argc - 1];
+        if (tail[0] >= '1' && tail[0] <= '9') {
+            val parsed: i64 = number(tail, 0);
+            if (parsed > 0 && parsed <= 1000) {
+                nseeds   = parsed::i32;
+                last_arg = argc - 1;
+            }
+        }
+    }
+
+    var net: [1326]i8;
+    var idx: i64 = 2;
+    for (idx < last_arg) {
+        if (idx == 3) {
+            idx = idx + 1;
+            cnt;
+        }
+        val path: str = argv[idx];
+        if (!read_net_file(a, path, ?net[0])) {
+            print.eprintln("arena: holdout net could not be read");
+            ret 2;
+        }
+        var total_games:  i32 = 0;
+        var total_fin:    i32 = 0;
+        var total_score:  i32 = 0;
+        var total_deaths: i32 = 0;
+        var map_fin:      [9]i32;
+        var mi: i32 = 0;
+        for (mi < nmaps) {
+            val m:     i32 = maps[mi];
+            val limit: i32 = eval_tics(m);
+            var mf:    i32 = 0;
+            var si:    i32 = 0;
+            for (si < nseeds) {
+                var done:    bool = 0;
+                var deaths:  i32  = 0;
+                var nearest: i32  = 0;
+                var tics:    i32  = 0;
+                var acid:    i32  = 0;
+                if (!eval_run(s, ?net[0], m, (900 + si)::u32, limit, ?done, ?deaths, ?nearest, ?tics, ?acid)) {
+                    print.eprintln("arena: holdout map could not be loaded");
+                    ret 3;
+                }
+                total_games  = total_games + 1;
+                total_deaths = total_deaths + deaths;
+                total_score  = total_score + eval_score(m, done, tics, nearest, deaths);
+                if (done) {
+                    total_fin = total_fin + 1;
+                    mf        = mf + 1;
+                }
+                si = si + 1;
+            }
+            map_fin[mi] = mf;
+            mi          = mi + 1;
+        }
+        var mean_deaths: i32 = 0;
+        if (total_games > 0) { mean_deaths = total_deaths / total_games; }
+        print.printlnf("{}  games {}  finished {}  score {}  deaths {}/game", path, total_games, total_fin, total_score, mean_deaths);
+        mi = 0;
+        for (mi < nmaps) {
+            print.printlnf("    E1M{}  finished {}/{}", maps[mi], map_fin[mi], nseeds);
+            mi = mi + 1;
+        }
+        idx = idx + 1;
+    }
+    ret 0;
+}
+
+# evolve a diverse population of co-op nets in pure Mach
+fun run_evolve(a: *allocator.Allocator, w: *wad.Wad, d: *rdata.Data, first: *i8, dir: str, gens: i32, nelites_arg: i32, nchild_arg: i32) i64 {
+    val sg: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](a, 1);
+    if (sel sg.err) { ret 2; }
+    val s: *game.Session = sg.ok;
+    game.init(s, a, w, d);
+
+    val psg: res[*PopState, allocator.Error] = allocator.zallocate[PopState](a, 1);
+    if (sel psg.err) { ret 2; }
+    val ps: *PopState = psg.ok;
+
+    val plg: res[*PopElite, allocator.Error] = allocator.zallocate[PopElite](a, EVOLVE_POOL::usize);
+    if (sel plg.err) { ret 2; }
+    val pool: *PopElite = plg.ok;
+
+    val fbg: res[*u8, allocator.Error] = allocator.zallocate[u8](a, (POP_FILE_BYTES + 128)::usize);
+    if (sel fbg.err) { ret 2; }
+    val pbuf: *u8 = fbg.ok;
+
+    var nelites: i32 = nelites_arg;
+    if (nelites < 1)             { nelites = 1; }
+    if (nelites > EVOLVE_ELITES) { nelites = EVOLVE_ELITES; }
+    var nchildren: i32 = nchild_arg;
+    if (nchildren < 1)                         { nchildren = 1; }
+    if (nelites + nchildren > EVOLVE_POOL)     { nchildren = EVOLVE_POOL - nelites; }
+
+    var maps:  [9]i32;
+    var nmaps: i32 = 0;
+    var mapbuf: [64]u8;
+    val mapenv: res[opt[usize], env.EnvError] = env.get("EVOLVE_MAPS", ?mapbuf[0], 64);
+    if (sel mapenv.ok) {
+        if (sel mapenv.ok.some) {
+            nmaps = parse_maps(?mapbuf[0], ?maps[0], 9);
+        }
+    }
+    if (nmaps == 0) {
+        var mi: i32 = 0;
+        for (mi < 6) {
+            maps[mi] = EVOLVE_DEFAULT_MAPS[mi];
+            mi       = mi + 1;
+        }
+        nmaps = 6;
+    }
+
+    var seeds_per_gen:   i32 = 2;
+    var validate_every:  i32 = 5;
+    var validate_seeds:  i32 = 16;
+    var validate_margin: i32 = 8;
+    var diverse:         i32 = EVOLVE_DIVERSE;
+    var rate_pct:        i32 = 15;
+    var layer_mode:      i32 = LAYERS_OUT_SENSES;
+    var out_mask:        i32 = EVOLVE_OUTMASK;
+
+    var ebuf: [32]u8;
+    val sgenv: res[opt[usize], env.EnvError] = env.get("EVOLVE_SEEDS", ?ebuf[0], 32);
+    if (sel sgenv.ok) {
+        if (sel sgenv.ok.some) { seeds_per_gen = number(?ebuf[0], 2)::i32; }
+    }
+    if (seeds_per_gen < 1) { seeds_per_gen = 1; }
+
+    val veenv: res[opt[usize], env.EnvError] = env.get("EVOLVE_VALIDATE_EVERY", ?ebuf[0], 32);
+    if (sel veenv.ok) {
+        if (sel veenv.ok.some) { validate_every = number(?ebuf[0], 5)::i32; }
+    }
+    val vsenv: res[opt[usize], env.EnvError] = env.get("EVOLVE_VALIDATE_SEEDS", ?ebuf[0], 32);
+    if (sel vsenv.ok) {
+        if (sel vsenv.ok.some) { validate_seeds = number(?ebuf[0], 16)::i32; }
+    }
+    if (validate_seeds < 1) { validate_seeds = 1; }
+
+    val vmenv: res[opt[usize], env.EnvError] = env.get("EVOLVE_VALIDATE_MARGIN", ?ebuf[0], 32);
+    if (sel vmenv.ok) {
+        if (sel vmenv.ok.some) { validate_margin = number(?ebuf[0], 8)::i32; }
+    }
+    val divenv: res[opt[usize], env.EnvError] = env.get("EVOLVE_DIVERSE", ?ebuf[0], 32);
+    if (sel divenv.ok) {
+        if (sel divenv.ok.some) { diverse = number(?ebuf[0], 60)::i32; }
+    }
+
+    var duty: i64 = 100;
+    val dutyenv: res[opt[usize], env.EnvError] = env.get("ARENA_DUTY", ?ebuf[0], 32);
+    if (sel dutyenv.ok) {
+        if (sel dutyenv.ok.some) { duty = number(?ebuf[0], 100); }
+    }
+    if (duty < 1)   { duty = 1; }
+    if (duty > 100) { duty = 100; }
+
+    seed = 42;
+    val seedenv: res[opt[usize], env.EnvError] = env.get("ARENA_SEED", ?ebuf[0], 32);
+    if (sel seedenv.ok) {
+        if (sel seedenv.ok.some) { seed = number(?ebuf[0], 42)::u64 | 1; }
+    }
+
+    fs.create_dir_all(a, dir, 0o755);
+    if (!load_pop(ps, a, dir)) {
+        if (load_pop_json(ps, a, dir, first)) {
+            save_pop(ps, dir, pbuf);
+        }
+        or {
+            var init_net: [1326]i8;
+            var apath:    [512]u8;
+            var aat:      i32 = join(?apath[0], 0, dir);
+            aat = join(?apath[0], aat, "/anchor.net");
+            if (!read_net_file(a, ?apath[0], ?init_net[0])) {
+                var ppath: [512]u8;
+                var pat:   i32 = join(?ppath[0], 0, dir);
+                pat = join(?ppath[0], pat, "/../anchor.net");
+                if (!read_net_file(a, ?ppath[0], ?init_net[0])) {
+                    var k: i32 = 0;
+                    for (k < NET) {
+                        init_net[k] = first[k];
+                        k           = k + 1;
+                    }
+                }
+            }
+            fresh_pop(ps, ?init_net[0], nelites, rate_pct, layer_mode, out_mask);
+            save_pop(ps, dir, pbuf);
+        }
+    }
+
+    val full: i32 = nmaps * seeds_per_gen;
+    var step: i32 = 0;
+    for (gens <= 0 || step < gens) {
+        val gen:   i32 = ps.gen;
+        val began: i64 = millis();
+        seed = (9000 + gen)::u64 | 1;
+
+        # rank current elites best-mean first
+        var ranked: [6]i32;
+        var i:      i32 = 0;
+        for (i < ps.nelites) {
+            ranked[i] = i;
+            i         = i + 1;
+        }
+        i = 1;
+        for (i < ps.nelites) {
+            val who:   i32 = ranked[i];
+            val wmean: i32 = elite_mean(?ps.elites[who]);
+            var j:     i32 = i;
+            for (j > 0 && elite_mean(?ps.elites[ranked[j - 1]]) < wmean) {
+                ranked[j] = ranked[j - 1];
+                j         = j - 1;
+            }
+            ranked[j] = who;
+            i         = i + 1;
+        }
+
+        i = 0;
+        for (i < ps.nelites) {
+            pool[i]          = ps.elites[ranked[i]];
+            pool[i].is_child = 0;
+            i                = i + 1;
+        }
+
+        val total_w: i32 = ps.nelites * (ps.nelites + 1) / 2;
+        var c:       i32 = 0;
+        for (c < nchildren) {
+            var pick: i32 = below(total_w);
+            var r:    i32 = 0;
+            for (r < ps.nelites - 1) {
+                val wgt: i32 = ps.nelites - r;
+                if (pick < wgt) { brk; }
+                pick = pick - wgt;
+                r    = r + 1;
+            }
+            val parent: *PopElite = ?pool[r];
+            val child:  *PopElite = ?pool[ps.nelites + c];
+            var blank:  PopElite;
+            @child = blank;
+            var sig: i32 = parent.sigma + (below(3) + below(3)) - 2;
+            if (sig < 1)  { sig = 1; }
+            if (sig > 12) { sig = 12; }
+            child.id       = ps.next_id + c;
+            child.born     = gen;
+            child.parent   = parent.id;
+            child.sigma    = sig;
+            child.nscores  = 0;
+            child.last     = 0;
+            child.is_child = 1;
+            evolve_mutate(?parent.net[0], ?child.net[0], sig, rate_pct, layer_mode, out_mask);
+            c = c + 1;
+        }
+        ps.next_id = ps.next_id + nchildren;
+
+        val npool: i32 = ps.nelites + nchildren;
+        i = 0;
+        for (i < npool) {
+            var sum_score: i32 = 0;
+            var sum_fin:   i32 = 0;
+            var mi:        i32 = 0;
+            for (mi < nmaps) {
+                val m:     i32 = maps[mi];
+                val limit: i32 = eval_tics(m);
+                var si:    i32 = 0;
+                for (si < seeds_per_gen) {
+                    val gseed:   u32  = (20000 + gen * seeds_per_gen + si)::u32;
+                    var done:    bool = 0;
+                    var deaths:  i32  = 0;
+                    var nearest: i32  = 0;
+                    var tics:    i32  = 0;
+                    var acid:    i32  = 0;
+                    if (!eval_run(s, ?pool[i].net[0], m, gseed, limit, ?done, ?deaths, ?nearest, ?tics, ?acid)) {
+                        print.eprintln("arena: evolve map could not be loaded");
+                        ret 3;
+                    }
+                    sum_score = sum_score + eval_score(m, done, tics, nearest, deaths);
+                    if (done) { sum_fin = sum_fin + 1; }
+                    si = si + 1;
+                }
+                mi = mi + 1;
+            }
+            elite_record_score(?pool[i], sum_score / full, sum_fin);
+            i = i + 1;
+        }
+
+        var children_kept: i32 = 0;
+        ps.nelites = evolve_select(pool, npool, ?ps.elites[0], nelites, diverse, layer_mode, out_mask, ?children_kept);
+        ps.gen     = gen + 1;
+
+        var did_val:    bool = 0;
+        var val_id:     i32  = 0;
+        var val_born:   i32  = 0;
+        var val_fb:     i32  = 0;
+        var val_fa:     i32  = 0;
+        var val_vb:     i32  = 0;
+        var val_va:     i32  = 0;
+        var new_anchor: bool = 0;
+
+        if (validate_every > 0 && ps.gen % validate_every == 0) {
+            var best_idx: i32 = -1;
+            i = 0;
+            for (i < ps.nelites) {
+                if (ps.elites[i].nscores >= 2) {
+                    best_idx = i;
+                    brk;
+                }
+                i = i + 1;
+            }
+            if (best_idx >= 0) {
+                val best: *PopElite = ?ps.elites[best_idx];
+                if (evolve_distance(?best.net[0], ?ps.anchor[0], LAYERS_ALL, 63) > 0) {
+                    did_val  = 1;
+                    val_id   = best.id;
+                    val_born = best.born;
+                    var mi: i32 = 0;
+                    for (mi < nmaps) {
+                        val m:     i32 = maps[mi];
+                        val limit: i32 = eval_tics(m);
+                        var si:    i32 = 0;
+                        for (si < validate_seeds) {
+                            val vseed:   u32  = (50000 + gen * validate_seeds + si)::u32;
+                            var done:    bool = 0;
+                            var deaths:  i32  = 0;
+                            var nearest: i32  = 0;
+                            var tics:    i32  = 0;
+                            var acid:    i32  = 0;
+                            if (!eval_run(s, ?best.net[0], m, vseed, limit, ?done, ?deaths, ?nearest, ?tics, ?acid)) { ret 3; }
+                            val_vb = val_vb + eval_score(m, done, tics, nearest, deaths);
+                            if (done) { val_fb = val_fb + 1; }
+                            if (!eval_run(s, ?ps.anchor[0], m, vseed, limit, ?done, ?deaths, ?nearest, ?tics, ?acid)) { ret 3; }
+                            val_va = val_va + eval_score(m, done, tics, nearest, deaths);
+                            if (done) { val_fa = val_fa + 1; }
+                            si = si + 1;
+                        }
+                        mi = mi + 1;
+                    }
+                    new_anchor = val_fb >= val_fa + validate_margin && val_vb > val_va;
+                    if (new_anchor) {
+                        var k: i32 = 0;
+                        for (k < NET) {
+                            ps.anchor[k] = best.net[k];
+                            k            = k + 1;
+                        }
+                        var aname: [64]u8;
+                        var aat:   i32 = join(?aname[0], 0, "anchor-pop-gen");
+                        aat = join_number(?aname[0], aat, gen::i64);
+                        aat = join(?aname[0], aat, ".net");
+                        replace(dir, ?aname[0], (?ps.anchor[0]):~*u8, NET);
+                    }
+                }
+            }
+        }
+
+        save_pop(ps, dir, pbuf);
+
+        var lbuf: [4096]u8;
+        var lat:  i32 = join(?lbuf[0], 0, "{\"gen\":");
+        lat = join_number(?lbuf[0], lat, gen::i64);
+        lat = join(?lbuf[0], lat, ",\"ms\":");
+        lat = join_number(?lbuf[0], lat, millis() - began);
+        lat = join(?lbuf[0], lat, ",\"elites\":[");
+        i = 0;
+        for (i < ps.nelites) {
+            val e: *PopElite = ?ps.elites[i];
+            var ename: [32]u8;
+            var pname: [32]u8;
+            elite_name(e.id, e.born, ?ename[0]);
+            elite_name(e.parent, 0, ?pname[0]);
+            if (i > 0) { lat = join(?lbuf[0], lat, ","); }
+            lat = join(?lbuf[0], lat, "{\"name\":\"");
+            lat = join(?lbuf[0], lat, ?ename[0]);
+            lat = join(?lbuf[0], lat, "\",\"mean\":");
+            lat = join_number(?lbuf[0], lat, elite_mean(e)::i64);
+            lat = join(?lbuf[0], lat, ",\"n\":");
+            lat = join_number(?lbuf[0], lat, e.nscores::i64);
+            lat = join(?lbuf[0], lat, ",\"last\":");
+            lat = join_number(?lbuf[0], lat, e.last::i64);
+            lat = join(?lbuf[0], lat, ",\"sigma\":");
+            lat = join_number(?lbuf[0], lat, e.sigma::i64);
+            lat = join(?lbuf[0], lat, ",\"parent\":\"");
+            lat = join(?lbuf[0], lat, ?pname[0]);
+            lat = join(?lbuf[0], lat, "\"}");
+            i = i + 1;
+        }
+        lat = join(?lbuf[0], lat, "],\"children_kept\":");
+        lat = join_number(?lbuf[0], lat, children_kept::i64);
+        if (did_val) {
+            var vname: [32]u8;
+            elite_name(val_id, val_born, ?vname[0]);
+            lat = join(?lbuf[0], lat, ",\"validate\":{\"elite\":\"");
+            lat = join(?lbuf[0], lat, ?vname[0]);
+            lat = join(?lbuf[0], lat, "\",\"finished\":[");
+            lat = join_number(?lbuf[0], lat, val_fb::i64);
+            lat = join(?lbuf[0], lat, ",");
+            lat = join_number(?lbuf[0], lat, val_fa::i64);
+            lat = join(?lbuf[0], lat, "],\"score\":[");
+            lat = join_number(?lbuf[0], lat, val_vb::i64);
+            lat = join(?lbuf[0], lat, ",");
+            lat = join_number(?lbuf[0], lat, val_va::i64);
+            lat = join(?lbuf[0], lat, "],\"new_anchor\":");
+            if (new_anchor) { lat = join(?lbuf[0], lat, "true}"); }
+            or              { lat = join(?lbuf[0], lat, "false}"); }
+        }
+        lat = join(?lbuf[0], lat, "}");
+        append_line(dir, "log.jsonl", ?lbuf[0], lat);
+        print.println(?lbuf[0]);
+
+        rest(began, duty);
+        step = step + 1;
+    }
+    ret 0;
+}
+
+fun swap_cohort(l: *League, nets: *i8, nnets: i32) {
+    if (nnets <= 0) { ret; }
+    var i: i32 = 0;
+    for (i < 4) {
+        val who: i32     = lf.COHORT[i];
+        val m:   *Member = ?l.members[who];
+        var src: i32     = i;
+        if (src >= nnets) { src = 0; }
+        var k: i32 = 0;
+        for (k < NET) {
+            val w: i8 = nets[src * NET + k];
+            m.net[k]   = w;
+            m.trial[k] = w;
+            k          = k + 1;
+        }
+        m.generation = m.generation + 1;
+        i            = i + 1;
+    }
+}
+
+fun run_swap(a: *allocator.Allocator, first: *i8, dir: str, argc: i64, argv: **u8) i64 {
+    coop = 1;
+    val lg: res[*League, allocator.Error] = allocator.zallocate[League](a, 1);
+    if (sel lg.err) { ret 2; }
+    val l: *League = lg.ok;
+    if (!load(l, a, dir)) {
+        print.eprintln("arena: coop.bin could not be loaded for swap");
+        ret 2;
+    }
+    val fb: res[*u8, allocator.Error] = allocator.zallocate[u8](a, (FILE_BYTES + 64)::usize);
+    if (sel fb.err) { ret 2; }
+    var nets:  [5304]i8;
+    var nnets: i32 = 1;
+    var k:     i32 = 0;
+    for (k < NET) {
+        nets[k] = first[k];
+        k       = k + 1;
+    }
+    var argi: i64 = 5;
+    for (argi < argc && nnets < 4) {
+        if (!read_net_file(a, argv[argi], ?nets[nnets * NET])) {
+            print.eprintln("arena: cohort net could not be read");
+            ret 2;
+        }
+        nnets = nnets + 1;
+        argi  = argi + 1;
+    }
+    swap_cohort(l, ?nets[0], nnets);
+    if (!save(l, dir, fb.ok)) {
+        print.eprintln("arena: coop.bin could not be saved after swap");
+        ret 2;
+    }
+    print.printlnf("arena: installed {} champion net(s) into co-op cohort {} {} {} {}", nnets, lf.COHORT[0], lf.COHORT[1], lf.COHORT[2], lf.COHORT[3]);
+    ret 0;
+}
+
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     if (argc < 4) {
-        print.eprintln("usage: arena <wad> <first net> <directory> [<matches> [coop]]");
+        print.eprintln("usage: arena <wad> <first net> <directory|eval|evolve|holdout|swap> [...]");
         ret 1;
     }
     var a:    allocator.Allocator;
@@ -2063,24 +3271,8 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     var d: rdata.Data = graphics.ok;
 
-    val first: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, argv[2]);
-    if (sel first.err) {
-        print.eprintln("arena: the first net could not be read");
-        ret 2;
-    }
-    # the first net: of this shape, or of the first, widened
     var firstnet: [1326]i8;
-    if (first.ok.len == NET::usize) {
-        var c: i32 = 0;
-        for (c < NET) {
-            firstnet[c] = first.ok.data[c]:~i8;
-            c           = c + 1;
-        }
-    }
-    or (first.ok.len == bot.NETSIZE_V1::usize) {
-        bot.widen(first.ok.data:~*i8, ?firstnet[0]);
-    }
-    or {
+    if (!read_net_file(?a, argv[2], ?firstnet[0])) {
         print.eprintln("arena: the first net should be 1326 bytes (or 942, the first shape)");
         ret 2;
     }
@@ -2091,6 +3283,27 @@ fun main(argc: i64, argv: **u8) i64 {
         var tics: i32 = 16800;
         if (argc >= 7) { tics = number(argv[6], 16800)::i32; }
         ret evalmatch(?a, ?w, ?d, ?firstnet[0], number(argv[4], 1)::i32, number(argv[5], 0)::u32, tics);
+    }
+    # arena <wad> <net> holdout [<other net> ...] [<seeds>]: judge nets on
+    # unseen holdout seeds (900 and up) in pure Mach
+    if (argc >= 4 && argv[3][0] == 'h' && argv[3][1] == 'o' && argv[3][2] == 'l' && argv[3][3] == 'd' && argv[3][4] == 'o' && argv[3][5] == 'u' && argv[3][6] == 't' && argv[3][7] == 0) {
+        ret run_holdout(?a, ?w, ?d, argc, argv);
+    }
+    # arena <wad> <first net> evolve <directory> [<gens> [<elites> [<children>]]]:
+    # evolve a diverse population of co-op nets in pure Mach
+    if (argc >= 5 && argv[3][0] == 'e' && argv[3][1] == 'v' && argv[3][2] == 'o' && argv[3][3] == 'l' && argv[3][4] == 'v' && argv[3][5] == 'e' && argv[3][6] == 0) {
+        var gens:   i32 = 1000;
+        var nel:    i32 = EVOLVE_ELITES;
+        var nchild: i32 = EVOLVE_CHILDS;
+        if (argc >= 6) { gens   = number(argv[5], 1000)::i32; }
+        if (argc >= 7) { nel    = number(argv[6], EVOLVE_ELITES::i64)::i32; }
+        if (argc >= 8) { nchild = number(argv[7], EVOLVE_CHILDS::i64)::i32; }
+        ret run_evolve(?a, ?w, ?d, ?firstnet[0], argv[4], gens, nel, nchild);
+    }
+    # arena <wad> <net> swap <directory> [<net2> <net3> <net4>]: install
+    # holdout-winning champion net(s) into the four active co-op cohort seats
+    if (argc >= 5 && argv[3][0] == 's' && argv[3][1] == 'w' && argv[3][2] == 'a' && argv[3][3] == 'p' && argv[3][4] == 0) {
+        ret run_swap(?a, ?firstnet[0], argv[4], argc, argv);
     }
     val dir:   str = argv[3];
     var limit: i64 = 0;
@@ -2571,5 +3784,104 @@ test human_coverage__separates_modes_and_levels {
     if (of_this_kind(?pool[0], 3) != 2 || taughtmaps[2] != 1 || taughtmaps[6] != 1) { ret 1; }
     coop = 0;
     if (of_this_kind(?pool[0], 3) != 1 || taughtmaps[2] != 1 || taughtmaps[6] != 0) { ret 2; }
+    ret 0;
+}
+
+test evolve_score__matches_completion_speed_and_progress_rules {
+    if (eval_tics(3) != 16800 || eval_tics(6) != 42000 || eval_tics(7) != 42000) { ret 1; }
+    # unfinished: nearest 50 -> 2*(200-50) = 300, less 3*4 = 12 -> 288
+    if (eval_score(3, 0, 16800, 50, 4) != 288) { ret 2; }
+    # nearest 0 (never set out) counts as 200 -> 0 progress points
+    if (eval_score(3, 0, 16800, 0, 2) != -6) { ret 3; }
+    # finished at half time on E1M6 (21000 of 42000) with nearest 1 and 2 deaths:
+    # 2*(200-1) - 6 + 1000 + 168*21000/42000 = 398 - 6 + 1000 + 84 = 1476
+    if (eval_score(6, 1, 21000, 1, 2) != 1476) { ret 4; }
+    ret 0;
+}
+
+test evolve_mutable__respects_layer_modes_and_diversity_distance {
+    var a: [1326]i8;
+    var b: [1326]i8;
+    # sense 0 (ray) is untouched in out+senses; sense 29 (F_FOEKIND) and sense 32 are mutable
+    b[0]  = 50;
+    b[29] = 10;
+    b[32] = -20;
+    # output 0 (forward, bit 0) is not in EVOLVE_OUTMASK (46); output 2 (turn, bit 2) is
+    b[EVOLVE_W2 + 0 * bot.HIDDEN] = 40;
+    b[EVOLVE_W2 + 2 * bot.HIDDEN] = 15;
+    if (evolve_distance(?a[0], ?b[0], LAYERS_OUT, EVOLVE_OUTMASK) != 15) { ret 1; }
+    if (evolve_distance(?a[0], ?b[0], LAYERS_OUT_FOE, EVOLVE_OUTMASK) != 25) { ret 2; }
+    if (evolve_distance(?a[0], ?b[0], LAYERS_OUT_SENSES, EVOLVE_OUTMASK) != 45) { ret 3; }
+    if (evolve_distance(?a[0], ?b[0], LAYERS_ALL, 63) != 135) { ret 4; }
+    ret 0;
+}
+
+test evolve_select__keeps_diverse_top_elites_and_windows_scores {
+    var pool: [4]PopElite;
+    var out:  [2]PopElite;
+    var i:    i32 = 0;
+    for (i < 4) {
+        pool[i].id = i;
+        i          = i + 1;
+    }
+    # candidate 0: best mean (1000)
+    elite_record_score(?pool[0], 900, 5);
+    elite_record_score(?pool[0], 1100, 7);
+    pool[0].net[EVOLVE_W2 + 2 * bot.HIDDEN] = 0;
+    # candidate 1: second-best mean (950), but too close to candidate 0 (distance 10 < 60)
+    elite_record_score(?pool[1], 950, 6);
+    pool[1].is_child = 1;
+    pool[1].net[EVOLVE_W2 + 2 * bot.HIDDEN] = 10;
+    # candidate 2: third-best mean (900), diverse from candidate 0 (distance 80 >= 60)
+    elite_record_score(?pool[2], 900, 6);
+    pool[2].is_child = 1;
+    pool[2].net[EVOLVE_W2 + 2 * bot.HIDDEN] = 80;
+    # candidate 3: unjudged child, must be skipped
+    pool[3].is_child = 1;
+    pool[3].net[EVOLVE_W2 + 2 * bot.HIDDEN] = -80;
+
+    var ckept: i32 = 0;
+    val n: i32 = evolve_select(?pool[0], 4, ?out[0], 2, 60, LAYERS_OUT_SENSES, EVOLVE_OUTMASK, ?ckept);
+    if (n != 2 || ckept != 1) { ret 1; }
+    if (out[0].id != 0 || out[1].id != 2) { ret 2; }
+    if (elite_mean(?out[0]) != 1000 || out[0].last != 7) { ret 3; }
+    ret 0;
+}
+
+test evolve_json_helpers__parse_saved_population_fields {
+    val sample: str = "{\"gen\": 1393, \"next\": 13936, \"elites\": [{\"name\": \"c13865\", \"sigma\": 10.26, \"scores\": [853.9, 1032.8], \"born\": 1385, \"parent\": \"c13846\", \"last\": 10}]}";
+    var slen: i32 = 0;
+    for (sample[slen] != 0) { slen = slen + 1; }
+    val gat: i32 = json_find_key(sample, 0, slen, "\"gen\"");
+    val nat: i32 = json_find_key(sample, 0, slen, "\"next\"");
+    val sat: i32 = json_find_key(sample, 0, slen, "\"sigma\"");
+    val nkey: i32 = json_find_key(sample, 0, slen, "\"name\"");
+    if (gat < 0 || nat < 0 || sat < 0 || nkey < 0) { ret 1; }
+    if (json_read_int(sample, gat, slen, 0) != 1393) { ret 2; }
+    if (json_read_int(sample, nat, slen, 0) != 13936) { ret 3; }
+    if (json_read_int(sample, sat, slen, 0) != 10) { ret 4; }
+    var name: [32]u8;
+    val nlen: i32 = json_read_str(sample, nkey, slen, ?name[0], 32);
+    if (nlen != 6 || json_read_int(?name[0], 0, nlen, 0) != 13865) { ret 5; }
+    ret 0;
+}
+
+test cohort_swap__updates_only_active_cohort_nets {
+    var l: League;
+    var i: i32 = 0;
+    for (i < MEMBERS) {
+        l.members[i].net[0]     = (i % 100)::i8;
+        l.members[i].games      = 10 + i;
+        l.members[i].generation = 3;
+        i                       = i + 1;
+    }
+    var champs: [2652]i8;
+    champs[0]       = 111;
+    champs[NET + 0] = 122;
+    swap_cohort(?l, ?champs[0], 2);
+    if (l.members[5].net[0] != 111 || l.members[23].net[0] != 122) { ret 1; }
+    if (l.members[41].net[0] != 111 || l.members[64].net[0] != 111) { ret 2; }
+    if (l.members[5].generation != 4 || l.members[5].games != 15) { ret 3; }
+    if (l.members[1].net[0] != 1 || l.members[1].generation != 3) { ret 4; }
     ret 0;
 }

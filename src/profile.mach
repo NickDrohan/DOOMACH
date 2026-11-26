@@ -1,0 +1,626 @@
+# the character on disk, this machine's own
+#
+# Three files under a profiles directory beside the program:
+#
+#   NAME.chr  the checkpoint: every field the character is, written
+#             atomically with two rotations kept. Binary, checksummed,
+#             field-by-field like a save.
+#   NAME.jrn  the journal: one line a reward, appended and fsynced,
+#             never rewritten. A checkpoint records the journal sequence
+#             it includes; loading replays only what came after.
+#   current   the name the player last chose, plain text.
+#
+# Nothing in here reaches the simulation: this module is the owning
+# client's bookkeeping only. What the game itself needs of a character —
+# its stat block — is handed over the wire like any command data.
+#
+# The journal's line is `seq,map,kind,detail,amount`: the map as e1m3,
+# kind one of k (a kill: detail the monster kind, amount the Slayer XP),
+# h (a weapon's hit: detail the weapon track, amount the weapon XP),
+# a (a point spent: detail the node), or l (a level reached: amount it).
+
+use std.allocator;
+use std.collections.vector.Vector;
+use std.crypto.rand;
+use fs: std.filesystem;
+use io_error: std.io.error;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use doom.defs;
+use doom.game;
+use doom.rpg;
+
+val NAMEMAX:   i32 = 16;
+val CHKMAGIC:  u32 = 0x52484344;   # "DCHR", little-endian
+val CHKVER:    i32 = 1;
+val CHKBYTES:  usize = 160;
+
+$if ($mach.build.sys == $mach.sys.windows) {
+    val SEP: u8 = '\\';
+}
+$or {
+    val SEP: u8 = '/';
+}
+
+# a character as this client knows it
+pub rec Profile {
+    name:      [24]u8;
+    id:        [16]u8;
+    seq:       i64;
+    slayer_xp: i64;
+    weapon_xp: [6]i64;
+    nodes:     [40]u8;
+    spent:     i32;
+
+    # the journal lines formatted but not yet appended
+    jbuf:      [3072]u8;
+    jbuflen:   i32;
+    lastwrite: i64;
+    lastchk:   i64;
+}
+
+pub var loaded: bool;
+pub var cur:    Profile;
+
+var dir:    [512]u8;
+var dirlen: i32;
+
+# where the profiles live; make it if it is not there
+pub fun init(a: *allocator.Allocator, path: str) {
+    dirlen = 0;
+    var i: i32 = 0;
+    for (i < 511 && path[i] != 0) {
+        dir[i] = path[i];
+        i      = i + 1;
+    }
+    dir[i]  = 0;
+    dirlen  = i;
+    fs.create_dir_all(a, ?dir[0], 0o755);
+}
+
+# build dir\name.ext
+fun path_for(name: *u8, ext: str, out: *u8) {
+    var i: i32 = 0;
+    for (i < dirlen) {
+        out[i] = dir[i];
+        i      = i + 1;
+    }
+    out[i] = SEP;
+    i      = i + 1;
+    var k: i32 = 0;
+    for (name[k] != 0 && k < 24) {
+        out[i] = name[k];
+        i      = i + 1;
+        k      = k + 1;
+    }
+    k = 0;
+    for (ext[k] != 0) {
+        out[i] = ext[k];
+        i      = i + 1;
+        k      = k + 1;
+    }
+    out[i] = 0;
+}
+
+# a name is 1 to 16 capitals, digits or underscores, so it is also a file
+pub fun name_ok(name: *u8) bool {
+    var i: i32 = 0;
+    for (i < NAMEMAX) {
+        val c: u8 = name[i];
+        if (c == 0) { brk; }
+        val ok: bool = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        if (!ok) { ret 0; }
+        i = i + 1;
+    }
+    ret i >= 1;
+}
+
+# the character files in the directory, names without the .chr, at most
+# the size of the caller's array
+pub fun list(a: *allocator.Allocator, out: *u8) i32 {
+    if (dirlen == 0) { ret 0; }
+    val got: res[Vector[fs.Listed], fs.FsError] = fs.read_dir(a, ?dir[0]);
+    if (sel got.err) { ret 0; }
+    var entries: Vector[fs.Listed] = got.ok;
+    var n: i32 = 0;
+    var i: usize = 0;
+    for (i < entries.len && n < 16) {
+        val entry: fs.Listed = entries.data[i];
+        if (sel entry.name) {
+            val e: str = entry.name;
+            var L: i32 = 0;
+            for (e[L] != 0) { L = L + 1; }
+            if (L > 4 && e[L - 4] == '.' && e[L - 3] == 'c' && e[L - 2] == 'h' && e[L - 1] == 'r' && L - 4 <= NAMEMAX) {
+                var k: i32 = 0;
+                for (k < L - 4) {
+                    out[n * 24 + k] = e[k];
+                    k               = k + 1;
+                }
+                out[n * 24 + k] = 0;
+                n               = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    fs.listed_dnit(?entries);
+    ret n;
+}
+
+# --------------------------------------------------------- the journal
+
+fun put_dec(out: *u8, at: i32, v: i64) i32 {
+    var tmp: [24]u8;
+    var n:   i32  = 0;
+    var u:   i64  = v;
+    if (u < 0) { u = 0 - u; }
+    for {
+        tmp[n] = '0' + (u % 10)::u8;
+        u      = u / 10;
+        n      = n + 1;
+        if (u == 0) { brk; }
+    }
+    var i: i32 = 0;
+    if (v < 0) { out[at] = '-'; i = i + 1; }
+    for (n > 0) {
+        n          = n - 1;
+        out[at + i] = tmp[n];
+        i          = i + 1;
+    }
+    ret i;
+}
+
+# format one line into the pending buffer
+fun jline(g: *defs.Game, kind: u8, detail: i32, amount: i64) {
+    var at: i32 = 0;
+    at = cur.jbuflen;
+    at = at + put_dec(?cur.jbuf[0], at, cur.seq);
+    cur.jbuf[at] = ','; at = at + 1;
+    cur.jbuf[at] = 'e';  at = at + 1;
+    at = at + put_dec(?cur.jbuf[0], at, g.gameepisode::i64);
+    cur.jbuf[at] = 'm';  at = at + 1;
+    at = at + put_dec(?cur.jbuf[0], at, g.gamemap::i64);
+    cur.jbuf[at] = ','; at = at + 1;
+    cur.jbuf[at] = kind; at = at + 1;
+    cur.jbuf[at] = ','; at = at + 1;
+    at = at + put_dec(?cur.jbuf[0], at, detail::i64);
+    cur.jbuf[at] = ','; at = at + 1;
+    at = at + put_dec(?cur.jbuf[0], at, amount);
+    cur.jbuf[at] = '\n'; at = at + 1;
+    cur.jbuflen  = at;
+    cur.seq      = cur.seq + 1;
+}
+
+# append the pending lines to NAME.jrn and sync
+fun jwrite() {
+    if (cur.jbuflen == 0) { ret; }
+    var path: [576]u8;
+    path_for(?cur.name[0], ".jrn", ?path[0]);
+    var raw_handle: usize = os.INVALID_HANDLE;
+    val raw:        i64   = os.open(os.working_dir(), ?path[0], os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644, ?raw_handle);
+    if (raw < 0) { ret; }
+    os.write(raw_handle, ?cur.jbuf[0], cur.jbuflen::usize);
+    os.sync_fd(raw_handle);
+    os.close(raw_handle);
+    cur.jbuflen = 0;
+}
+
+# pull this machine's journal queue into the character and its file. The
+# queue only ever fills where earning applies. force appends at once;
+# otherwise once a second and whenever the buffer is nearly full.
+pub fun flush(s: *game.Session, force: bool) {
+    if (!loaded) { s.rpg_njq = 0; ret; }
+    val g: *defs.Game = ?s.g;
+    var i: i32 = 0;
+    for (i < s.rpg_njq) {
+        val ev: *defs.RpgEvent = ?s.rpg_jq[i];
+        if (ev.kind == defs.REV_KILL) {
+            cur.slayer_xp = cur.slayer_xp + ev.xp::i64;
+            jline(g, 'k', ev.aux::i32, ev.xp::i64);
+        }
+        or (ev.kind == defs.REV_HIT) {
+            val wx: i32 = rpg.wx_index(ev.weapon::i32);
+            if (wx >= 0) {
+                cur.weapon_xp[wx] = cur.weapon_xp[wx] + ev.xp::i64;
+                jline(g, 'h', wx, ev.xp::i64);
+            }
+        }
+        or (ev.kind == defs.REV_ALLOC) {
+            if (cur.nodes[ev.aux::i32] < 255) { cur.nodes[ev.aux::i32] = cur.nodes[ev.aux::i32] + 1; }
+            cur.spent = cur.spent + 1;
+            jline(g, 'a', ev.aux::i32, 1);
+        }
+        or (ev.kind == defs.REV_LEVEL) {
+            jline(g, 'l', 0, ev.xp::i64);
+        }
+        i = i + 1;
+    }
+    s.rpg_njq = 0;
+    if (dirlen == 0) { ret; }
+    if (force || cur.jbuflen > 2048 || g.gametic::i64 - cur.lastwrite >= 35) {
+        cur.lastwrite = g.gametic::i64;
+        jwrite();
+    }
+}
+
+# ------------------------------------------------------- the checkpoint
+
+var store: [256]u8;
+var at:    usize;
+
+fun w8(v: u8) {
+    store[at] = v;
+    at        = at + 1;
+}
+fun w32(v: i32) {
+    w8(v::u8);
+    w8((v >> 8)::u8);
+    w8((v >> 16)::u8);
+    w8((v >> 24)::u8);
+}
+fun w64(v: i64) {
+    w32(v::i32);
+    w32((v >> 32)::i32);
+}
+
+fun chk_sum() u32 {
+    var h: u32 = 5381;
+    var i: usize = 0;
+    for (i < at) {
+        h = h * 33 + store[i]::u32;
+        i = i + 1;
+    }
+    ret h;
+}
+
+# write NAME.chr atomically, keeping the previous two as .1 and .2
+pub fun checkpoint(s: *game.Session) {
+    if (!loaded || dirlen == 0) { ret; }
+    at = 0;
+    w32(CHKMAGIC::i32);
+    w32(CHKVER);
+    var i: i32 = 0;
+    for (i < 16) { w8(cur.id[i]);   i = i + 1; }
+    i = 0;
+    for (i < 24) { w8(cur.name[i]); i = i + 1; }
+    w64(cur.seq);
+    w64(cur.slayer_xp);
+    i = 0;
+    for (i < 6) { w64(cur.weapon_xp[i]); i = i + 1; }
+    i = 0;
+    for (i < 40) { w8(cur.nodes[i]); i = i + 1; }
+    w32(cur.spent);
+    w32(chk_sum()::i32);
+
+    var path:  [576]u8;
+    var bak1:  [576]u8;
+    var bak2:  [576]u8;
+    var tmp:   [576]u8;
+    path_for(?cur.name[0], ".chr",   ?path[0]);
+    path_for(?cur.name[0], ".chr.1", ?bak1[0]);
+    path_for(?cur.name[0], ".chr.2", ?bak2[0]);
+    path_for(?cur.name[0], ".tmp",   ?tmp[0]);
+    val w: err[fs.FsError] = fs.write_bytes(?tmp[0], ?store[0], at, 0o644);
+    if (sel w.err) { ret; }
+    fs.remove_file(?bak2[0]);
+    fs.rename(?bak1[0], ?bak2[0]);
+    fs.rename(?path[0], ?bak1[0]);
+    fs.rename(?tmp[0], ?path[0]);
+    # the caller's session marks when this was written; a fresh character
+    # has none yet, and the next checkpoint is due soon enough anyway
+    if (s != nil) { cur.lastchk = s.g.gametic::i64; }
+}
+
+# every frame: drain the journal queue, and checkpoint when five minutes
+# of game has gone by since the last one
+pub fun maybe(s: *game.Session) {
+    if (!loaded) { ret; }
+    flush(s, 0);
+    if (s.g.gametic::i64 - cur.lastchk >= 5 * 60 * 35) { checkpoint(s); }
+}
+
+# ------------------------------------------------------- create / load
+
+fun blank_cur(name: *u8) {
+    var b: Profile;
+    cur = b;
+    var i: i32 = 0;
+    for (i < 24 && name[i] != 0) {
+        cur.name[i] = name[i];
+        i           = i + 1;
+    }
+    rand.fill(?cur.id[0], 16);
+    loaded = 1;
+}
+
+# make a character with nothing earned and choose it
+pub fun create(name: *u8) bool {
+    if (!name_ok(name) || dirlen == 0) { ret 0; }
+    var path: [576]u8;
+    path_for(name, ".chr", ?path[0]);
+    val there: res[bool, io_error.Error] = fs.exists(?path[0]);
+    if (sel there.ok) {
+        if (there.ok) { ret 0; }
+    }
+    blank_cur(name);
+    checkpoint(nil);
+    ret 1;
+}
+
+var rdat: [256]u8;
+var rat:  usize;
+
+fun r8() u8 {
+    val v: u8 = rdat[rat];
+    rat = rat + 1;
+    ret v;
+}
+fun r32() i32 {
+    var v: i32 = r8()::i32;
+    v = v | (r8()::i32 << 8);
+    v = v | (r8()::i32 << 16);
+    v = v | (r8()::i32 << 24);
+    ret v;
+}
+fun r64() i64 {
+    var v: i64 = r32()::i64 & 0xffffffff;
+    v = v | ((r32()::i64 & 0xffffffff) << 32);
+    ret v;
+}
+
+# a decimal at p, ended by a comma or the line's end; how far it went in i
+fun atou(p: *u8, i: *i32) i64 {
+    var v: i64 = 0;
+    for (p[(@i)::usize] >= '0' && p[(@i)::usize] <= '9') {
+        v  = v * 10 + (p[(@i)::usize] - '0')::i64;
+        @i = @i + 1;
+    }
+    ret v;
+}
+
+# read NAME.jrn and apply every line beyond the checkpoint's sequence
+fun replay(a: *allocator.Allocator, p: *Profile) {
+    var path: [576]u8;
+    path_for(?p.name[0], ".jrn", ?path[0]);
+    val got: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    if (sel got.err) { ret; }
+    var i: usize = 0;
+    for (i < got.ok.len) {
+        var c: i32 = i::i32;
+        val line: i64 = atou(got.ok.data, ?c);
+        if (c == i::i32 || line < p.seq) {
+            for (c < got.ok.len::i32 && got.ok.data[c::usize] != '\n') { c = c + 1; }
+            if (c < got.ok.len::i32) { c = c + 1; }
+            i = c::usize;
+            cnt;
+        }
+        # fields: seq , e{m}m{n} , kind , detail , amount \n
+        for (c < got.ok.len::i32 && got.ok.data[c::usize] != ',') { c = c + 1; }
+        c = c + 1;
+        # a line that stops early stops the replay, not the program
+        if (c >= got.ok.len::i32 || got.ok.data[c::usize] != 'e') { brk; }
+        c = c + 1;
+        val ep: i64 = atou(got.ok.data, ?c);
+        if (c >= got.ok.len::i32 || got.ok.data[c::usize] != 'm') { brk; }
+        c = c + 1;
+        val mp: i64 = atou(got.ok.data, ?c);
+        if (c >= got.ok.len::i32 || got.ok.data[c::usize] != ',') { brk; }
+        c = c + 1;
+        var kind: u8 = got.ok.data[c::usize];
+        if (kind > 'z') { kind = kind - '0'; }
+        c = c + 1;
+        if (c >= got.ok.len::i32 || got.ok.data[c::usize] != ',') { brk; }
+        c = c + 1;
+        val detail: i64 = atou(got.ok.data, ?c);
+        if (c >= got.ok.len::i32 || got.ok.data[c::usize] != ',') { brk; }
+        c = c + 1;
+        val amount: i64 = atou(got.ok.data, ?c);
+        if (kind == 'k') {
+            p.slayer_xp = p.slayer_xp + amount;
+        }
+        or (kind == 'h' && detail >= 0 && detail < 6) {
+            p.weapon_xp[detail::i32] = p.weapon_xp[detail::i32] + amount;
+        }
+        or (kind == 'a' && detail >= 0 && detail < 40) {
+            if (p.nodes[detail::i32] < 255) { p.nodes[detail::i32] = p.nodes[detail::i32] + 1; }
+            p.spent = p.spent + 1;
+        }
+        if (line + 1 > p.seq) { p.seq = line + 1; }
+        for (c < got.ok.len::i32 && got.ok.data[c::usize] != '\n') { c = c + 1; }
+        if (c < got.ok.len::i32) { c = c + 1; }
+        i = c::usize;
+    }
+}
+
+# read NAME.chr then replay NAME.jrn past it; a bad checkpoint falls back
+# to its rotations
+fun read_chr(a: *allocator.Allocator, path: *u8) bool {
+    val got: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel got.err) { ret 0; }
+    if (got.ok.len < CHKBYTES) { ret 0; }
+    var i: usize = 0;
+    for (i < CHKBYTES) {
+        rdat[i] = got.ok.data[i];
+        i       = i + 1;
+    }
+    rat = 0;
+    if (r32():~u32 != CHKMAGIC || r32() != CHKVER) { ret 0; }
+    var p: Profile;
+    i = 0;
+    for (i < 16) { p.id[i]   = r8(); i = i + 1; }
+    i = 0;
+    for (i < 24) { p.name[i] = r8(); i = i + 1; }
+    p.seq       = r64();
+    p.slayer_xp = r64();
+    i = 0;
+    for (i < 6)  { p.weapon_xp[i] = r64(); i = i + 1; }
+    i = 0;
+    for (i < 40) { p.nodes[i] = r8(); i = i + 1; }
+    p.spent = r32();
+    if (r32():~u32 != chk_sum_at()) { ret 0; }
+    cur = p;
+    ret 1;
+}
+
+# the checksum stored at the end of rdat
+fun chk_sum_at() u32 {
+    var h: u32 = 5381;
+    var i: usize = 0;
+    for (i < CHKBYTES - 4) {
+        h = h * 33 + rdat[i]::u32;
+        i = i + 1;
+    }
+    ret h;
+}
+
+# load the character named and choose it
+pub fun load(a: *allocator.Allocator, name: *u8) bool {
+    if (!name_ok(name) || dirlen == 0) { ret 0; }
+    var path: [576]u8;
+    var bak:  [576]u8;
+    path_for(name, ".chr", ?path[0]);
+    if (!read_chr(a, ?path[0])) {
+        path_for(name, ".chr.1", ?path[0]);
+        path_for(name, ".chr.2", ?bak[0]);
+        if (!read_chr(a, ?path[0]) && !read_chr(a, ?bak[0])) { ret 0; }
+    }
+    replay(a, ?cur);
+    loaded = 1;
+    ret 1;
+}
+
+# ------------------------------------------------------------- choosing
+
+# the name in the current file, or none
+pub fun selected(a: *allocator.Allocator, out: *u8) bool {
+    var path: [576]u8;
+    var i:    i32 = 0;
+    for (i < dirlen) { path[i] = dir[i]; i = i + 1; }
+    path[i] = SEP; i = i + 1;
+    var k: i32 = 0;
+    val cf: str = "current";
+    for (cf[k] != 0) { path[i] = cf[k]; i = i + 1; k = k + 1; }
+    path[i] = 0;
+    val got: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?path[0]);
+    if (sel got.err) { ret 0; }
+    if (got.ok.len == 0) { ret 0; }
+    var n: i32 = 0;
+    for (n < got.ok.len::i32 && n < NAMEMAX && got.ok.data[n::usize] != '\n' && got.ok.data[n::usize] != '\r') {
+        out[n] = got.ok.data[n::usize];
+        n      = n + 1;
+    }
+    out[n] = 0;
+    ret name_ok(out);
+}
+
+# remember the choice, and mark the character loaded if it can be read
+pub fun choose(a: *allocator.Allocator, name: *u8) bool {
+    if (!load(a, name)) { ret 0; }
+    var path: [576]u8;
+    var i:    i32 = 0;
+    for (i < dirlen) { path[i] = dir[i]; i = i + 1; }
+    path[i] = SEP; i = i + 1;
+    var k: i32 = 0;
+    val cf: str = "current";
+    for (cf[k] != 0) { path[i] = cf[k]; i = i + 1; k = k + 1; }
+    path[i] = 0;
+    var text: [24]u8;
+    var n:    i32 = 0;
+    for (name[n] != 0 && n < NAMEMAX) { text[n] = name[n]; n = n + 1; }
+    text[n] = '\n'; n = n + 1;
+    fs.write_bytes(?path[0], ?text[0], n::usize, 0o644);
+    ret 1;
+}
+
+pub fun unload() {
+    loaded = 0;
+}
+
+# -------------------------------------------------- the simulation view
+
+# the block the simulation plays this character as: the bought nodes,
+# and the weapon levels the totals have reached
+pub fun block() *defs.RpgStats {
+    var b:  *defs.RpgStats = ?s_block;
+    var i:  i32 = 0;
+    var bb: defs.RpgStats;
+    s_block = bb;
+    if (!loaded) { ret b; }
+    s_block.ver = 1;
+    i = 0;
+    for (i < 40) {
+        s_block.nodes[i] = cur.nodes[i];
+        i                = i + 1;
+    }
+    i = 0;
+    for (i < 6) {
+        var wl: i32 = rpg.wlevel_of(cur.weapon_xp[i]) - 1;
+        if (wl < 0)   { wl = 0; }
+        if (wl > 255) { wl = 255; }
+        s_block.wlevel[i] = wl::u8;
+        i                 = i + 1;
+    }
+    ret b;
+}
+
+var s_block: defs.RpgStats;
+
+# points the character may still spend: one a level, less what is spent
+pub fun points() i32 {
+    if (!loaded) { ret 0; }
+    val p: i32 = rpg.level_of(cur.slayer_xp) - 1 - cur.spent;
+    if (p < 0) { ret 0; }
+    ret p;
+}
+
+# whether the node may be bought now: points, one-timers not yet owned,
+# blue armor only once green is
+pub fun can_buy(node: i32) bool {
+    if (!loaded || node < 0 || node >= rpg.N_NODES) { ret 0; }
+    if (points() <= 0) { ret 0; }
+    if (node == rpg.NODE_KIT_BA && cur.nodes[rpg.NODE_KIT_GA] == 0) { ret 0; }
+    if (node == rpg.NODE_BLINK || node == rpg.NODE_STIM ||
+        (node >= rpg.NODE_KIT_SG && node <= rpg.NODE_KIT_BFG)) {
+        ret cur.nodes[node] == 0;
+    }
+    ret 1;
+}
+
+# the character id a save records, so a save cannot pass between characters
+pub fun id(out: *u8) {
+    var i: i32 = 0;
+    for (i < 16) {
+        if (loaded) { out[i] = cur.id[i]; }
+        or          { out[i] = 0; }
+        i = i + 1;
+    }
+}
+
+# the name for the menus, or empty
+pub fun name(out: *u8) {
+    var i: i32 = 0;
+    for (i < 24) {
+        if (loaded) { out[i] = cur.name[i]; }
+        or          { out[i] = 0; }
+        i = i + 1;
+    }
+}
+
+# ------------------------------------------------------------- tests
+
+test name_ok__names {
+    var good: [8]u8;
+    good[0] = 'D'; good[1] = 'O'; good[2] = 'O'; good[3] = 'M'; good[4] = 0;
+    if (!name_ok(?good[0])) { ret 1; }
+    var low: [4]u8;
+    low[0] = 'd'; low[1] = 'o'; low[2] = 'o'; low[3] = 0;
+    if (name_ok(?low[0])) { ret 2; }
+    var empty: [4]u8;
+    empty[0] = 0;
+    if (name_ok(?empty[0])) { ret 3; }
+    ret 0;
+}

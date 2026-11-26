@@ -309,6 +309,9 @@ for build in debug release; do
     same "four-player co-op on E1M3 ends where it is pinned ($build)" "$work/coop4.$build" "$here/fixtures/coop4.expected"
 done
 
+rpgcheck_ok() { "$debug" rpgcheck "$wad" >"$work/rpgcheck.out" 2>&1 && ! grep -q "^FAIL" "$work/rpgcheck.out"; }
+gate "the character system's standing orders hold (rpgcheck)" 0 rpgcheck_ok
+
 # Bots. A bot is a player the simulation plays itself, so it must decide the
 # same on every machine: `doom botmatch` runs a deathmatch between four of
 # the hand-written bots as two games in one process, compared every tic.

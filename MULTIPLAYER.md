@@ -10,17 +10,17 @@ Each machine needs the same `DOOM1.WAD`. The easy way is the menu: Esc, "Play on
 "Host a game for 2" (3, 4) and a skill, or "Join with a room code". With "Listed publicly" set
 to yes the hosted game also shows under "Find an open game" on every other copy of the same
 build, to be joined with Enter; `doom rooms <wad> <relay address>` prints that list. The host's screen shows a
-six-character code to send the others. It goes through the relay at `mach-doom-relay.fly.dev`
+six-character code to send the others. It goes through the relay at `doomach.fly.dev`
 (see [RELAY.md](RELAY.md)), or the one `--relay` or `DOOM_RELAY` names; Options, End Game leaves,
 and the others are told. From the command line, the same through the relay:
 
 ```
-doom host <wad> [<players 2-4> [<map 1-9> [<skill 1-5>]]] --relay mach-doom-relay.fly.dev
-doom join <wad> <ROOM CODE> --relay mach-doom-relay.fly.dev
+doom host <wad> [<players 2-4> [<map 1-9> [<skill 1-5>]]] --relay doomach.fly.dev
+doom join <wad> <ROOM CODE> --relay doomach.fly.dev
 ```
 
 The host's waiting screen shows a six-character room code; the others join with it. Setting
-`DOOM_RELAY=mach-doom-relay.fly.dev` once saves typing `--relay` each time.
+`DOOM_RELAY=doomach.fly.dev` once saves typing `--relay` each time.
 
 Directly, with no relay, on a LAN (or across the internet if the host's router forwards UDP
 5029):

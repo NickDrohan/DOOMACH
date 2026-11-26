@@ -22,7 +22,7 @@ pub val HEADER: i32 = 16;
 
 # the version of this protocol and of the game's network behaviour; two
 # machines with different versions are refused at the door
-pub val VERSION: u8 = 2;
+pub val VERSION: u8 = 3;
 
 # game to relay
 pub val CREATE: u8 = 1;
@@ -66,6 +66,8 @@ pub val FLAG_PUBLIC: u8 = 1;
 pub val FLAG_DEATHMATCH: u8 = 2;
 # bots take the empty seats after a quarter of a minute, not the usual wait
 pub val FLAG_QUICK: u8 = 4;
+# co-op players hurt one another, as the room's host chose
+pub val FLAG_FRIENDLYFIRE: u8 = 8;
 
 # the public list: at most this many rooms in an answer, each this many
 # bytes (code, players, joined, skill, map, and 1 for a deathmatch). A request must be as long as

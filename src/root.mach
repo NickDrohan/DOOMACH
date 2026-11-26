@@ -26,7 +26,7 @@ use std.print;
 use std.runtime;
 use std.text.parse;
 use std.process.env;
-use std.crypto.hash.sha256;
+use std.memory;
 use std.types.bool.bool;
 use std.types.error.err;
 use std.types.option.opt;
@@ -45,11 +45,13 @@ use doom.level;
 use doom.maputl;
 use doom.music;
 use doom.opl;
+use doom.profile;
 use doom.net;
 use doom.random;
 use doom.relaycore;
 use doom.relayproto;
 use doom.rdata;
+use doom.rpgcheck;
 use doom.render;
 use doom.save;
 use doom.sound;
@@ -67,13 +69,13 @@ val EXIT_DATA:   i64 = 4;
 val EXIT_WRITE:  i64 = 5;
 val EXIT_WINDOW: i64 = 6;
 
-# the relay a game started from the menu meets the others through, unless
+# the server a game started from the menu meets the others through, unless
 # --relay or DOOM_RELAY names another
-val DEFAULT_RELAY: str = "mach-doom-relay.fly.dev";
+val DEFAULT_RELAY: str = "doomach.fly.dev";
 
 # where the newest program is kept, unless DOOM_UPDATE_URL names another
 # place: doom.exe there, and doom.exe.sha256, its hash as 64 hex digits
-val UPDATE_URL: str = "https://mach-doom-relay.fly.dev";
+val UPDATE_URL: str = "https://doomach.fly.dev";
 
 # the game was started by a double click, with no words after its name; an
 # update starts the new one the same way
@@ -399,6 +401,7 @@ fun start_menu_net(argc: i64, argv: **u8, n: *net.Net, request: i32, f: *front.F
     }
     if (!net.open(n, 0, 0)) { ret "the network could not be opened.\n\n(press a key)"; }
     n.wadhash = wadhash;
+    load_block(n);
     if (request == front.NET_HOST) {
         # a deathmatch is on one of the maps the bots know, picked by the
         # clock; co-op starts the episode. The list's standing deathmatch is
@@ -411,12 +414,23 @@ fun start_menu_net(argc: i64, argv: **u8, n: *net.Net, request: i32, f: *front.F
         n.public     = f.netpublic || f.netquick;
         n.deathmatch = dm;
         n.quick      = f.netquick;
+        n.ff         = f.netff;
     }
     or {
         net.use_relay(n, ?relay);
         net.join_code(n, ?f.code[0]);
     }
     ret nil;
+}
+
+# my character's stat block into the 48 bytes every command packet carries
+fun load_block(n: *net.Net) {
+    val mb: *defs.RpgStats = profile.block();
+    var i:  i32 = 0;
+    for (i < 48) {
+        n.blockmine[i] = (mb:~*u8)[i];
+        i              = i + 1;
+    }
 }
 
 fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
@@ -505,6 +519,8 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     st.init(?bar);
     var palette: i32 = -1;
     var weapon:  i32 = 0;
+    var blinkq:  i32 = 0;
+    var stimq:   i32 = 0;
 
     var gametic:    i32  = 0;
     var netstarted: bool = 0;
@@ -522,6 +538,15 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
     var joinmsg:   [96]u8;
     var joinretry: i64 = 0;
     tidy_update();
+
+    # the character this machine plays as, if one was chosen before
+    var profpath: [512]u8;
+    if (win.beside_exe("profiles", ?profpath[0])) {
+        profile.init(?a, ?profpath[0]);
+        var cname: [24]u8;
+        if (profile.selected(?a, ?cname[0])) { profile.load(?a, ?cname[0]); }
+    }
+
     # watching the bot league: a match being fetched, or one being played
     # again, and how long it runs
     var fetch:     *net.Watch = nil;
@@ -559,6 +584,12 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
             or (playing && key == front.KEY_F12 && front.may_spy(?f, s)) {
                 # the corner's view: the next team-mate's eyes, then nobody's
                 front.spy_next(?f, s);
+            }
+            or (playing && (key == 'Q' || key == 'q')) {
+                blinkq = 1;
+            }
+            or (playing && (key == 'X' || key == 'x')) {
+                stimq = 1;
             }
             or (playing && key >= '1' && key <= '7') {
                 weapon = key - '0';
@@ -841,6 +872,19 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                 input.activate     = win.key_down(?window, win.VK_SPACE) || win.key_down(?window, 'E') || (f.mode == front.MODE_LEVEL && win.key_down(?window, win.VK_RBUTTON));
                 input.weapon       = weapon;
                 weapon             = 0;
+                input.blink        = blinkq != 0;
+                input.stim         = stimq != 0;
+                blinkq             = 0;
+                stimq              = 0;
+            }
+            if (f.nallocq > 0) {
+                input.alloc = f.allocq[0];
+                var aq: i32 = 1;
+                for (aq < f.nallocq) {
+                    f.allocq[aq - 1] = f.allocq[aq];
+                    aq               = aq + 1;
+                }
+                f.nallocq = f.nallocq - 1;
             }
 
             if (n == nil) {
@@ -854,7 +898,7 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                         progress   = now;
                         var names: [96]u8;
                         net_names(n, ?names[0]);
-                        if (!front.start_coop(?f, s, n.players, n.me, n.skill, n.map, n.deathmatch, ?names[0])) { f.quit = 1; }
+                        if (!front.start_coop(?f, s, n.players, n.me, n.skill, n.map, n.deathmatch, ?names[0], n.ff, ?n.blockmine[0])) { f.quit = 1; }
                         seat_bots(s, n);
                         f.message = nil;
                     }
@@ -873,6 +917,7 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
                         net.add_command(n, ?cmd);
                     }
                     net.send_commands(n, gametic - 1);
+                    net.install(s, n);
                     for (!n.desync && !n.quit && !stalled && net.due(n, gametic) && net.ready(n, gametic)) {
                         var cmds: [4]defs.Ticcmd;
                         net.commands(n, gametic, ?cmds[0]);
@@ -905,6 +950,7 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
         }
         if (now >= next)                                                 { next = now; }
         win.audio_pump(?audio, mix_all);
+        profile.maybe(s);
 
         # the song the front end wants, at the volume the menu sets
         if (hasmusic) {
@@ -945,6 +991,8 @@ fun play_with(argc: i64, argv: **u8, given: *net.Net) i64 {
             win.nap(1);
         }
     }
+    profile.flush(s, 1);
+    profile.checkpoint(s);
     if (n != nil && given == nil) { net.close(n); }
     net.lobby_close(?lobby);
     if (fetch != nil) { net.watch_close(fetch); }
@@ -1027,8 +1075,8 @@ fun frame(argc: i64, argv: **u8) i64 {
         degrees = number(argv[7], 0);
     }
     or {
-        var i:     i32 = 0;
-        var found: u8  = 0;
+        var i:     i32  = 0;
+        var found: bool = 0;
         for (i < lv.numthings) {
             if (lv.things[i].kind == 1) {
                 x       = lv.things[i].x::i64;
@@ -1542,7 +1590,7 @@ fun script(argc: i64, argv: **u8) i64 {
         or (step[0] == 'c' && step[1] == 'o' && step[2] == 'o' && step[3] == 'p' && step[4] == ':') {
             # a co-op game on a map, this player and three hand-written bots
             var names: [96]u8;
-            if (front.start_coop(?f, s, 4, 0, defs.SK_MEDIUM, number(?step[5], 1)::i32, 0, ?names[0])) {
+            if (front.start_coop(?f, s, 4, 0, defs.SK_MEDIUM, number(?step[5], 1)::i32, 0, ?names[0], 0, nil)) {
                 var q: i32 = 1;
                 for (q < 4) {
                     game.set_bot(s, q, bot.KIND_SCRIPT, nil, (q * 7919 + 17):~u32);
@@ -1594,11 +1642,129 @@ fun script(argc: i64, argv: **u8) i64 {
     ret EXIT_OK;
 }
 
+val SHA256_K: [64]u32 = [64]u32{
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+fun sha_rotr(x: u32, n: u32) u32 { ret (x >> n) | (x << (32 - n)); }
+
+fun sha256_block(h: *u32, block: *u8) {
+    var w: [64]u32;
+    var i: usize = 0;
+    for (i < 16) {
+        val off: usize = i * 4;
+        w[i] = (block[off]::u32 << 24) | (block[off + 1]::u32 << 16) | (block[off + 2]::u32 << 8) | block[off + 3]::u32;
+        i    = i + 1;
+    }
+    for (i < 64) {
+        val g1: u32 = sha_rotr(w[i - 2], 17) ^ sha_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        val g0: u32 = sha_rotr(w[i - 15], 7) ^ sha_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        w[i] = g1 + w[i - 7] + g0 + w[i - 16];
+        i    = i + 1;
+    }
+    var a:  u32 = h[0];
+    var b:  u32 = h[1];
+    var c:  u32 = h[2];
+    var d:  u32 = h[3];
+    var e:  u32 = h[4];
+    var f:  u32 = h[5];
+    var g:  u32 = h[6];
+    var hh: u32 = h[7];
+    i = 0;
+    for (i < 64) {
+        val s1: u32 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25);
+        val ch: u32 = (e & f) ^ (~e & g);
+        val t1: u32 = hh + s1 + ch + SHA256_K[i] + w[i];
+        val s0: u32 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22);
+        val mj: u32 = (a & b) ^ (a & c) ^ (b & c);
+        val t2: u32 = s0 + mj;
+        hh = g;
+        g  = f;
+        f  = e;
+        e  = d + t1;
+        d  = c;
+        c  = b;
+        b  = a;
+        a  = t1 + t2;
+        i  = i + 1;
+    }
+    h[0] = h[0] + a;
+    h[1] = h[1] + b;
+    h[2] = h[2] + c;
+    h[3] = h[3] + d;
+    h[4] = h[4] + e;
+    h[5] = h[5] + f;
+    h[6] = h[6] + g;
+    h[7] = h[7] + hh;
+}
+
+fun sha256_hash(data: *u8, len: usize, digest: *u8) {
+    var h: [8]u32 = [8]u32{
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    var off: usize = 0;
+    for (off + 64 <= len) {
+        sha256_block(?h[0], ?data[off]);
+        off = off + 64;
+    }
+    var buf: [64]u8;
+    var rem: usize = len - off;
+    if (rem > 0) { memory.raw_copy(?buf[0], ?data[off], rem); }
+    buf[rem] = 0x80;
+    rem      = rem + 1;
+    if (rem > 56) {
+        for (rem < 64) {
+            buf[rem] = 0;
+            rem      = rem + 1;
+        }
+        sha256_block(?h[0], ?buf[0]);
+        rem = 0;
+    }
+    for (rem < 56) {
+        buf[rem] = 0;
+        rem      = rem + 1;
+    }
+    val bits: u64 = len::u64 * 8;
+    buf[56] = (bits >> 56)::u8;
+    buf[57] = (bits >> 48)::u8;
+    buf[58] = (bits >> 40)::u8;
+    buf[59] = (bits >> 32)::u8;
+    buf[60] = (bits >> 24)::u8;
+    buf[61] = (bits >> 16)::u8;
+    buf[62] = (bits >> 8)::u8;
+    buf[63] = bits::u8;
+    sha256_block(?h[0], ?buf[0]);
+    var k: usize = 0;
+    for (k < 8) {
+        digest[k * 4]     = (h[k] >> 24)::u8;
+        digest[k * 4 + 1] = (h[k] >> 16)::u8;
+        digest[k * 4 + 2] = (h[k] >> 8)::u8;
+        digest[k * 4 + 3] = h[k]::u8;
+        k = k + 1;
+    }
+}
+
 # the first eight bytes of the WAD's SHA-256, which every machine in a network
 # game must share
 fun first64(data: *u8, len: usize) u64 {
     var digest: [32]u8;
-    sha256.hash(data, len, ?digest[0]);
+    sha256_hash(data, len, ?digest[0]);
     var h: u64 = 0;
     var k: i32 = 0;
     for (k < 8) {
@@ -1612,13 +1778,7 @@ fun first64(data: *u8, len: usize) u64 {
 # hashed, so that two different downloads are turned away at the door rather
 # than going out of step later. The program's part is 0 if it cannot be read.
 fun game_hash(a: *allocator.Allocator, w: *wad.Wad) u64 {
-    var exe:  [512]u8;
-    var mine: u64 = 0;
-    if (win.exe_path(?exe[0])) {
-        val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?exe[0]);
-        if (sel bytes.ok) { mine = first64(bytes.ok.data, bytes.ok.len); }
-    }
-    ret first64(w.data, w.len) ^ (mine * 0x9e3779b97f4a7c15);
+    ret first64(w.data, w.len);
 }
 
 # a file's SHA-256 as 64 hex digits and a zero; false if it cannot be read
@@ -1626,7 +1786,7 @@ fun file_hash(a: *allocator.Allocator, path: str, out: *u8) bool {
     val bytes: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
     if (sel bytes.err) { ret 0; }
     var digest: [32]u8;
-    sha256.hash(bytes.ok.data, bytes.ok.len, ?digest[0]);
+    sha256_hash(bytes.ok.data, bytes.ok.len, ?digest[0]);
     val digits: str = "0123456789abcdef";
     var k: i32 = 0;
     for (k < 32) {
@@ -3161,6 +3321,7 @@ fun netplay(argc: i64, argv: **u8) i64 {
         if (viarelay) { net.use_relay(n, ?relay); }
         n.public     = listed;
         n.deathmatch = deathmatch;
+        load_block(n);
     }
     or (viarelay) {
         net.use_relay(n, ?relay);
@@ -3259,6 +3420,7 @@ fun netplay(argc: i64, argv: **u8) i64 {
             if (paced) { brk; }
         }
         net.send_commands(n, gametic - 1);
+        net.install(s, n);
         val before: i32 = gametic;
 
         var ran: bool = 0;
@@ -3759,6 +3921,25 @@ fun print_fingerprint(argv: **u8) i64 {
     ret EXIT_OK;
 }
 
+# the character system's standing orders, as rpgcheck.mach has them
+fun do_rpgcheck(argv: **u8) i64 {
+    var a:    allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?a);
+    if (sel made.err) { ret EXIT_WAD; }
+    val loaded: res[wad.Wad, wad.WadError] = wad.load(?a, argv[2]);
+    if (sel loaded.err) { ret refuse(loaded.err); }
+    var w: wad.Wad = loaded.ok;
+    val graphics: res[rdata.Data, rdata.DataError] = rdata.init(?a, ?w);
+    if (sel graphics.err) { ret EXIT_DATA; }
+    var d: rdata.Data = graphics.ok;
+    val got: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?a, 1);
+    if (sel got.err) { ret EXIT_DATA; }
+    val s: *game.Session = got.ok;
+    game.init(s, ?a, ?w, ?d);
+    if (rpgcheck.run(s, ?a) != 0) { ret EXIT_DATA; }
+    ret EXIT_OK;
+}
+
 # this program's fingerprint (game.fingerprint), worked out the first time
 # it is asked for, in the session given, which the probe leaves in a state
 # to be replaced
@@ -3990,6 +4171,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (argc == 3 && str_equals(argv[1], "joinleague"))                       { ret joinleague(argv); }
     if (argc == 5 && str_equals(argv[1], "resumecheck"))                      { ret resumecheck(argv); }
     if (argc == 3 && str_equals(argv[1], "fingerprint"))                      { ret print_fingerprint(argv); }
+    if (argc == 3 && str_equals(argv[1], "rpgcheck"))                         { ret do_rpgcheck(argv); }
     if (argc >= 5 && argc <= 8 && str_equals(argv[1], "coopmatch") && (argc < 8 || str_equals(argv[7], "trace") || str_equals(argv[7], "league") || str_equals(argv[7], "leaguetrace") || str_equals(argv[7], "route") || str_equals(argv[7], "uv") || str_equals(argv[7], "uvtrace") || str_equals(argv[7], "lead") || str_equals(argv[7], "redlead")))         { ret coopmatch(argc, argv); }
     if (argc == 4 && str_equals(argv[1], "rooms"))                            { ret rooms(argv); }
     if (argc == 4 && str_equals(argv[1], "watch"))                            { ret watch(argc, argv); }

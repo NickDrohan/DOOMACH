@@ -3,11 +3,12 @@
 A port of id Software's Doom engine to Mach, built so that the port asks hard questions of the
 language rather than just transliterating C.
 
-**To just play it:** download it from <https://mach-doom-relay.fly.dev/>, unzip, double-click
-`doom.exe`. Co-op and deathmatch with friends or bots are on the main menu under "Play online".
+**To just play it:** open <https://doomach.fly.dev/> in any browser — it runs full-screen in `4:3`
+with online lockstep co-op, deathmatch, and the live neural-network bot leagues without leaving
+the browser (or download `doom-in-mach.zip`, unzip, and double-click `doom.exe`).
 
 ```bash
-./bootstrap.sh                         # compiler 6.9.0, std, shareware WAD, id's source
+./bootstrap.sh                         # compiler 7.0.0, std, shareware WAD, id's source
 scripts/mach build . --profile release
 out=out/windows-x86_64/release/bin/doom.exe
 
@@ -24,8 +25,8 @@ $out mus data/DOOM1.WAD D_E1M1  # a song's MIDI messages, one per line
 $out muswav data/DOOM1.WAD D_E1M1 e1m1.wav 30   # ... and 30 s of it, synthesized
 $out host data/DOOM1.WAD 2      # co-op: host a game for two players...
 $out join data/DOOM1.WAD 192.168.1.20   # ...and join it from another machine
-$out host data/DOOM1.WAD 2 --relay mach-doom-relay.fly.dev   # across the internet: shows a room code
-$out join data/DOOM1.WAD KQ7M2T --relay mach-doom-relay.fly.dev  # ...which the friend joins with
+$out host data/DOOM1.WAD 2 --relay doomach.fly.dev   # across the internet: shows a room code
+$out join data/DOOM1.WAD KQ7M2T --relay doomach.fly.dev  # ...which the friend joins with
 $out botmatch data/DOOM1.WAD 1 2100   # four bots' deathmatch on E1M1, a minute of it
 $out navdump data/DOOM1.WAD 5 nav.ppm # the bots' walk grid of a map, as a picture
 bash check.sh             # acceptance gates
@@ -137,7 +138,7 @@ protocol and how to deploy both are in [RELAY.md](RELAY.md).
 ## Two bot leagues
 
 The league of a hundred bots that plays deathmatch has a twin that plays co-op, on Nightmare,
-with nets of its own; see [BOTS.md](BOTS.md). Both are on the [league page](https://mach-doom-relay.fly.dev/league.html),
+with nets of its own; see [BOTS.md](BOTS.md). Both are on the [league page](https://doomach.fly.dev/league.html),
 both can be watched from the game, and each seats its bots in people's games of its kind.
 
 ## A second view
@@ -356,10 +357,10 @@ cannot see that bug, so a unit test now pins the behaviour instead.
 
 ## Toolchain
 
-`toolchain.env` pins **Mach 6.9.0**: the SPIR-V backend and 256-bit vectors arrived after 5.11.
-`bootstrap.sh` fetches that compiler into `tools/`, checked against the hash its release
-publishes, and `scripts/mach` runs it. The standard library is `tag/v9.4.1`, pinned in
-`mach.toml`.
+`toolchain.env` pins **Mach 7.0.0** (with the `wasi-wasm32` WebAssembly target, SPIR-V backend,
+and 256-bit vectors). `bootstrap.sh` fetches that compiler into `tools/`, checked against the
+hash its release publishes, and `scripts/mach` runs it. The standard library is `tag/v10.1.1`,
+pinned in `mach.toml`.
 
 ## Data and reference source
 

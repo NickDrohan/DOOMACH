@@ -8,5 +8,5 @@ COPY out/deploy/ /
 RUN chmod 755 /usr/local/bin/relay /usr/local/bin/hedge /usr/local/bin/arena /usr/local/bin/start
 # start runs as root to prepare the league's disk, then drops to nobody
 ENV RELAY_BIND_HOST=fly-global-services RELAY_UDP_PORT=5029 RELAY_MAX_ROOMS=32 ARENA_DUTY=1 COOP_DUTY=5 COOP_COHORT=4 LEAGUE_EPOCH=2 COOP_EPOCH=2 RELAY_WATCH_FILE=/data/league/watch.bin RELAY_LEAGUE_FILE=/data/league/league.bin RELAY_COOP_FILE=/data/league/coop.bin RELAY_TRAIN_FILE=/data/league/train.bin RELAY_FILL_SECONDS=120 RELAY_SHY_ONE_IN=10
-EXPOSE 5029/udp 8080/tcp
+EXPOSE 5029/udp 5030/tcp 8080/tcp
 CMD ["/usr/local/bin/start"]

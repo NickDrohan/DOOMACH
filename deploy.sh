@@ -27,8 +27,8 @@ done
 [[ -n "$python" ]] || { echo "deploy: python is needed for episode qualification" >&2; exit 1; }
 mkdir -p "$here/out/qualification"
 "$python" "$here/harness/coopcheck.py" --league --maps 1 --tics 16800 --seeds 0 --timeout 120 --fail-fast --report "$here/out/qualification/release.json"
-"$root/scripts/mach" build "$here" --artifact relay --target linux-x86_64 --profile release --jobs 2 --quiet
-"$root/scripts/mach" build "$here" --artifact arena --target linux-x86_64 --profile release --jobs 2 --quiet
+"$root/scripts/mach" build "$here" --artifact relay --target linux-x86_64 --profile release --threads 2 --quiet
+"$root/scripts/mach" build "$here" --artifact arena --target linux-x86_64 --profile release --threads 2 --quiet
 
 # hedge
 compiler="$root/tools/mach-$hedge_mach/mach.exe"
@@ -65,6 +65,9 @@ cp "$here/site/league.html" "$stage/srv/site/"
 # for the game's own update: the program by itself, and its hash
 cp "$here/out/windows-x86_64/release/bin/doom.exe" "$stage/srv/site/doom.exe"
 sha256sum "$stage/srv/site/doom.exe" | cut -d' ' -f1 >"$stage/srv/site/doom.exe.sha256"
+# for the browser player: the WebAssembly build (wasi-wasm32) and shareware WAD
+cp "$here/out/wasi-wasm32/release/bin/doom.wasm" "$stage/srv/site/doom.wasm"
+cp "$here/data/DOOM1.WAD" "$stage/srv/site/DOOM1.WAD"
 cp "$here/site/shot.png" "$here/out/package/doom-in-mach.zip" "$here/out/package/source.zip" "$stage/srv/site/"
 
 zip="$here/out/package/doom-in-mach.zip"

@@ -277,6 +277,14 @@ pub rec Mobj {
     # for nightmare respawn
     spawnpoint: level.Thing;
 
+    # which thing in the map's THINGS lump this came from, or -1; it is
+    # the index the respawn-decay counter in Game.rpg_deaths is kept by.
+    # The last weapon a player hurt this with, and the seat that dealt
+    # it: the kill bonus goes to them. RPG_NONE is no hit yet.
+    spawnid: i32;
+    rpgseat: u8;
+    rpgwp:   u8;
+
     # the thing being chased by a seeking missile
     tracer: *Mobj;
 }
@@ -313,6 +321,8 @@ pub rec Player {
 
     # carried between levels; mo.health is the one used during a level
     health:      i32;
+    # the most health pickups will restore; the character's nodes raise it
+    maxhealth:   i32;
     armorpoints: i32;
     armortype:   i32;
 
@@ -385,9 +395,59 @@ pub rec Anim {
     speed:     i32;
 }
 
+# ------------------------------- the character system (rpg.mach)
+
+# a seat's character as it changes the simulation: the ranks bought into
+# each node, and the level each of the six weapons has reached. A block
+# of zeros is no character and that seat is the vanilla game. On the
+# wire and in a save it is these 48 bytes exactly.
+pub rec RpgStats {
+    ver:    u8;
+    pad:    u8;
+    nodes:  [40]u8;
+    wlevel: [6]u8;
+}
+
+# a seat's ability state, reset when a level or a respawn starts
+pub rec RpgRt {
+    # Stim: tics of burst left, cooldown left, and the fraction of an
+    # extra weapon tic earned so far, in 16.16 fixed point
+    stimleft: i32;
+    stimcd:   i32;
+    stimacc:  i32;
+    # Blink: tics until it may be used again
+    blinkcd:  i32;
+}
+
+# no seat and no weapon, where an event's seat or weapon would go
+pub val RPG_NONE: u8 = 255;
+
+# what one reward event is
+pub val REV_KILL:  u8 = 1;   # a monster died; xp is Slayer XP for every human
+pub val REV_HIT:   u8 = 2;   # a player's weapon dealt; xp is that seat's weapon XP
+pub val REV_ALLOC: u8 = 3;   # a point was spent; aux is the node
+pub val REV_LEVEL: u8 = 4;   # the console player's Slayer level rose; xp is it
+
+pub rec RpgEvent {
+    kind:   u8;   # a REV_* value
+    seat:   u8;   # who earned it, or RPG_NONE
+    weapon: u8;   # what dealt it, or RPG_NONE
+    aux:    u8;   # a kind for REV_KILL, a node for REV_ALLOC
+    xp:     i32;
+}
+
 pub def ActionHook:  fun(*Game, *Mobj, *Player, *Pspdef, i32);
 pub def SpecialHook: fun(*Game, i32, i32, i32, *Mobj) bool;
 pub def SoundHook:   fun(*Game, ptr, bool, Fixed, Fixed, i32);
+
+# the hooks by which a character reaches the simulation: a player's
+# damage out and a player's damage taken, a monster's death, a weapon's
+# blow for the bookkeeping, a BT_SPECIAL command, and a fresh inventory
+pub def RpgScaleHook: fun(*Game, *Player, i32, i32) i32;
+pub def RpgKillHook:  fun(*Game, *Mobj, *Mobj);
+pub def RpgHitHook:   fun(*Game, *Player, i32, *Mobj, i32);
+pub def RpgCmdHook:   fun(*Game, *Player, i32);
+pub def RpgSpawnHook: fun(*Game, *Player);
 
 pub rec Game {
     lv:  *level.Level;
@@ -406,6 +466,16 @@ pub rec Game {
     run_action:   ActionHook;
     line_special: SpecialHook;
     start_sound:  SoundHook;
+
+    # the character system's calls, installed with the three above. Each
+    # one checks rpg_on first, so they cost a branch and nothing more in
+    # a game with no characters
+    rpg_out:   RpgScaleHook;
+    rpg_in:    RpgScaleHook;
+    rpg_kill:  RpgKillHook;
+    rpg_hit:   RpgHitHook;
+    rpg_cmd:   RpgCmdHook;
+    rpg_spawn: RpgSpawnHook;
 
     # the game
     gameskill:       i32;
@@ -579,6 +649,27 @@ pub rec Game {
 
     # p_user
     onground: bool;
+
+    # the character system's part of the game. rpg_on is set when any
+    # seat's stat block is nonzero; everything the hooks do is gated on
+    # it, so a game with no characters is byte-for-byte the vanilla one.
+    # stats is each seat's bought nodes and weapon levels; rt is per-seat
+    # ability state, reset at a level or a respawn; deaths counts how
+    # often each map thing's monster has respawned, for XP decay; log is
+    # the tic's reward events, drained by the session for its journal.
+    rpg_on:      bool;
+    rpg_stats:   [4]RpgStats;
+    rpg_rt:      [4]RpgRt;
+    rpg_deaths:  *u8;
+    rpg_ndeaths: i32;
+    rpg_log:     [256]RpgEvent;
+    rpg_nlog:    i32;
+    rpg_over:    i32;
+
+    # co-op friendly fire, as the host chose: set, players hurt, hit and
+    # block one another as in the original game; unset, teammates()
+    # suppresses all of it
+    friendlyfire: bool;
 }
 
 val CHUNK: usize = 1 << 20;

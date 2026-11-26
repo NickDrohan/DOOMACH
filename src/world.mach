@@ -416,6 +416,11 @@ fun nightmare_respawn(g: *Game, mobj: *Mobj) {
     # inherit attributes from deceased one
     mo            = spawn_mobj(g, x, y, z, mobj.kind);
     mo.spawnpoint = mobj.spawnpoint;
+    mo.spawnid    = mobj.spawnid;
+    # a life spent: its XP decays one map-step each time it comes back
+    if (mo.spawnid >= 0 && mo.spawnid < g.rpg_ndeaths && g.rpg_deaths[mo.spawnid] < 255) {
+        g.rpg_deaths[mo.spawnid] = g.rpg_deaths[mo.spawnid] + 1;
+    }
     mo.angle      = t.ANG45 * (mobj.spawnpoint.angle::i32 / 45):~u32;
 
     if ((mobj.spawnpoint.options::i32 & defs.MTF_AMBUSH) != 0) { mo.flags = mo.flags | defs.MF_AMBUSH; }
@@ -505,6 +510,9 @@ pub fun spawn_mobj(g: *Game, x: Fixed, y: Fixed, z: Fixed, kind: i32) *Mobj {
         mobj.z = z;
     }
 
+    mobj.spawnid = -1;
+    mobj.rpgseat = defs.RPG_NONE;
+    mobj.rpgwp   = defs.RPG_NONE;
     mobj.thinker.kind = defs.TH_MOBJ;
     add_thinker(g, ?mobj.thinker);
     ret mobj;
@@ -562,6 +570,10 @@ pub fun player_reborn(g: *Game, player: i32) {
         p.maxammo[i] = MAXAMMO[i];
         i            = i + 1;
     }
+
+    # a character's spawn: its bought health and kit, if a stat block is in
+    p.maxhealth = defs.MAXHEALTH;
+    if (g.rpg_on) { g.rpg_spawn(g, p); }
 }
 
 # P_SpawnPlayer: called when a player is spawned on the level. most of the
@@ -610,7 +622,7 @@ pub fun spawn_player(g: *Game, mthing: *level.Thing) {
 }
 
 # P_SpawnMapThing
-pub fun spawn_map_thing(g: *Game, mthing: *level.Thing) {
+pub fun spawn_map_thing(g: *Game, mthing: *level.Thing, spawnid: i32) {
     val kind: i32 = mthing.kind::i32;
 
     # count deathmatch start positions
@@ -668,6 +680,7 @@ pub fun spawn_map_thing(g: *Game, mthing: *level.Thing) {
 
     val mobj: *Mobj = spawn_mobj(g, x, y, z, i);
     mobj.spawnpoint = @mthing;
+    mobj.spawnid    = spawnid;
 
     if (mobj.tics > 0)                         { mobj.tics = 1 + (defs.p_random(g) % mobj.tics); }
     if ((mobj.flags & defs.MF_COUNTKILL) != 0) { g.totalkills = g.totalkills + 1; }
@@ -917,16 +930,40 @@ pub fun setup_psprites(g: *Game, player: *Player) {
 
 # P_MovePsprites: called every tic by player thinking routine
 pub fun move_psprites(g: *Game, player: *Player) {
+    # a character's ability state ticks here, this routine being called
+    # once a player a tic alive or dead (rpg.mach): the two cooldowns,
+    # and Stim's burst, whose accumulator earns whole extra passes of
+    # the psprite clock — faster fire on the vanilla frames themselves
+    var extra: i32 = 0;
+    if (g.rpg_on) {
+        val seat: i32 = player_number(g, player);
+        if (seat >= 0) {
+            val rt: *defs.RpgRt = ?g.rpg_rt[seat];
+            if (rt.blinkcd  > 0) { rt.blinkcd  = rt.blinkcd  - 1; }
+            if (rt.stimcd   > 0) { rt.stimcd   = rt.stimcd   - 1; }
+            if (rt.stimleft > 0) {
+                rt.stimleft = rt.stimleft - 1;
+                rt.stimacc  = rt.stimacc + 32768;
+                for (rt.stimacc >= 65536) {
+                    rt.stimacc = rt.stimacc - 65536;
+                    extra      = extra + 1;
+                }
+            }
+        }
+    }
+
     var i: i32 = 0;
     for (i < defs.NUMPSPRITES) {
         val psp: *Pspdef = ?player.psprites[i];
         # a null state means not active
         if (psp.state != info.S_NULL) {
             # drop tic count and possibly change state; a -1 tic count never
-            # changes
-            if (psp.tics != -1) {
+            # changes. a Stim pass does it again, into the next states too
+            var reps: i32 = 1 + extra;
+            for (reps > 0 && psp.tics != -1) {
                 psp.tics = psp.tics - 1;
                 if (psp.tics == 0) { set_psprite(g, player, i, info.st_next(psp.state)); }
+                reps = reps - 1;
             }
         }
         i = i + 1;
@@ -1087,10 +1124,10 @@ fun give_weapon(g: *Game, player: *Player, weapon: i32, dropped: bool) bool {
 # ---
 # ret: false if the body isn't needed at all
 pub fun give_body(player: *Player, num: i32) bool {
-    if (player.health >= defs.MAXHEALTH) { ret 0; }
+    if (player.health >= player.maxhealth) { ret 0; }
 
     player.health = player.health + num;
-    if (player.health > defs.MAXHEALTH) { player.health = defs.MAXHEALTH; }
+    if (player.health > player.maxhealth) { player.health = player.maxhealth; }
     player.mo.health = player.health;
     ret 1;
 }
@@ -1209,7 +1246,7 @@ fun touch_special_thing(g: *Game, special: *Mobj, toucher: *Mobj) {
     or (sprite == info.SPR_BON1) {
         # bonus items; can go over 100%
         player.health = player.health + 1;
-        if (player.health > 200) { player.health = 200; }
+        if (player.health > player.maxhealth + 100) { player.health = player.maxhealth + 100; }
         player.mo.health = player.health;
         player.message   = "Picked up a health bonus.";
     }
@@ -1222,7 +1259,7 @@ fun touch_special_thing(g: *Game, special: *Mobj, toucher: *Mobj) {
     }
     or (sprite == info.SPR_SOUL) {
         player.health = player.health + 100;
-        if (player.health > 200) { player.health = 200; }
+        if (player.health > player.maxhealth + 100) { player.health = player.maxhealth + 100; }
         player.mo.health = player.health;
         player.message   = "Supercharge!";
         sound            = info.SFX_GETPOW;
@@ -1265,6 +1302,11 @@ fun touch_special_thing(g: *Game, special: *Mobj, toucher: *Mobj) {
     or (sprite == info.SPR_STIM) {
         # medikits, heals
         if (!give_body(player, 10)) { ret; }
+        # a stimpack readies a character's Stim again (rpg.mach)
+        if (g.rpg_on) {
+            val seat: i32 = player_number(g, player);
+            if (seat >= 0) { g.rpg_rt[seat].stimcd = 0; }
+        }
         player.message = "Picked up a stimpack.";
     }
     or (sprite == info.SPR_MEDI) {
@@ -1506,6 +1548,8 @@ fun kill_mobj(g: *Game, source: *Mobj, target: *Mobj) {
         g.players[0].killcount = g.players[0].killcount + 1;
     }
 
+    if (g.rpg_on && (target.flags & defs.MF_COUNTKILL) != 0) { g.rpg_kill(g, source, target); }
+
     if (target.player != nil) {
         # count environment kills against you
         if (source == nil) {
@@ -1548,6 +1592,20 @@ fun kill_mobj(g: *Game, source: *Mobj, target: *Mobj) {
     mo.flags = mo.flags | defs.MF_DROPPED;
 }
 
+# the weapon a player hurt something with, for the bookkeeping: the
+# held weapon for a direct blow (a bullet, pellet, punch or saw, all of
+# which deal their damage in the same call), or the missile's kind for a
+# projectile. Anything else is no weapon of theirs.
+fun rpg_weapon_of(source: *Mobj, inflictor: *Mobj) i32 {
+    if (source == nil || source.player == nil) { ret defs.RPG_NONE::i32; }
+    if (inflictor == nil)                      { ret defs.RPG_NONE::i32; }
+    if (inflictor == source)                   { ret source.player.readyweapon; }
+    if (inflictor.kind == info.MT_ROCKET)      { ret defs.WP_MISSILE; }
+    if (inflictor.kind == info.MT_PLASMA)      { ret defs.WP_PLASMA; }
+    if (inflictor.kind == info.MT_BFG)         { ret defs.WP_BFG; }
+    ret defs.RPG_NONE::i32;
+}
+
 # P_DamageMobj: damages both enemies and players
 # ---
 # target:    the thing hurt
@@ -1564,6 +1622,22 @@ pub fun damage_mobj(g: *Game, target: *Mobj, inflictor: *Mobj, source: *Mobj, da
         ret;
     }
     if (target.health <= 0) { ret; }
+    if (teammates(g, target, source)) { ret; }
+
+    # a character's say in the damage (rpg.mach): the shooter's scale on
+    # a monster, the target's reduction from a monster or the world, and
+    # the weapon noted for the kill bonus. Player on player is always
+    # the vanilla amount, whichever way friendly fire is set.
+    var hitweapon: i32 = defs.RPG_NONE::i32;
+    if (g.rpg_on) {
+        if (source != nil && source.player != nil && target.player == nil) {
+            hitweapon = rpg_weapon_of(source, inflictor);
+            damage    = g.rpg_out(g, source.player, hitweapon, damage);
+        }
+        if (target.player != nil && (source == nil || source.player == nil)) {
+            damage = g.rpg_in(g, target.player, defs.RPG_NONE::i32, damage);
+        }
+    }
 
     if ((target.flags & defs.MF_SKULLFLY) != 0) {
         target.momx = 0;
@@ -1633,6 +1707,13 @@ pub fun damage_mobj(g: *Game, target: *Mobj, inflictor: *Mobj, source: *Mobj, da
     }
 
     # do the damage
+    if (hitweapon != defs.RPG_NONE::i32 && (target.flags & defs.MF_COUNTKILL) != 0) {
+        var eff: i32 = damage;
+        if (eff > target.health) { eff = target.health; }
+        g.rpg_hit(g, source.player, hitweapon, target, eff);
+        target.rpgseat = player_number(g, source.player)::u8;
+        target.rpgwp   = hitweapon::u8;
+    }
     target.health = target.health - damage;
     if (target.health <= 0) {
         kill_mobj(g, source, target);
@@ -1792,6 +1873,14 @@ fun check_line(g: *Game, linenum: i32) bool {
     ret 1;
 }
 
+# Co-op players, two different ones: they pass through one another, and
+# through one another's fire. Players walking through each other stood in
+# each other's line of fire, and E1M3's bots shot each other twice as much.
+pub fun teammates(g: *Game, a: *Mobj, b: *Mobj) bool {
+    if (g.deathmatch != 0 || g.friendlyfire || a == nil || b == nil || a == b) { ret 0; }
+    ret a.player != nil && b.player != nil;
+}
+
 # PIT_CheckThing
 fun check_thing(g: *Game, thing: *Mobj) bool {
     val tmthing: *Mobj = g.tmthing;
@@ -1806,6 +1895,10 @@ fun check_thing(g: *Game, thing: *Mobj) bool {
 
     # don't clip against self
     if (thing == tmthing) { ret 1; }
+
+    # in co-op, players walk through one another: two meeting in a corridor
+    # one wide would otherwise stand nose to nose
+    if (teammates(g, thing, tmthing)) { ret 1; }
 
     # check for skulls slamming into things
     if ((tmthing.flags & defs.MF_SKULLFLY) != 0) {
@@ -1825,6 +1918,8 @@ fun check_thing(g: *Game, thing: *Mobj) bool {
 
     # missiles can hit other things
     if ((tmthing.flags & defs.MF_MISSILE) != 0) {
+        # but in co-op, a player's missile passes through teammates
+        if (teammates(g, thing, tmthing.target)) { ret 1; }
         # see if it went over / under
         if (tmthing.z > thing.z + thing.height) {
             # overhead
@@ -2222,6 +2317,7 @@ fun aim_traverse(g: *Game, in: *Intercept) bool {
         # corpse or something
         ret 1;
     }
+    if (teammates(g, th, g.shootthing)) { ret 1; }
 
     # check angles to see if the thing can be aimed at
     val dist:          Fixed = fixed.mul(g.attackrange, in.frac);
@@ -2315,6 +2411,7 @@ fun shoot_traverse(g: *Game, in: *Intercept) bool {
         # corpse or something
         ret 1;
     }
+    if (teammates(g, th, g.shootthing)) { ret 1; }
 
     # check angles to see if the thing can be aimed at
     val dist:          Fixed = fixed.mul(g.attackrange, in.frac);

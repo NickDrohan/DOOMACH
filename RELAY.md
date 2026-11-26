@@ -6,18 +6,18 @@ router that drops datagrams nobody asked for. The relay is a small UDP server bo
 game datagram goes game → relay → game. The relay never reads the game inside them; lockstep,
 the checksums and the desync alarm work exactly as they do directly.
 
-**Live:** `mach-doom-relay.fly.dev`, UDP port 5029 (dedicated IPv4 137.66.49.243), Fly.io region
+**Live:** `doomach.fly.dev`, UDP port 5029 (dedicated IPv4 137.66.49.243), Fly.io region
 `iad`, deployed 2026-10-02. The same machine serves the download page at
-<https://mach-doom-relay.fly.dev/> with [hedge](https://github.com/briar-systems/hedge).
+<https://doomach.fly.dev/> with [hedge](https://github.com/briar-systems/hedge).
 
 The game's menu uses this relay by default ("Play online"). From the command line:
 
 ```
-doom host <wad> [<players> [<map> [<skill>]]] --relay mach-doom-relay.fly.dev   # shows the code
-doom join <wad> <CODE> --relay mach-doom-relay.fly.dev
+doom host <wad> [<players> [<map> [<skill>]]] --relay doomach.fly.dev   # shows the code
+doom join <wad> <CODE> --relay doomach.fly.dev
 ```
 
-or set `DOOM_RELAY=mach-doom-relay.fly.dev` and leave out `--relay`.
+or set `DOOM_RELAY=doomach.fly.dev` and leave out `--relay`.
 
 ## What it does, and what it deliberately does not
 
@@ -104,7 +104,7 @@ Settings come from the environment as well: `RELAY_BIND_HOST` (default `0.0.0.0`
 `RELAY_MAX_ROOMS` (32, at most 256). It logs what happens to each room by its code, with no
 addresses: opened for how many players, each player joining, the start, a player leaving or
 timing out, the close with how long the game was played, and each refusal with its reason; and
-the totals when the number of rooms changes and once a minute. `flyctl logs -a mach-doom-relay`
+the totals when the number of rooms changes and once a minute. `flyctl logs -a doomach`
 shows them live, which is how a game between friends can be followed from here.
 
 ## The machine
@@ -126,8 +126,8 @@ stages them in `out/deploy`, and deploys:
 bash deploy.sh            # or deploy.sh --stage to stop before deploying
 ```
 
-From nothing, once: `flyctl apps create mach-doom-relay`, `flyctl ips allocate-v4 -a
-mach-doom-relay` (UDP needs a dedicated IPv4; $2 a month), then the deploy above. The machine is
+From nothing, once: `flyctl apps create doomach`, `flyctl ips allocate-v4 -a
+doomach` (UDP needs a dedicated IPv4; $2 a month), then the deploy above. The machine is
 `shared-cpu-1x` with 256 MB and never stops, since Fly cannot wake a stopped machine for UDP:
-about $2 for the machine and $2 for the address, a month. The page adds nothing to that. `flyctl logs -a mach-doom-relay` shows
+about $2 for the machine and $2 for the address, a month. The page adds nothing to that. `flyctl logs -a doomach` shows
 the room counts.

@@ -1,0 +1,442 @@
+# the character system: Slayer XP, weapon XP, and what the nodes bought
+# with them do to the simulation
+#
+# Every seat's character is a stat block (RpgStats in defs.mach): the
+# ranks bought into each node and the level each weapon has reached. A
+# game in which every block is zero is the vanilla game: g.rpg_on is
+# never set, and each hook below returns at its first line. The hooks
+# are installed with the others (tick.install_hooks); the simulation
+# calls them, they emit reward events into g.rpg_log, and the session
+# drains the log (game.rpg_drain) into per-seat totals and its journal
+# queue. All of it is deterministic: every machine produces the same
+# events from the same commands.
+
+use std.types.bool.bool;
+
+use doom.defs;
+use doom.defs.Game;
+use doom.defs.Mobj;
+use doom.defs.Player;
+use doom.defs.RpgStats;
+use doom.fixed;
+use doom.fixed.Fixed;
+use doom.info;
+use doom.random;
+use doom.world;
+use t: doom.tables;
+
+# the nodes a point can buy. NODE_KIT_* are one-time buys: they stock
+# the inventory every fresh spawn gets. The rest are ranks.
+pub val NODE_MAXHP:   i32 = 0;   # +5 max health a rank
+pub val NODE_DMG:     i32 = 1;   # +1% damage a rank
+pub val NODE_DR:      i32 = 2;   # x0.98 damage taken a rank
+pub val NODE_SGDMG:   i32 = 3;   # +2% shotgun damage a rank
+pub val NODE_BLINK:   i32 = 4;   # one-time: Blink
+pub val NODE_STIM:    i32 = 5;   # one-time: Stim
+pub val NODE_KIT_SG:  i32 = 6;   # kit: shotgun and 8 shells
+pub val NODE_KIT_SAW: i32 = 7;   # kit: chainsaw
+pub val NODE_KIT_GA:  i32 = 8;   # kit: green armor
+pub val NODE_KIT_PK:  i32 = 9;   # kit: backpack
+pub val NODE_KIT_CG:  i32 = 10;  # kit: chaingun and 20 bullets
+pub val NODE_KIT_BZ:  i32 = 11;  # kit: berserk fists for the map
+pub val NODE_KIT_BA:  i32 = 12;  # kit: blue armor; needs green at purchase
+pub val NODE_KIT_RL:  i32 = 13;  # kit: rocket launcher and 2 rockets
+pub val NODE_KIT_PL:  i32 = 14;  # kit: plasma rifle (registered only)
+pub val NODE_KIT_BFG: i32 = 15;  # kit: BFG 9000 (registered only)
+pub val N_NODES:      i32 = 16;
+
+# the BT_SPECIAL payloads a ticcmd's buttons byte carries: 1..N_NODES
+# allocates that node, these fire the two abilities
+pub val CMD_BLINK: i32 = 126;
+pub val CMD_STIM:  i32 = 127;
+
+# the six weapons weapon XP knows, in the doc's order
+pub val WX_FIST: i32 = 0;
+pub val WX_SAW:  i32 = 1;
+pub val WX_PIS:  i32 = 2;
+pub val WX_SG:   i32 = 3;
+pub val WX_CG:   i32 = 4;
+pub val WX_RL:   i32 = 5;
+pub val N_WX:    i32 = 6;
+
+# the weapon XP track a WP_* weapon earns on, or -1
+pub fun wx_index(weapon: i32) i32 {
+    if (weapon == defs.WP_FIST)     { ret WX_FIST; }
+    if (weapon == defs.WP_CHAINSAW) { ret WX_SAW; }
+    if (weapon == defs.WP_PISTOL)   { ret WX_PIS; }
+    if (weapon == defs.WP_SHOTGUN)  { ret WX_SG; }
+    if (weapon == defs.WP_CHAINGUN) { ret WX_CG; }
+    if (weapon == defs.WP_MISSILE)  { ret WX_RL; }
+    ret -1;
+}
+
+# the level a Slayer XP total has reached: 1 at zero, capped at 1000
+pub fun level_of(xp: i64) i32 {
+    var l:   i32 = 1;
+    var sum: i64 = 0;
+    for (l < 1000) {
+        val need: i64 = 13000 + 5 * l::i64;
+        if (xp - sum < need) { brk; }
+        sum = sum + need;
+        l   = l + 1;
+    }
+    ret l;
+}
+
+# the level a weapon XP total has reached: 1 at zero, uncapped
+pub fun wlevel_of(xp: i64) i32 {
+    var m:   i32 = 1;
+    var sum: i64 = 0;
+    for {
+        val need: i64 = 3600 + 900 * m::i64 + 54 * m::i64 * m::i64;
+        if (xp - sum < need) { brk; }
+        sum = sum + need;
+        m   = m + 1;
+    }
+    ret m;
+}
+
+# base Slayer XP a kind of monster is worth: the doc's table, and
+# max(5, hp/5) by spawn health for anything unlisted
+pub fun base_xp(g: *Game, kind: i32) i32 {
+    if (kind == info.MT_POSSESSED) { ret 10; }
+    if (kind == info.MT_SHOTGUY)   { ret 15; }
+    if (kind == info.MT_TROOP)     { ret 20; }
+    if (kind == info.MT_SERGEANT)  { ret 30; }
+    if (kind == info.MT_SHADOWS)   { ret 40; }
+    if (kind == info.MT_BRUISER)   { ret 150; }
+    var hp: i32 = info.mi(kind, info.MI_SPAWNHEALTH);
+    hp = (hp + 4) / 5;
+    if (hp < 5) { hp = 5; }
+    ret hp;
+}
+
+# the map number the multiplier works by: E1M1 is 1, E1M9 is 9, E2M1 is 10
+pub fun mapnum(g: *Game) i32 {
+    ret (g.gameepisode - 1) * 9 + g.gamemap;
+}
+
+# the map multiplier less the thing's respawns, never below zero
+fun decay(g: *Game, thingid: i32) i32 {
+    var r: i32 = 0;
+    if (g.rpg_deaths != nil && thingid >= 0 && thingid < g.rpg_ndeaths) { r = g.rpg_deaths[thingid]::i32; }
+    val m: i32 = mapnum(g) - r;
+    if (m < 0) { ret 0; }
+    ret m;
+}
+
+# how many seats are human: bots are party members for kills only
+pub fun humans(g: *Game) i32 {
+    var n: i32 = 0;
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (g.playeringame[i] && !g.isbot[i]) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# which seat a player record is
+fun seat_of(g: *Game, p: *Player) i32 {
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (p == ?g.players[i]) { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# whether this game may be journaled: a four-seat co-op on Nightmare
+pub fun earning(g: *Game) bool {
+    # co-op on Nightmare with all four seats playing; bots fill a seat but
+    # play a vanilla game and progress nothing, and the kill still pays
+    if (g.deathmatch != 0 || g.nomonsters || g.gameskill != defs.SK_NIGHTMARE) { ret 0; }
+    var i: i32 = 0;
+    for (i < defs.MAXPLAYERS) {
+        if (!g.playeringame[i]) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# put one reward event on the tic's log; past the bound the count only grows
+fun emit(g: *Game, kind: u8, seat: u8, weapon: u8, aux: u8, xp: i32) {
+    if (g.rpg_nlog < 256) {
+        g.rpg_log[g.rpg_nlog].kind   = kind;
+        g.rpg_log[g.rpg_nlog].seat   = seat;
+        g.rpg_log[g.rpg_nlog].weapon = weapon;
+        g.rpg_log[g.rpg_nlog].aux    = aux;
+        g.rpg_log[g.rpg_nlog].xp     = xp;
+        g.rpg_nlog = g.rpg_nlog + 1;
+        ret;
+    }
+    g.rpg_over = g.rpg_over + 1;
+}
+
+# --------------------------------------------------------------- hooks
+
+# g.rpg_out: a player's damage to a monster, scaled by the damage nodes:
+# +1% a rank of Damage, +2% a rank of shotgun damage on the shotgun.
+# Integer Doom cannot feel a percent at a time, so the fraction rounds
+# stochastically on the character system's own random walk; the walk the
+# simulation shares is never drawn for it.
+pub fun scale_out(g: *Game, player: *Player, weapon: i32, damage: i32) i32 {
+    if (!g.rpg_on) { ret damage; }
+    val seat: i32 = seat_of(g, player);
+    if (seat < 0) { ret damage; }
+    val b:   *RpgStats = ?g.rpg_stats[seat];
+    var pct: i32       = b.nodes[NODE_DMG]::i32;
+    if (weapon == defs.WP_SHOTGUN) { pct = pct + 2 * b.nodes[NODE_SGDMG]::i32; }
+    ret scale_by(g, damage, pct);
+}
+
+# multiply by (100 + pct) / 100, stochastically rounding the fraction
+fun scale_by(g: *Game, v: i32, pct: i32) i32 {
+    if (pct <= 0) { ret v; }
+    val scaled: i64 = v::i64 * (100 + pct)::i64;
+    var out:    i64 = scaled / 100;
+    val frac:   i64 = scaled - out * 100;
+    if (frac > 0 && random.rpg_random(?g.rnd)::i64 * 100 < frac * 256) { out = out + 1; }
+    # overflow insurance, per the doc
+    if (out > 1000000) { out = 1000000; }
+    ret out::i32;
+}
+
+# g.rpg_in: damage a monster or the world deals a character, cut by the
+# damage-reduction ranks: x0.98 a rank, multiplicative, never nothing
+pub fun scale_in(g: *Game, player: *Player, weapon: i32, damage: i32) i32 {
+    if (!g.rpg_on) { ret damage; }
+    val seat: i32 = seat_of(g, player);
+    if (seat < 0) { ret damage; }
+    var out: i32 = damage;
+    var r:   i32 = g.rpg_stats[seat].nodes[NODE_DR]::i32;
+    for (r > 0) {
+        out = out * 98 / 100;
+        r   = r - 1;
+    }
+    ret out;
+}
+
+# g.rpg_kill: a monster died. Its Slayer XP — base times the map's
+# number, one map-step less for each life it already spent — is every
+# human's. The weapon that landed it, if a player's did, earns the kill
+# bonus for that seat.
+pub fun killed(g: *Game, source: *Mobj, target: *Mobj) {
+    if (!g.rpg_on) { ret; }
+    val n:    i32 = decay(g, target.spawnid);
+    var who:  u8  = defs.RPG_NONE;
+    var seat: i32 = -1;
+    if (source != nil && source.player != nil) { seat = seat_of(g, source.player); }
+    if (seat >= 0) {
+        who = target.rpgwp;
+        if (who != defs.RPG_NONE) {
+            emit(g, defs.REV_HIT, seat::u8, who, 0, 10 * n * humans(g));
+        }
+    }
+    var kseat: u8 = defs.RPG_NONE;
+    if (seat >= 0) { kseat = seat::u8; }
+    emit(g, defs.REV_KILL, kseat, who, target.kind::u8, base_xp(g, target.kind) * n);
+}
+
+# g.rpg_hit: a player's weapon dealt damage to a monster. Weapon XP is
+# the dealt amount capped at the health it had — upgrades cannot inflate
+# it — times the map step and the party size.
+pub fun hit(g: *Game, player: *Player, weapon: i32, target: *Mobj, eff: i32) {
+    if (!g.rpg_on) { ret; }
+    val seat: i32 = seat_of(g, player);
+    if (seat < 0) { ret; }
+    emit(g, defs.REV_HIT, seat::u8, weapon::u8, 0, eff * decay(g, target.spawnid) * humans(g));
+}
+
+# g.rpg_cmd: a BT_SPECIAL tic arrived for this seat. 1..N_NODES spends a
+# point on the node (the owning client already decided it could afford
+# it; a peer never second-guesses) and the two payloads fire Blink and
+# Stim when bought.
+pub fun command(g: *Game, player: *Player, payload: i32) {
+    if (!g.rpg_on) { ret; }
+    val seat: i32 = seat_of(g, player);
+    if (seat < 0) { ret; }
+    val b: *RpgStats = ?g.rpg_stats[seat];
+    if (payload >= 1 && payload <= N_NODES) {
+        val node: i32 = payload - 1;
+        if (b.nodes[node] < 255) { b.nodes[node] = b.nodes[node] + 1; }
+        if (node == NODE_MAXHP) {
+            player.maxhealth = player.maxhealth + 5;
+            player.health    = player.health + 5;
+            if (player.mo != nil) { player.mo.health = player.health; }
+        }
+        emit(g, defs.REV_ALLOC, seat::u8, defs.RPG_NONE, node::u8, 0);
+        ret;
+    }
+    if (payload == CMD_BLINK) { blink(g, player, seat); ret; }
+    if (payload == CMD_STIM)  { stim(g, player, seat); ret; }
+}
+
+# g.rpg_spawn: a seat with a fresh inventory — a campaign start, a
+# respawn, or a stat block installed after the level was entered — gets
+# its bought health and kit.
+pub fun spawned(g: *Game, player: *Player) {
+    if (!g.rpg_on) { ret; }
+    val seat: i32 = seat_of(g, player);
+    if (seat < 0) { ret; }
+    spawn_fx(g, player, seat);
+}
+
+fun give_ammo(player: *Player, am: i32, n: i32) {
+    player.ammo[am] = player.ammo[am] + n;
+    if (player.ammo[am] > player.maxammo[am]) { player.ammo[am] = player.maxammo[am]; }
+}
+
+fun spawn_fx(g: *Game, player: *Player, seat: i32) {
+    val b: *RpgStats = ?g.rpg_stats[seat];
+    player.maxhealth = defs.MAXHEALTH + 5 * b.nodes[NODE_MAXHP]::i32;
+    player.health    = player.maxhealth;
+    if (player.mo != nil) { player.mo.health = player.health; }
+
+    # the kit the points bought, on top of pistol and fifty bullets
+    if (b.nodes[NODE_KIT_PK] != 0) {
+        player.backpack = 1;
+        var i: i32 = 0;
+        for (i < defs.NUMAMMO) {
+            player.maxammo[i] = player.maxammo[i] * 2;
+            i                 = i + 1;
+        }
+    }
+    if (b.nodes[NODE_KIT_SG] != 0) {
+        player.weaponowned[defs.WP_SHOTGUN] = 1;
+        give_ammo(player, defs.AM_SHELL, 8);
+    }
+    if (b.nodes[NODE_KIT_SAW] != 0) { player.weaponowned[defs.WP_CHAINSAW] = 1; }
+    if (b.nodes[NODE_KIT_CG] != 0) {
+        player.weaponowned[defs.WP_CHAINGUN] = 1;
+        give_ammo(player, defs.AM_CLIP, 20);
+    }
+    if (b.nodes[NODE_KIT_RL] != 0) {
+        player.weaponowned[defs.WP_MISSILE] = 1;
+        give_ammo(player, defs.AM_MISL, 2);
+    }
+    if (!g.shareware) {
+        if (b.nodes[NODE_KIT_PL] != 0) {
+            player.weaponowned[defs.WP_PLASMA] = 1;
+            give_ammo(player, defs.AM_CELL, 40);
+        }
+        if (b.nodes[NODE_KIT_BFG] != 0) {
+            player.weaponowned[defs.WP_BFG] = 1;
+            give_ammo(player, defs.AM_CELL, 40);
+        }
+    }
+    if (b.nodes[NODE_KIT_GA] != 0 && player.armortype == 0) {
+        player.armortype   = 1;
+        player.armorpoints = 100;
+    }
+    if (b.nodes[NODE_KIT_BA] != 0) {
+        player.armortype   = 2;
+        player.armorpoints = 200;
+    }
+    if (b.nodes[NODE_KIT_BZ] != 0) { player.powers[defs.PW_STRENGTH] = 1; }
+
+    # ability state dies with the body
+    var blank: defs.RpgRt;
+    g.rpg_rt[seat] = blank;
+}
+
+# ---------------------------------------------------------- the blocks
+
+# whether a stat block is all zeros: no character at all
+pub fun block_zero(b: *RpgStats) bool {
+    var i: i32 = 0;
+    for (i < 40) {
+        if (b.nodes[i] != 0) { ret 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 6) {
+        if (b.wlevel[i] != 0) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# install one seat's stat block, as every machine must compute alike:
+# from the local profile, from a save, or from the wire. A seat already
+# standing gets the spawn effects at once — blocks arrive before the
+# first tic but after the level was entered.
+pub fun set_block(g: *Game, seat: i32, block: *RpgStats) {
+    if (seat < 0 || seat >= defs.MAXPLAYERS) { ret; }
+    g.rpg_stats[seat] = @block;
+    # a character is here whenever a block was sent — ver marks one even
+    # before its first rank, and only a true empty block is nobody
+    if (block.ver == 0 && block_zero(block)) { ret; }
+    g.rpg_on = 1;
+    if (block_zero(block)) { ret; }
+    val p: *Player = ?g.players[seat];
+    if (g.playeringame[seat] && p.playerstate == defs.PST_LIVE) { spawn_fx(g, p, seat); }
+}
+
+# ------------------------------------------------------------- Blink
+
+# a short teleport along the facing, as the doc has it: ordinary
+# movement in half-radius steps, so it stops wherever walking would —
+# the wall, the ledge, the blocker — and each step fires the walk-over
+# lines it crosses, exactly as walking there would have. Eight seconds
+# between uses; ranks can shorten it later.
+fun blink(g: *Game, player: *Player, seat: i32) {
+    if (g.rpg_stats[seat].nodes[NODE_BLINK] == 0) { ret; }
+    if (g.rpg_rt[seat].blinkcd != 0)              { ret; }
+    if (player.mo == nil || player.mo.health <= 0) { ret; }
+
+    val an:   u32   = player.mo.angle >> t.ANGLETOFINESHIFT;
+    val step: Fixed = player.mo.radius / 2;
+    val dx:   Fixed = fixed.mul(step, t.FINESINE[an + t.COSINE::u32]);
+    val dy:   Fixed = fixed.mul(step, t.FINESINE[an]);
+    val want: i32   = (256 * 65536) / step;
+    var k:    i32   = 0;
+    for (k < want) {
+        if (!world.try_move(g, player.mo, player.mo.x + dx, player.mo.y + dy)) { brk; }
+        k = k + 1;
+    }
+    g.rpg_rt[seat].blinkcd = 8 * 35;
+}
+
+# -------------------------------------------------------------- Stim
+
+# a timed burst of faster fire on the vanilla frames: the per-weapon
+# accumulator is read by move_psprites; a stimpack resets the cooldown.
+fun stim(g: *Game, player: *Player, seat: i32) {
+    if (g.rpg_stats[seat].nodes[NODE_STIM] == 0) { ret; }
+    if (g.rpg_rt[seat].stimcd != 0)              { ret; }
+    g.rpg_rt[seat].stimleft = 6 * 35;
+    g.rpg_rt[seat].stimcd   = 45 * 35;
+    g.rpg_rt[seat].stimacc  = 0;
+}
+
+# ------------------------------------------------------------- tests
+
+test level_of__curve {
+    if (level_of(0) != 1)            { ret 1; }
+    if (level_of(13004) != 1)        { ret 2; }
+    if (level_of(13005) != 2)        { ret 3; }
+    if (level_of(15466504) != 998)   { ret 4; }
+    if (level_of(15466505) != 999)   { ret 5; }
+    if (level_of(15484499) != 999)   { ret 6; }
+    if (level_of(15484500) != 1000)  { ret 7; }
+    if (level_of(99999999999) != 1000) { ret 8; }
+    ret 0;
+}
+
+test wlevel_of__curve {
+    if (wlevel_of(0) != 1)           { ret 1; }
+    if (wlevel_of(4553) != 1)        { ret 2; }
+    if (wlevel_of(4554) != 2)        { ret 3; }
+    if (wlevel_of(106289) != 10)     { ret 4; }
+    if (wlevel_of(106290) != 11)     { ret 5; }
+    ret 0;
+}
+
+test wx_index__weapons {
+    if (wx_index(defs.WP_FIST) != WX_FIST)     { ret 1; }
+    if (wx_index(defs.WP_SHOTGUN) != WX_SG)    { ret 2; }
+    if (wx_index(defs.WP_MISSILE) != WX_RL)    { ret 3; }
+    if (wx_index(defs.WP_PLASMA) != -1)        { ret 4; }
+    ret 0;
+}

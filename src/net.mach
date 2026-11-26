@@ -15,15 +15,24 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-use io_error: std.io.error;
-use std.net.ip;
-use socket_api: std.net.socket;
-use std.net.udp;
+use std.system.capability;
+$if (capability.HAS_SOCKETS) {
+    use io_error: std.io.error;
+    use std.net.ip;
+    use socket_api: std.net.socket;
+    use std.net.udp;
+    def SockField: udp.Socket;
+}
+$or {
+    def SockField: usize;
+}
 use std.crypto.rand;
 
 use doom.defs;
 use doom.defs.Ticcmd;
+use doom.game;
 use rp: doom.relayproto;
+use doom.rpg;
 
 pub val PORT: u16 = 5029;
 
@@ -67,8 +76,90 @@ pub rec BotSeat {
     net:   [1326]i8;
 }
 
+val QCAP: i32 = 64;
+val QMAX: i32 = 1400;
+
+rec PacketQ {
+    data:  [64][1400]u8;
+    lens:  [64]i32;
+    head:  i32;
+    count: i32;
+}
+
+var outq:      PacketQ;
+var inq:       PacketQ;
+var lobbypkt:  [128]u8;
+var lobbylen:  i32;
+var watchq:    PacketQ;
+
+fun q_push(q: *PacketQ, src: *u8, len: i32) {
+    if (len <= 0 || len > QMAX) { ret; }
+    if (q.count >= QCAP) {
+        q.head  = (q.head + 1) % QCAP;
+        q.count = q.count - 1;
+    }
+    val slot: i32 = (q.head + q.count) % QCAP;
+    var k:    i32 = 0;
+    for (k < len) {
+        q.data[slot][k] = src[k];
+        k               = k + 1;
+    }
+    q.lens[slot] = len;
+    q.count      = q.count + 1;
+}
+
+fun q_pop(q: *PacketQ, dst: *u8, cap: i32) i32 {
+    if (q.count <= 0) { ret 0; }
+    val slot: i32 = q.head;
+    val len:  i32 = q.lens[slot];
+    q.head  = (q.head + 1) % QCAP;
+    q.count = q.count - 1;
+    if (len > cap) { ret 0; }
+    var k: i32 = 0;
+    for (k < len) {
+        dst[k] = q.data[slot][k];
+        k      = k + 1;
+    }
+    ret len;
+}
+
+pub fun clear_queues() {
+    outq.head  = 0;
+    outq.count = 0;
+    inq.head   = 0;
+    inq.count  = 0;
+    watchq.head  = 0;
+    watchq.count = 0;
+    lobbylen   = 0;
+}
+
+pub fun push_incoming(src: *u8, len: i32) {
+    if (!rp.is_relay(src, len)) { ret; }
+    val kind: u8 = src[4];
+    if (kind == rp.ROOMS) {
+        if (len <= 128) {
+            var k: i32 = 0;
+            for (k < len) {
+                lobbypkt[k] = src[k];
+                k           = k + 1;
+            }
+            lobbylen = len;
+        }
+        ret;
+    }
+    if (kind == rp.MATCH) {
+        q_push(?watchq, src, len);
+        ret;
+    }
+    q_push(?inq, src, len);
+}
+
+pub fun pop_outgoing(dst: *u8, cap: i32) i32 {
+    ret q_pop(?outq, dst, cap);
+}
+
 pub rec Net {
-    sock:   udp.Socket;
+    sock: SockField;
     opened: bool;
 
     # the game every machine agrees to play
@@ -122,6 +213,14 @@ pub rec Net {
     quick:      bool;
     # why the host or the relay turned this machine away, or 0
     refused: u8;
+    # co-op friendly fire, as the host chose: the host's flag reaches every
+    # joiner with the start, and a relay carries it in the room's flags
+    ff:      bool;
+    # each seat's character stat block (48 bytes, defs.RpgStats): mine goes
+    # out on every command I send; a peer's is kept from its first command
+    ff_pad:    i32;
+    blockmine: [48]u8;
+    rpgblocks: [4][48]u8;
 
     # through a relay: where it is, this player's token, the room's code,
     # how many have joined, and a count that paces the lobby messages
@@ -161,22 +260,24 @@ fun get32(p: *u8, at: i32) u32 {
     ret p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24);
 }
 
-fun endpoint_of(p: *Peer) ip.Endpoint {
-    ret ip.endpoint(p.octets[0], p.octets[1], p.octets[2], p.octets[3], p.port);
-}
+$if (capability.HAS_SOCKETS) {
+    fun endpoint_of(p: *Peer) ip.Endpoint {
+        ret ip.endpoint(p.octets[0], p.octets[1], p.octets[2], p.octets[3], p.port);
+    }
 
-fun same_peer(p: *Peer, ep: *ip.Endpoint) bool {
-    ret p.known && p.port == ep.port && p.octets[0] == ep.addr.v4.octets[0] && p.octets[1] == ep.addr.v4.octets[1] &&
-        p.octets[2] == ep.addr.v4.octets[2] && p.octets[3] == ep.addr.v4.octets[3];
-}
+    fun same_peer(p: *Peer, ep: *ip.Endpoint) bool {
+        ret p.known && p.port == ep.port && p.octets[0] == ep.addr.v4.octets[0] && p.octets[1] == ep.addr.v4.octets[1] &&
+            p.octets[2] == ep.addr.v4.octets[2] && p.octets[3] == ep.addr.v4.octets[3];
+    }
 
-fun set_peer(p: *Peer, ep: *ip.Endpoint) {
-    p.octets[0] = ep.addr.v4.octets[0];
-    p.octets[1] = ep.addr.v4.octets[1];
-    p.octets[2] = ep.addr.v4.octets[2];
-    p.octets[3] = ep.addr.v4.octets[3];
-    p.port      = ep.port;
-    p.known     = 1;
+    fun set_peer(p: *Peer, ep: *ip.Endpoint) {
+        p.octets[0] = ep.addr.v4.octets[0];
+        p.octets[1] = ep.addr.v4.octets[1];
+        p.octets[2] = ep.addr.v4.octets[2];
+        p.octets[3] = ep.addr.v4.octets[3];
+        p.port      = ep.port;
+        p.known     = 1;
+    }
 }
 
 fun begin(n: *Net, kind: u8) i32 {
@@ -187,6 +288,16 @@ fun begin(n: *Net, kind: u8) i32 {
     n.packet[4] = kind;
     n.packet[5] = n.me::u8;
     ret 6;
+}
+
+# a message to the relay itself
+fun to_relay(n: *Net, len: i32) {
+    $if (capability.HAS_SOCKETS) {
+        udp.send_to(?n.sock, ?n.wrap[0], len::usize, endpoint_of(?n.relay));
+    }
+    $or {
+        q_push(?outq, ?n.wrap[0], len);
+    }
 }
 
 fun send(n: *Net, peer: i32, len: i32) {
@@ -200,33 +311,32 @@ fun send(n: *Net, peer: i32, len: i32) {
             n.wrap[at + k] = n.packet[k];
             k              = k + 1;
         }
-        udp.send_to(?n.sock, ?n.wrap[0], (at + len)::usize, endpoint_of(?n.relay));
+        to_relay(n, at + len);
         ret;
     }
-    udp.send_to(?n.sock, ?n.packet[0], len::usize, endpoint_of(?n.peers[peer]));
+    $if (capability.HAS_SOCKETS) {
+        udp.send_to(?n.sock, ?n.packet[0], len::usize, endpoint_of(?n.peers[peer]));
+    }
 }
 
-# a message to the relay itself
-fun to_relay(n: *Net, len: i32) {
-    udp.send_to(?n.sock, ?n.wrap[0], len::usize, endpoint_of(?n.relay));
-}
-
-# read where a host or relay is: a.b.c.d with an optional :port, the port
-# the default when absent
-pub fun parse_address(text: str, out: *Peer) bool {
-    val parsed: res[ip.Endpoint, ip.ParseError] = ip.endpoint_parse(text);
-    var ep:     ip.Endpoint;
-    if (sel parsed.ok) {
-        ep = parsed.ok;
+$if (capability.HAS_SOCKETS) {
+    # read where a host or relay is: a.b.c.d with an optional :port, the port
+    # the default when absent
+    pub fun parse_address(text: str, out: *Peer) bool {
+        val parsed: res[ip.Endpoint, ip.ParseError] = ip.endpoint_parse(text);
+        var ep:     ip.Endpoint;
+        if (sel parsed.ok) {
+            ep = parsed.ok;
+        }
+        or {
+            val addr: res[ip.IPv4, ip.ParseError] = ip.ipv4_parse(text);
+            if (sel addr.err) { ret 0; }
+            ep = ip.endpoint_v4(addr.ok, PORT);
+        }
+        if (ep.addr.is_v6 != 0) { ret 0; }
+        set_peer(out, ?ep);
+        ret 1;
     }
-    or {
-        val addr: res[ip.IPv4, ip.ParseError] = ip.ipv4_parse(text);
-        if (sel addr.err) { ret 0; }
-        ep = ip.endpoint_v4(addr.ok, PORT);
-    }
-    if (ep.addr.is_v6 != 0) { ret 0; }
-    set_peer(out, ?ep);
-    ret 1;
 }
 
 # play through a relay rather than directly
@@ -288,11 +398,17 @@ fun reset(n: *Net) {
 # loopback: listen on this machine only, as the tests do
 # ret:      whether the socket opened
 pub fun open(n: *Net, port: u16, loopback: bool) bool {
-    var where: ip.Endpoint = ip.endpoint(0, 0, 0, 0, port);
-    if (loopback) { where = ip.endpoint(127, 0, 0, 1, port); }
-    val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(where, socket_api.async_flags());
-    if (sel bound.err) { ret 0; }
-    n.sock   = bound.ok;
+    $if (capability.HAS_SOCKETS) {
+        var where: ip.Endpoint = ip.endpoint(0, 0, 0, 0, port);
+        if (loopback) { where = ip.endpoint(127, 0, 0, 1, port); }
+        val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(where, socket_api.async_flags());
+        if (sel bound.err) { ret 0; }
+        n.sock = bound.ok;
+    }
+    $or {
+        inq.head  = 0;
+        inq.count = 0;
+    }
     n.opened = 1;
     reset(n);
     ret 1;
@@ -314,7 +430,9 @@ pub fun close(n: *Net) {
         if (n.relaymode && n.token != 0) { to_relay(n, rp.header(?n.wrap[0], rp.LEAVE, n.me, 0, n.token)); }
         k = k + 1;
     }
-    udp.socket_close(?n.sock);
+    $if (capability.HAS_SOCKETS) {
+        udp.socket_close(?n.sock);
+    }
     n.opened = 0;
 }
 
@@ -327,26 +445,28 @@ pub fun host(n: *Net, players: i32, skill: i32, map: i32) {
     n.map     = map;
 }
 
-# set up to join the game hosted at an address
-# ---
-# n:    the network state, opened
-# text: the host's address, a.b.c.d, optionally :port
-# ret:  whether the address could be read
-pub fun join(n: *Net, text: str) bool {
-    val parsed: res[ip.Endpoint, ip.ParseError] = ip.endpoint_parse(text);
-    var ep:     ip.Endpoint;
-    if (sel parsed.ok) {
-        ep = parsed.ok;
+$if (capability.HAS_SOCKETS) {
+    # set up to join the game hosted at an address
+    # ---
+    # n:    the network state, opened
+    # text: the host's address, a.b.c.d, optionally :port
+    # ret:  whether the address could be read
+    pub fun join(n: *Net, text: str) bool {
+        val parsed: res[ip.Endpoint, ip.ParseError] = ip.endpoint_parse(text);
+        var ep:     ip.Endpoint;
+        if (sel parsed.ok) {
+            ep = parsed.ok;
+        }
+        or {
+            val addr: res[ip.IPv4, ip.ParseError] = ip.ipv4_parse(text);
+            if (sel addr.err) { ret 0; }
+            ep = ip.endpoint_v4(addr.ok, PORT);
+        }
+        if (ep.addr.is_v6 != 0) { ret 0; }
+        n.host = 0;
+        set_peer(?n.peers[0], ?ep);
+        ret 1;
     }
-    or {
-        val addr: res[ip.IPv4, ip.ParseError] = ip.ipv4_parse(text);
-        if (sel addr.err) { ret 0; }
-        ep = ip.endpoint_v4(addr.ok, PORT);
-    }
-    if (ep.addr.is_v6 != 0) { ret 0; }
-    n.host = 0;
-    set_peer(?n.peers[0], ?ep);
-    ret 1;
 }
 
 # tell every joiner the game: who they are, and where everyone is
@@ -358,7 +478,9 @@ fun send_start(n: *Net) {
         n.packet[at + 1] = n.players::u8;
         n.packet[at + 2] = n.skill::u8;
         n.packet[at + 3] = n.map::u8;
-        at               = at + 4;
+        n.packet[at + 4] = 0;
+        if (n.ff) { n.packet[at + 4] = 1; }
+        at               = at + 5;
         var q: i32 = 0;
         for (q < n.players) {
             n.packet[at]     = n.peers[q].octets[0];
@@ -390,7 +512,7 @@ fun store(n: *Net, player: i32, tic: i32, cmd: *Ticcmd) {
     }
 }
 
-fun handle(n: *Net, len: i32, from: *ip.Endpoint) {
+fun handle(n: *Net, len: i32, from: ptr) {
     if (len < 6 || n.packet[0] != 'M' || n.packet[1] != 'D' || n.packet[2] != 'M' || n.packet[3] != '1') { ret; }
     val kind:   u8  = n.packet[4];
     val sender: i32 = n.packet[5]::i32;
@@ -399,56 +521,60 @@ fun handle(n: *Net, len: i32, from: *ip.Endpoint) {
     # without an address and are ignored
     if ((kind == KIND_HELLO || kind == KIND_START) && from == nil) { ret; }
 
-    if (kind == KIND_HELLO && n.host) {
-        # a known joiner asking again has missed its start
-        var p: i32 = 1;
-        for (p < 4) {
-            if (same_peer(?n.peers[p], from)) {
-                if (n.started) { send_start(n); }
+    $if (capability.HAS_SOCKETS) {
+        val ep: *ip.Endpoint = from::*ip.Endpoint;
+        if (kind == KIND_HELLO && n.host) {
+            # a known joiner asking again has missed its start
+            var p: i32 = 1;
+            for (p < 4) {
+                if (same_peer(?n.peers[p], ep)) {
+                    if (n.started) { send_start(n); }
+                    ret;
+                }
+                p = p + 1;
+            }
+            if (n.started) { ret; }
+
+            # a different build or WAD would only go out of step: turn it away
+            var why: u8 = 0;
+            if (len < 15 || n.packet[6] != rp.VERSION) {
+                why = rp.OLD_VERSION;
+            }
+            or (rp.get64(?n.packet[0], 7) != n.wadhash) {
+                why = rp.WAD_MISMATCH;
+            }
+            if (why != 0) {
+                val at: i32 = begin(n, KIND_REFUSE);
+                n.packet[at] = why;
+                udp.send_to(?n.sock, ?n.packet[0], (at + 1)::usize, @ep);
                 ret;
             }
-            p = p + 1;
-        }
-        if (n.started) { ret; }
 
-        # a different build or WAD would only go out of step: turn it away
-        var why: u8 = 0;
-        if (len < 15 || n.packet[6] != rp.VERSION) {
-            why = rp.OLD_VERSION;
-        }
-        or (rp.get64(?n.packet[0], 7) != n.wadhash) {
-            why = rp.WAD_MISMATCH;
-        }
-        if (why != 0) {
-            val at: i32 = begin(n, KIND_REFUSE);
-            n.packet[at] = why;
-            udp.send_to(?n.sock, ?n.packet[0], (at + 1)::usize, @from);
+            # a new joiner takes the next number
+            p = 1;
+            for (p < n.players) {
+                if (!n.peers[p].known) {
+                    set_peer(?n.peers[p], ep);
+                    brk;
+                }
+                p = p + 1;
+            }
             ret;
         }
-
-        # a new joiner takes the next number
-        p = 1;
-        for (p < n.players) {
-            if (!n.peers[p].known) {
-                set_peer(?n.peers[p], from);
-                brk;
-            }
-            p = p + 1;
-        }
-        ret;
     }
 
-    if (kind == KIND_START && !n.host && !n.started && len >= 10) {
+    if (kind == KIND_START && !n.host && !n.started && len >= 11) {
         n.me      = n.packet[6]::i32;
         n.players = n.packet[7]::i32;
         n.skill   = n.packet[8]::i32;
         n.map     = n.packet[9]::i32;
-        if (n.players < 2 || n.players > 4 || n.me < 1 || n.me >= n.players || len < 10 + n.players * 6) { ret; }
+        n.ff      = n.packet[10] != 0;
+        if (n.players < 2 || n.players > 4 || n.me < 1 || n.me >= n.players || len < 11 + n.players * 6) { ret; }
         # the host is where it was reached from; the others as the host saw
         # them
         var q: i32 = 1;
         for (q < n.players) {
-            val at: i32 = 10 + q * 6;
+            val at: i32 = 11 + q * 6;
             n.peers[q].octets[0] = n.packet[at];
             n.peers[q].octets[1] = n.packet[at + 1];
             n.peers[q].octets[2] = n.packet[at + 2];
@@ -474,7 +600,13 @@ fun handle(n: *Net, len: i32, from: *ip.Endpoint) {
     if (kind == KIND_COMMAND && n.started && sender >= 0 && sender < n.players && sender != n.me && len >= 11) {
         val first: i32 = get32(?n.packet[0], 6):~i32;
         val count: i32 = n.packet[10]::i32;
-        if (count > PERPACK || len < 11 + count * 5 + 12) { ret; }
+        if (count > PERPACK || len < 11 + count * 5 + 12 + 48) { ret; }
+        # the seat's character stat block, on every command it sends
+        var bk: i32 = 0;
+        for (bk < 48) {
+            n.rpgblocks[sender][bk] = n.packet[11 + count * 5 + 12 + bk];
+            bk                      = bk + 1;
+        }
         var k: i32 = 0;
         for (k < count) {
             val at:  i32 = 11 + k * 5;
@@ -545,7 +677,10 @@ fun from_relay(n: *Net, len: i32) {
         n.map     = n.wrap[body + 2]::i32;
         n.botmask = 0;
         if (len >= body + 4) { n.botmask = n.wrap[body + 3]::i32; }
-        if (len >= body + 5) { n.deathmatch = (n.wrap[body + 4] & rp.FLAG_DEATHMATCH) != 0; }
+        if (len >= body + 5) {
+            n.deathmatch = (n.wrap[body + 4] & rp.FLAG_DEATHMATCH) != 0;
+            n.ff         = (n.wrap[body + 4] & rp.FLAG_FRIENDLYFIRE) != 0;
+        }
         if (n.players < 2 || n.players > 4 || n.me >= n.players || (n.botmask & (1 << n.me)) != 0) { ret; }
         var q: i32 = 0;
         for (q < n.players) {
@@ -603,18 +738,27 @@ fun from_relay(n: *Net, len: i32) {
 # read every packet waiting
 pub fun receive(n: *Net) {
     if (!n.opened) { ret; }
-    for {
-        var from: ip.Endpoint;
-        if (n.relaymode) {
-            val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.wrap[0], 1400, ?from);
+    $if (capability.HAS_SOCKETS) {
+        for {
+            var from: ip.Endpoint;
+            if (n.relaymode) {
+                val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.wrap[0], 1400, ?from);
+                if (sel got.err) { brk; }
+                # only the relay speaks to a game that uses one
+                if (same_peer(?n.relay, ?from)) { from_relay(n, got.ok::i32); }
+                cnt;
+            }
+            val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.packet[0], 256, ?from);
             if (sel got.err) { brk; }
-            # only the relay speaks to a game that uses one
-            if (same_peer(?n.relay, ?from)) { from_relay(n, got.ok::i32); }
-            cnt;
+            handle(n, got.ok::i32, (?from)::ptr);
         }
-        val got: res[usize, io_error.Error] = udp.recv_from(?n.sock, ?n.packet[0], 256, ?from);
-        if (sel got.err) { brk; }
-        handle(n, got.ok::i32, ?from);
+    }
+    $or {
+        for {
+            val len: i32 = q_pop(?inq, ?n.wrap[0], 1400);
+            if (len <= 0) { brk; }
+            from_relay(n, len);
+        }
     }
 }
 
@@ -639,6 +783,7 @@ fun gather_relay(n: *Net) bool {
             if (n.public)     { n.wrap[at + 16] = n.wrap[at + 16] | rp.FLAG_PUBLIC; }
             if (n.deathmatch) { n.wrap[at + 16] = n.wrap[at + 16] | rp.FLAG_DEATHMATCH; }
             if (n.quick)      { n.wrap[at + 16] = n.wrap[at + 16] | rp.FLAG_QUICK; }
+            if (n.ff)         { n.wrap[at + 16] = n.wrap[at + 16] | rp.FLAG_FRIENDLYFIRE; }
             to_relay(n, at + 17);
         }
         or {
@@ -754,7 +899,7 @@ pub rec Listing {
 
 # asking a relay for its open games, before any game is joined
 pub rec Lobby {
-    sock:     udp.Socket;
+    sock: SockField;
     opened:   bool;
     relay:    Peer;
     wadhash:  u64;
@@ -769,9 +914,14 @@ pub rec Lobby {
 }
 
 pub fun lobby_open(l: *Lobby, relay: *Peer, wadhash: u64) bool {
-    val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(ip.endpoint(0, 0, 0, 0, 0), socket_api.async_flags());
-    if (sel bound.err) { ret 0; }
-    l.sock        = bound.ok;
+    $if (capability.HAS_SOCKETS) {
+        val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(ip.endpoint(0, 0, 0, 0, 0), socket_api.async_flags());
+        if (sel bound.err) { ret 0; }
+        l.sock = bound.ok;
+    }
+    $or {
+        lobbylen = 0;
+    }
     l.opened      = 1;
     l.relay       = @relay;
     l.relay.known = 1;
@@ -785,8 +935,36 @@ pub fun lobby_open(l: *Lobby, relay: *Peer, wadhash: u64) bool {
 
 pub fun lobby_close(l: *Lobby) {
     if (!l.opened) { ret; }
-    udp.socket_close(?l.sock);
+    $if (capability.HAS_SOCKETS) {
+        udp.socket_close(?l.sock);
+    }
     l.opened = 0;
+}
+
+fun parse_rooms(l: *Lobby, len: i32) {
+    if (!rp.is_relay(?l.buf[0], len) || l.buf[4] != rp.ROOMS || len < rp.HEADER + 1) { ret; }
+    var count: i32 = l.buf[rp.HEADER]::i32;
+    if (count > rp.LISTMAX)                          { count = rp.LISTMAX; }
+    if (len < rp.HEADER + 1 + count * rp.LISTENTRY)  { ret; }
+    var i: i32 = 0;
+    for (i < count) {
+        val at: i32      = rp.HEADER + 1 + i * rp.LISTENTRY;
+        val g:  *Listing = ?l.rooms[i];
+        var k:  i32      = 0;
+        for (k < rp.CODELEN) {
+            g.code[k] = l.buf[at + k];
+            k         = k + 1;
+        }
+        g.code[6] = 0;
+        g.players = l.buf[at + 6]::i32;
+        g.joined  = l.buf[at + 7]::i32;
+        g.skill   = l.buf[at + 8]::i32;
+        g.map     = l.buf[at + 9]::i32;
+        g.deathmatch = l.buf[at + 10] != 0;
+        i         = i + 1;
+    }
+    l.count    = count;
+    l.answered = 1;
 }
 
 # ask again every two seconds, and take whatever answers have come
@@ -804,38 +982,34 @@ pub fun lobby_poll(l: *Lobby, now: i64) {
         val at: i32 = rp.header(?l.buf[0], rp.LIST, 0, 0, 0);
         l.buf[at] = rp.VERSION;
         rp.put64(?l.buf[0], at + 1, l.wadhash);
-        udp.send_to(?l.sock, ?l.buf[0], rp.LISTSIZE::usize, endpoint_of(?l.relay));
+        $if (capability.HAS_SOCKETS) {
+            udp.send_to(?l.sock, ?l.buf[0], rp.LISTSIZE::usize, endpoint_of(?l.relay));
+        }
+        $or {
+            q_push(?outq, ?l.buf[0], rp.LISTSIZE);
+        }
         l.asked = now;
         l.asks  = l.asks + 1;
     }
-    for {
-        var from: ip.Endpoint;
-        val got:  res[usize, io_error.Error] = udp.recv_from(?l.sock, ?l.buf[0], 128, ?from);
-        if (sel got.err) { brk; }
-        val len: i32 = got.ok::i32;
-        if (!same_peer(?l.relay, ?from) || !rp.is_relay(?l.buf[0], len) || l.buf[4] != rp.ROOMS || len < rp.HEADER + 1) { cnt; }
-        var count: i32 = l.buf[rp.HEADER]::i32;
-        if (count > rp.LISTMAX)                                { count = rp.LISTMAX; }
-        if (len < rp.HEADER + 1 + count * rp.LISTENTRY)        { cnt; }
-        var i: i32 = 0;
-        for (i < count) {
-            val at: i32      = rp.HEADER + 1 + i * rp.LISTENTRY;
-            val g:  *Listing = ?l.rooms[i];
-            var k:  i32      = 0;
-            for (k < rp.CODELEN) {
-                g.code[k] = l.buf[at + k];
-                k         = k + 1;
-            }
-            g.code[6] = 0;
-            g.players = l.buf[at + 6]::i32;
-            g.joined  = l.buf[at + 7]::i32;
-            g.skill   = l.buf[at + 8]::i32;
-            g.map     = l.buf[at + 9]::i32;
-            g.deathmatch = l.buf[at + 10] != 0;
-            i         = i + 1;
+    $if (capability.HAS_SOCKETS) {
+        for {
+            var from: ip.Endpoint;
+            val got:  res[usize, io_error.Error] = udp.recv_from(?l.sock, ?l.buf[0], 128, ?from);
+            if (sel got.err) { brk; }
+            if (same_peer(?l.relay, ?from)) { parse_rooms(l, got.ok::i32); }
         }
-        l.count    = count;
-        l.answered = 1;
+    }
+    $or {
+        if (lobbylen > 0) {
+            var k: i32 = 0;
+            for (k < lobbylen) {
+                l.buf[k] = lobbypkt[k];
+                k        = k + 1;
+            }
+            val n: i32 = lobbylen;
+            lobbylen = 0;
+            parse_rooms(l, n);
+        }
     }
 }
 
@@ -843,7 +1017,7 @@ pub fun lobby_poll(l: *Lobby, now: i64) {
 
 # fetching the bot league's last match from a relay, in pieces
 pub rec Watch {
-    sock:   udp.Socket;
+    sock: SockField;
     opened: bool;
     relay:  Peer;
     # the file, which pieces of it have come, and the match they are of
@@ -859,9 +1033,15 @@ pub rec Watch {
 }
 
 pub fun watch_open(w: *Watch, relay: *Peer) bool {
-    val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(ip.endpoint(0, 0, 0, 0, 0), socket_api.async_flags());
-    if (sel bound.err) { ret 0; }
-    w.sock        = bound.ok;
+    $if (capability.HAS_SOCKETS) {
+        val bound: res[udp.Socket, io_error.Error] = udp.bind_with_flags(ip.endpoint(0, 0, 0, 0, 0), socket_api.async_flags());
+        if (sel bound.err) { ret 0; }
+        w.sock = bound.ok;
+    }
+    $or {
+        watchq.head  = 0;
+        watchq.count = 0;
+    }
     w.opened      = 1;
     w.relay       = @relay;
     w.relay.known = 1;
@@ -879,7 +1059,9 @@ pub fun watch_open(w: *Watch, relay: *Peer) bool {
 
 pub fun watch_close(w: *Watch) {
     if (!w.opened) { ret; }
-    udp.socket_close(?w.sock);
+    $if (capability.HAS_SOCKETS) {
+        udp.socket_close(?w.sock);
+    }
     w.opened = 0;
 }
 
@@ -903,7 +1085,12 @@ pub fun watch_poll(w: *Watch, now: i64) {
                 val at: i32 = rp.header(?w.buf[0], rp.WATCH, 0, 0, 0);
                 w.buf[at]     = rp.VERSION;
                 w.buf[at + 1] = piece::u8;
-                udp.send_to(?w.sock, ?w.buf[0], rp.WATCHSIZE::usize, endpoint_of(?w.relay));
+                $if (capability.HAS_SOCKETS) {
+                    udp.send_to(?w.sock, ?w.buf[0], rp.WATCHSIZE::usize, endpoint_of(?w.relay));
+                }
+                $or {
+                    q_push(?outq, ?w.buf[0], rp.WATCHSIZE);
+                }
             }
             piece = piece + 1;
         }
@@ -911,12 +1098,20 @@ pub fun watch_poll(w: *Watch, now: i64) {
         w.asks  = w.asks + 1;
     }
     for {
-        var from: ip.Endpoint;
-        val got:  res[usize, io_error.Error] = udp.recv_from(?w.sock, ?w.buf[0], 1100, ?from);
-        if (sel got.err) { brk; }
-        val len: i32 = got.ok::i32;
-        val at:  i32 = rp.HEADER;
-        if (!same_peer(?w.relay, ?from) || !rp.is_relay(?w.buf[0], len) || w.buf[4] != rp.MATCH || len < at + 8) { cnt; }
+        var len: i32 = 0;
+        $if (capability.HAS_SOCKETS) {
+            var from: ip.Endpoint;
+            val got:  res[usize, io_error.Error] = udp.recv_from(?w.sock, ?w.buf[0], 1100, ?from);
+            if (sel got.err) { brk; }
+            if (!same_peer(?w.relay, ?from)) { cnt; }
+            len = got.ok::i32;
+        }
+        $or {
+            len = q_pop(?watchq, ?w.buf[0], 1100);
+            if (len <= 0) { brk; }
+        }
+        val at: i32 = rp.HEADER;
+        if (!rp.is_relay(?w.buf[0], len) || w.buf[4] != rp.MATCH || len < at + 8) { cnt; }
         val total: i32 = w.buf[at]::i32 | (w.buf[at + 1]::i32 << 8);
         val piece: i32 = w.buf[at + 2]::i32;
         if (total != rp.WATCHFILE) {
@@ -1068,9 +1263,43 @@ pub fun send_commands(n: *Net, lastrun: i32) {
         }
         put32(?n.packet[0], at + 4, checktic:~u32);
         put32(?n.packet[0], at + 8, check);
-        send(n, p, at + 12);
+        # my character's stat block, for the seat I play; the same 48 bytes
+        # every time, so a lost start is repaired by the next command
+        var bk: i32 = 0;
+        for (bk < 48) {
+            n.packet[at + 12 + bk] = n.blockmine[bk];
+            bk                     = bk + 1;
+        }
+        send(n, p, at + 60);
         p = p + 1;
     }
+}
+
+# every seat's character stat block, from the wire: mine was installed
+# when the game was made, each peer's lands with its first command. Since
+# a tic cannot run until every command for it is in, every block is in
+# before the first tic — the same game on every machine. ff comes from
+# the host's start packet or the relay's room flags.
+# ---
+# ret: whether every seat's block is here
+pub fun install(s: *game.Session, n: *Net) bool {
+    if (s.rpgnet) { ret 1; }
+    var p: i32 = 0;
+    for (p < n.players) {
+        if (p != n.me && (n.botmask & (1 << p)) == 0 && n.have[p] <= 0) { ret 0; }
+        p = p + 1;
+    }
+    val g: *defs.Game = ?s.g;
+    g.friendlyfire    = n.ff;
+    p = 0;
+    for (p < n.players) {
+        if (p != n.me && (n.botmask & (1 << p)) == 0) {
+            rpg.set_block(g, p, (?n.rpgblocks[p][0]):~*defs.RpgStats);
+        }
+        p = p + 1;
+    }
+    s.rpgnet = 1;
+    ret 1;
 }
 
 # whether every player's command for a tic is here

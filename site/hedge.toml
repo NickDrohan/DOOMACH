@@ -5,6 +5,9 @@
 [server]
 name = "doom-site"
 
+[server.features]
+proxy = true
+
 [[listener]]
 name = "public"
 address = "0.0.0.0:8080"
@@ -12,7 +15,7 @@ protocols = ["http/1.1"]
 
 [host.site]
 listener = "public"
-names = ["mach-doom-relay.fly.dev", "localhost"]
+names = ["doomach.fly.dev", "mach-doom-relay.fly.dev", "localhost"]
 
 [service.files]
 kind = "static"
@@ -22,6 +25,16 @@ index = "index.html"
 [service.league]
 kind = "static"
 root = "/data"
+
+[service.net]
+kind = "proxy"
+upstream = "127.0.0.1:5030"
+
+[[route]]
+name = "net"
+host = "site"
+path = "/net/**"
+service = "net"
 
 [[route]]
 name = "league"

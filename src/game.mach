@@ -23,6 +23,7 @@ use doom.info;
 use doom.level;
 use doom.random;
 use doom.rdata;
+use doom.rpg;
 use doom.render;
 use doom.spec;
 use t: doom.tables;
@@ -52,6 +53,11 @@ pub rec Input {
     activate:     bool;
     # 1 to 7 to change weapon, 0 for no change
     weapon: i32;
+    # the character system's commands: a node to spend a point on (1 to
+    # rpg.N_NODES, 0 for none) and the two abilities
+    alloc: i32;
+    blink: bool;
+    stim:  bool;
     # how far the mouse moved sideways since the last tic, in pixels,
     # positive to the right
     mousex: i32;
@@ -113,9 +119,25 @@ pub rec Session {
     # place would have sensed, beside what they did (bot.observe). sampled
     # says this machine's own player was looked at this tic, and sample is
     # what was seen.
+    # which players the simulation plays itself (bot.mach)
     watchers: [4]bot.Bot;
     sampled:  bool;
     sample:   [38]u8;
+
+    # the character system's bookkeeping (rpg.mach): Slayer XP and weapon
+    # XP per seat since this game began, the level each seat's Slayer XP
+    # has reached, journal events not yet written by the profile layer,
+    # whether the stat blocks from the wire were installed, and whether
+    # this map was cheated out of earning
+    # the character the save belongs to, all zeros when none
+    rpg_charid: [16]u8;
+    rpg_xp:    [4]i64;
+    rpg_wxp:   [4][6]i64;
+    rpg_lvl:   [4]i32;
+    rpg_jq:    [64]defs.RpgEvent;
+    rpg_njq:   i32;
+    rpgnet:    bool;
+    rpg_cheat: bool;
 }
 
 # what a finished level reports to the intermission (wbstartstruct_t)
@@ -184,7 +206,7 @@ fun load_things(g: *Game) {
             brk;
         }
 
-        world.spawn_map_thing(g, mt);
+        world.spawn_map_thing(g, mt, i);
         i = i + 1;
     }
 }
@@ -256,6 +278,22 @@ fun load_level(s: *Session) bool {
     # one list of things for each blockmap cell
     val cells: i32 = g.lv.bmapwidth * g.lv.bmapheight;
     g.blocklinks = defs.alloc(g, (cells * 8)::usize):~**defs.Mobj;
+
+    # the level's part of a character's state: the respawn-decay counter
+    # for every map thing (zeroed by alloc), fresh ability state, and an
+    # empty event log
+    g.rpg_deaths  = defs.alloc(g, g.lv.numthings::usize):~*u8;
+    g.rpg_ndeaths = g.lv.numthings;
+    g.rpg_nlog    = 0;
+    g.rpg_over    = 0;
+    g.rnd.rpg     = 0;
+    s.rpg_cheat   = 0;
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        var blankrt: defs.RpgRt;
+        g.rpg_rt[i] = blankrt;
+        i           = i + 1;
+    }
 
     g.bodyqueslot = 0;
     g.numdmstarts = 0;
@@ -555,6 +593,26 @@ pub fun init_new(s: *Session, skill_in: i32, episode_in: i32, map_in: i32) bool 
     g.gamemap      = map;
     g.gameskill    = skill;
 
+    # a game begins with no characters and no friendly fire; the stat
+    # blocks and the flag are installed after this returns
+    g.rpg_on       = 0;
+    g.friendlyfire = 0;
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        var blankstats: defs.RpgStats;
+        g.rpg_stats[i] = blankstats;
+        s.rpg_xp[i]    = 0;
+        s.rpg_lvl[i]   = 0;
+        var wj: i32 = 0;
+        for (wj < 6) {
+            s.rpg_wxp[i][wj] = 0;
+            wj               = wj + 1;
+        }
+        i = i + 1;
+    }
+    s.rpg_njq = 0;
+    s.rpgnet  = 0;
+
     ret load_level(s);
 }
 
@@ -823,6 +881,15 @@ pub fun build_ticcmd(s: *Session, input: *Input, cmd: *Ticcmd) {
     if (input.weapon >= 1 && input.weapon <= 7) {
         buttons = buttons | defs.BT_CHANGE;
         buttons = buttons | ((input.weapon - 1) << defs.BT_WEAPONSHIFT);
+    }
+    if (input.blink) {
+        buttons = defs.BT_SPECIAL::i32 | rpg.CMD_BLINK;
+    }
+    or (input.stim) {
+        buttons = defs.BT_SPECIAL::i32 | rpg.CMD_STIM;
+    }
+    or (input.alloc >= 1 && input.alloc <= rpg.N_NODES) {
+        buttons = defs.BT_SPECIAL::i32 | input.alloc;
     }
     cmd.buttons = buttons::u8;
 
@@ -1158,7 +1225,54 @@ pub fun ticker_cmds(s: *Session, cmds: *Ticcmd) {
 
     tick.ticker(g);
     respawn_specials(g);
+
+    # the tic's rewards go into the per-seat totals and the console
+    # player's journal queue; every machine sees the same events
+    if (g.rpg_on) { rpg_drain(s); }
     g.gametic = g.gametic + 1;
+}
+
+# pull the tic's reward events into the per-seat totals and the console
+# player's journal queue. A kill is the party's; a hit is its seat's.
+fun rpg_drain(s: *Session) {
+    val g:    *Game = ?s.g;
+    val earn: bool  = rpg.earning(g) && !s.demoplayback && !s.rpg_cheat;
+    var i:    i32   = 0;
+    for (i < g.rpg_nlog) {
+        val ev: *defs.RpgEvent = ?g.rpg_log[i];
+        if (ev.kind == defs.REV_KILL) {
+            var p: i32 = 0;
+            for (p < defs.MAXPLAYERS) {
+                if (g.playeringame[p] && !g.isbot[p]) {
+                    s.rpg_xp[p]  = s.rpg_xp[p] + ev.xp::i64;
+                    val lv: i32  = rpg.level_of(s.rpg_xp[p]);
+                    if (lv > s.rpg_lvl[p]) {
+                        s.rpg_lvl[p] = lv;
+                        # the console player's rise is journaled as a level event
+                        if (p == g.consoleplayer && s.rpg_njq < 64) {
+                            s.rpg_jq[s.rpg_njq].kind   = defs.REV_LEVEL;
+                            s.rpg_jq[s.rpg_njq].seat   = p::u8;
+                            s.rpg_jq[s.rpg_njq].weapon = defs.RPG_NONE;
+                            s.rpg_jq[s.rpg_njq].aux    = 0;
+                            s.rpg_jq[s.rpg_njq].xp     = lv;
+                            s.rpg_njq                  = s.rpg_njq + 1;
+                        }
+                    }
+                }
+                p = p + 1;
+            }
+        }
+        or (ev.kind == defs.REV_HIT && ev.seat < 4) {
+            val wx: i32 = rpg.wx_index(ev.weapon::i32);
+            if (wx >= 0) { s.rpg_wxp[ev.seat][wx] = s.rpg_wxp[ev.seat][wx] + ev.xp::i64; }
+        }
+        if (earn && s.rpg_njq < 64 && (ev.kind == defs.REV_KILL || ev.seat == g.consoleplayer::u8)) {
+            s.rpg_jq[s.rpg_njq] = @ev;
+            s.rpg_njq           = s.rpg_njq + 1;
+        }
+        i = i + 1;
+    }
+    g.rpg_nlog = 0;
 }
 
 # a running sum over the state that a demo must reproduce: every map

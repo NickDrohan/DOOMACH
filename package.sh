@@ -11,7 +11,8 @@ root="$here"
     echo "package: data/DOOM1.WAD is missing or not shareware 1.9; run bootstrap.sh" >&2
     exit 1
 }
-"$root/scripts/mach" build "$here" --profile release --jobs 2 --quiet
+"$root/scripts/mach" build "$here" --profile release --threads 2 --quiet
+"$root/scripts/mach" build "$here" --artifact web --target wasi-wasm32 --profile release --threads 2 --quiet
 
 python=""
 for candidate in "${PYTHON:-}" python python3; do

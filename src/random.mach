@@ -30,6 +30,11 @@ val TABLE_SUM: i32 = 32986;
 pub rec Random {
     play: u8;
     misc: u8;
+    # the character system's own walk, for the stochastic rounding its
+    # damage scaling needs: drawn only inside the rpg hooks, so a game
+    # without characters never touches it and the playsim walk is the
+    # same draws it always was
+    rpg:  u8;
 }
 
 # draw the next playsim number, 0 to 255
@@ -50,12 +55,22 @@ pub fun m_random(r: *Random) i32 {
     ret TABLE[r.misc::usize]::i32;
 }
 
+# draw the next number on the character system's walk, 0 to 255
+# ---
+# r:   generator state
+# ret: the next table entry on the rpg walk
+pub fun rpg_random(r: *Random) i32 {
+    r.rpg = r.rpg + 1;
+    ret TABLE[r.rpg::usize]::i32;
+}
+
 # rewind both walks, as every level start and demo start does
 # ---
 # r: generator state
 pub fun clear(r: *Random) {
     r.play = 0;
     r.misc = 0;
+    r.rpg  = 0;
 }
 
 test p_random__first_draws {

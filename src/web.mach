@@ -1,0 +1,1390 @@
+# web: Doom in Mach compiled to WebAssembly (wasi-wasm32) for the browser
+#
+# Runs the same deterministic simulation, software renderer, status bar,
+# automap, menus, character progression, saved games, lockstep multiplayer,
+# sound mixer and OPL2 FM synthesizer as the native game. The browser host
+# loads DOOM1.WAD into linear memory, calls web_init, drives the game at 35
+# tics a second with web_tic, draws the 320x200 RGBA frame with web_draw,
+# pulls 11025 Hz stereo 16-bit PCM audio from web_audio, and forwards MDR1
+# relay packets through web_net_pop and web_net_push.
+
+use std.allocator;
+use std.allocator.page;
+use fs: std.filesystem;
+use io_error: std.io.error;
+use std.memory;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use doom.am;
+use doom.bot;
+use doom.defs;
+use doom.front;
+use doom.game;
+use lf: doom.leaguefile;
+use doom.level;
+use doom.music;
+use doom.net;
+use doom.opl;
+use doom.profile;
+use doom.rdata;
+use doom.relayproto;
+use doom.render;
+use doom.sound;
+use doom.st;
+use doom.wad;
+
+# virtual key codes matching front.mach and win.mach
+val VK_LBUTTON: i32 = 0x01;
+val VK_RBUTTON: i32 = 0x02;
+val VK_SHIFT:   i32 = 0x10;
+val VK_CONTROL: i32 = 0x11;
+val VK_SPACE:   i32 = 0x20;
+val VK_LEFT:    i32 = 0x25;
+val VK_UP:      i32 = 0x26;
+val VK_RIGHT:   i32 = 0x27;
+val VK_DOWN:    i32 = 0x28;
+
+# host actions requested by the in-game menus
+val ACTION_NONE:       i32 = 0;
+val ACTION_WATCH_COOP: i32 = 1;
+val ACTION_WATCH_DM:   i32 = 2;
+val ACTION_PLAY_COOP:  i32 = 3;
+val ACTION_PLAY_DM:    i32 = 4;
+
+val ANOTHER_SIMULATION: i32 = -1;
+
+val NOW_HEAD:  i32 = 20;
+val NOW_SEAT:  i32 = 32 + 1326;
+val NOW_BYTES: i32 = 20 + 4 * (32 + 1326) + 1040;
+
+val BOTMAPS: [7]i32 = [7]i32{1, 2, 3, 4, 7, 8, 9};
+
+val SHA256_K: [64]u32 = [64]u32{
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+rec LeagueJoin {
+    target: i32;
+    map:    i32;
+    tic:    i32;
+    hook:   defs.SoundHook;
+    cmds:   [4]defs.Ticcmd;
+}
+
+var alloc:      allocator.Allocator;
+var alloc_init: bool;
+var archive:    wad.Wad;
+var wadhash:    u64;
+var graphics:   rdata.Data;
+var session:    *game.Session;
+var renderer:   *render.Renderer;
+var ui:         front.Front;
+var bar:        st.State;
+var song:       music.Song;
+var songserial: i32 = -1;
+var musvolume:  i32 = -1;
+var hasmusic:   bool;
+var muscarry:   i32;
+var ready:      bool;
+var clock_us:   i64;
+var trainsaid:  i32;
+
+# 320x200 RGBA framebuffer for HTML5 canvas ImageData
+var rgba: [256000]u8;
+
+# interleaved 16-bit stereo PCM buffer (up to 4096 frames)
+var pcm: [8192]i16;
+
+# shared transfer buffer for league watch files and network packets from JS
+var transfer: [16384]u8;
+
+# scratch buffer for upgrading a v1 league file in memory
+var leaguetmp: [270016]u8;
+
+# keyboard and mouse state
+var keys:      [32]i32;
+var keyfirst:  i32;
+var keycount:  i32;
+var held:      [256]u8;
+var mousepend: i32;
+var weapon:    i32;
+var blinkq:    i32;
+var stimq:     i32;
+
+# lockstep multiplayer state
+var menunet:       *net.Net;
+var active_net:    *net.Net;
+var lobby:         net.Lobby;
+var netstarted:    bool;
+var stalled:       bool;
+var gametic:       i32;
+var progress_tics: i32;
+var wait_tics:     i32;
+var instant_fill:  bool;
+var waitbuf:       [256]u8;
+var empty_code:    [7]u8;
+var lessons:       [912]u8;
+var nlessons:      i32;
+
+# watching or playing with league bots
+var pending_action: i32;
+var watchtics:      i32;
+var joining:        i32;
+var join:           LeagueJoin;
+var joinnames:      [96]u8;
+var joinmsg:        [96]u8;
+var botline:        [256]u8;
+var map_cycle:      i32;
+
+var fingerprinted: bool;
+var fingerprint:   u32;
+
+fun sha_rotr(x: u32, n: u32) u32 { ret (x >> n) | (x << (32 - n)); }
+
+fun sha256_block(h: *u32, block: *u8) {
+    var w: [64]u32;
+    var i: usize = 0;
+    for (i < 16) {
+        val off: usize = i * 4;
+        w[i] = (block[off]::u32 << 24) | (block[off + 1]::u32 << 16) | (block[off + 2]::u32 << 8) | block[off + 3]::u32;
+        i    = i + 1;
+    }
+    for (i < 64) {
+        val g1: u32 = sha_rotr(w[i - 2], 17) ^ sha_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        val g0: u32 = sha_rotr(w[i - 15], 7) ^ sha_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        w[i] = g1 + w[i - 7] + g0 + w[i - 16];
+        i    = i + 1;
+    }
+    var a:  u32 = h[0];
+    var b:  u32 = h[1];
+    var c:  u32 = h[2];
+    var d:  u32 = h[3];
+    var e:  u32 = h[4];
+    var f:  u32 = h[5];
+    var g:  u32 = h[6];
+    var hh: u32 = h[7];
+    i = 0;
+    for (i < 64) {
+        val s1: u32 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25);
+        val ch: u32 = (e & f) ^ (~e & g);
+        val t1: u32 = hh + s1 + ch + SHA256_K[i] + w[i];
+        val s0: u32 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22);
+        val mj: u32 = (a & b) ^ (a & c) ^ (b & c);
+        val t2: u32 = s0 + mj;
+        hh = g;
+        g  = f;
+        f  = e;
+        e  = d + t1;
+        d  = c;
+        c  = b;
+        b  = a;
+        a  = t1 + t2;
+        i  = i + 1;
+    }
+    h[0] = h[0] + a;
+    h[1] = h[1] + b;
+    h[2] = h[2] + c;
+    h[3] = h[3] + d;
+    h[4] = h[4] + e;
+    h[5] = h[5] + f;
+    h[6] = h[6] + g;
+    h[7] = h[7] + hh;
+}
+
+fun sha256_hash(data: *u8, len: usize, digest: *u8) {
+    var h: [8]u32 = [8]u32{
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    var off: usize = 0;
+    for (off + 64 <= len) {
+        sha256_block(?h[0], ?data[off]);
+        off = off + 64;
+    }
+    var buf: [64]u8;
+    var rem: usize = len - off;
+    if (rem > 0) { memory.raw_copy(?buf[0], ?data[off], rem); }
+    buf[rem] = 0x80;
+    rem      = rem + 1;
+    if (rem > 56) {
+        for (rem < 64) {
+            buf[rem] = 0;
+            rem      = rem + 1;
+        }
+        sha256_block(?h[0], ?buf[0]);
+        rem = 0;
+    }
+    for (rem < 56) {
+        buf[rem] = 0;
+        rem      = rem + 1;
+    }
+    val bits: u64 = len::u64 * 8;
+    buf[56] = (bits >> 56)::u8;
+    buf[57] = (bits >> 48)::u8;
+    buf[58] = (bits >> 40)::u8;
+    buf[59] = (bits >> 32)::u8;
+    buf[60] = (bits >> 24)::u8;
+    buf[61] = (bits >> 16)::u8;
+    buf[62] = (bits >> 8)::u8;
+    buf[63] = bits::u8;
+    sha256_block(?h[0], ?buf[0]);
+    var k: usize = 0;
+    for (k < 8) {
+        digest[k * 4]     = (h[k] >> 24)::u8;
+        digest[k * 4 + 1] = (h[k] >> 16)::u8;
+        digest[k * 4 + 2] = (h[k] >> 8)::u8;
+        digest[k * 4 + 3] = h[k]::u8;
+        k = k + 1;
+    }
+}
+
+fun first64(data: *u8, len: usize) u64 {
+    var digest: [32]u8;
+    sha256_hash(data, len, ?digest[0]);
+    var h: u64 = 0;
+    var k: i32 = 0;
+    for (k < 8) {
+        h = (h << 8) | digest[k]::u64;
+        k = k + 1;
+    }
+    ret h;
+}
+
+fun build_code(h: u64, out: *u8) {
+    val digits: str = "0123456789ABCDEF";
+    var k: i32 = 0;
+    for (k < 6) {
+        out[k] = digits[((h >> (60 - k * 4)::u64) & 15)::i32];
+        k      = k + 1;
+    }
+    out[6] = 0;
+}
+
+fun read_choice() i32 {
+    val opened: res[fs.File, io_error.Error] = fs.open("/doom.cfg");
+    if (sel opened.err) { ret front.TRAIN_UNASKED; }
+    var file: fs.File = opened.ok;
+    var text: [64]u8;
+    val got:  res[usize, io_error.Error] = fs.read(file, ?text[0], 60);
+    fs.close(?file);
+    if (sel got.err) { ret front.TRAIN_UNASKED; }
+    var k: i32 = 0;
+    for (k + 6 < got.ok::i32) {
+        if (text[k] == 't' && text[k + 1] == 'r' && text[k + 2] == 'a' && text[k + 3] == 'i' && text[k + 4] == 'n' && text[k + 5] == '=') {
+            if (text[k + 6] == '1') { ret front.TRAIN_YES; }
+            if (text[k + 6] == '0') { ret front.TRAIN_NO; }
+        }
+        k = k + 1;
+    }
+    ret front.TRAIN_UNASKED;
+}
+
+fun write_choice(choice: i32) {
+    var text: str = "train=0\n";
+    if (choice == front.TRAIN_YES) { text = "train=1\n"; }
+    fs.write_bytes("/doom.cfg", text, 8, 0o644);
+}
+
+fun ensure_alloc() bool {
+    if (alloc_init) { ret 1; }
+    val made: err[allocator.Error] = page.make(?alloc);
+    if (sel made.err) { ret 0; }
+    alloc_init = 1;
+    ret 1;
+}
+
+#[export]
+#[symbol("web_alloc")]
+pub fun web_alloc(size: i32) *u8 {
+    if (size <= 0 || !ensure_alloc()) { ret nil; }
+    val got: res[*u8, allocator.Error] = allocator.zallocate[u8](?alloc, size::usize);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+#[export]
+#[symbol("web_transfer_ptr")]
+pub fun web_transfer_ptr() *u8 {
+    ret ?transfer[0];
+}
+
+#[export]
+#[symbol("web_rgba_ptr")]
+pub fun web_rgba_ptr() *u8 {
+    ret ?rgba[0];
+}
+
+#[export]
+#[symbol("web_pcm_ptr")]
+pub fun web_pcm_ptr() *i16 {
+    ret ?pcm[0];
+}
+
+#[export]
+#[symbol("web_net_pop")]
+pub fun web_net_pop(dst: *u8, cap: i32) i32 {
+    ret net.pop_outgoing(dst, cap);
+}
+
+#[export]
+#[symbol("web_net_push")]
+pub fun web_net_push(src: *u8, len: i32) {
+    net.push_incoming(src, len);
+}
+
+#[export]
+#[symbol("web_room_code_ptr")]
+pub fun web_room_code_ptr() *u8 {
+    if (active_net != nil && active_net.relaymode && active_net.token != 0) {
+        ret ?active_net.code[0];
+    }
+    empty_code[0] = 0;
+    ret ?empty_code[0];
+}
+
+fun opl_init(w: *wad.Wad) bool {
+    val found: opt[u32] = wad.find(w, "GENMIDI");
+    if (sel found.none) { ret 0; }
+    ret opl.init(wad.bytes(w, found.some), wad.lump(w, found.some).size);
+}
+
+#[export]
+#[symbol("web_init")]
+pub fun web_init(wad_ptr: *u8, wad_len: i32) i32 {
+    if (wad_ptr == nil || wad_len <= 0 || !ensure_alloc()) { ret -1; }
+
+    val parsed: res[wad.Wad, wad.WadError] = wad.parse(wad_ptr, wad_len::usize);
+    if (sel parsed.err) { ret -2; }
+    archive = parsed.ok;
+    wadhash = first64(archive.data, archive.len);
+
+    val gres: res[rdata.Data, rdata.DataError] = rdata.init(?alloc, ?archive);
+    if (sel gres.err) { ret -3; }
+    graphics = gres.ok;
+
+    val sres: res[*game.Session, allocator.Error] = allocator.zallocate[game.Session](?alloc, 1);
+    if (sel sres.err) { ret -4; }
+    session = sres.ok;
+    game.init(session, ?alloc, ?archive, ?graphics);
+
+    var first: level.Level;
+    val lres:  res[level.Level, level.LevelError] = level.load(?alloc, ?archive, "E1M1");
+    if (sel lres.err) { ret -5; }
+    first = lres.ok;
+    val berr: rdata.BindError = rdata.bind(?graphics, ?first);
+    if (sel berr.side || sel berr.sector) { ret -6; }
+
+    val rres: res[*render.Renderer, render.RenderError] = render.make(?alloc, ?graphics, ?first);
+    if (sel rres.err) { ret -7; }
+    renderer = rres.ok;
+
+    front.init(?ui);
+    ui.train  = read_choice();
+    trainsaid = ui.trainsaid;
+    build_code(wadhash, ?ui.build[0]);
+    val second: res[*render.Renderer, render.RenderError] = render.make(?alloc, ?graphics, ?first);
+    if (sel second.ok) { ui.inset = second.ok; }
+
+    st.init(?bar);
+    sound.install(?session.g, ?archive);
+    hasmusic   = opl_init(?archive);
+    songserial = -1;
+    musvolume  = -1;
+    muscarry   = 0;
+
+    profile.init(?alloc, "/profiles");
+    var cname: [24]u8;
+    if (profile.selected(?alloc, ?cname[0])) { profile.load(?alloc, ?cname[0]); }
+
+    ready = 1;
+    ret 0;
+}
+
+#[export]
+#[symbol("web_key_down")]
+pub fun web_key_down(key: i32, repeat: i32) {
+    if (key > 0 && key < 256) { held[key] = 1; }
+    if (repeat == 0 && key > 0 && keycount < 32) {
+        keys[(keyfirst + keycount) % 32] = key;
+        keycount                         = keycount + 1;
+    }
+}
+
+#[export]
+#[symbol("web_key_up")]
+pub fun web_key_up(key: i32) {
+    if (key > 0 && key < 256) { held[key] = 0; }
+}
+
+#[export]
+#[symbol("web_mouse_move")]
+pub fun web_mouse_move(dx: i32) {
+    if (ui.mode == front.MODE_LEVEL && !ui.menuactive) {
+        mousepend = mousepend + dx;
+    }
+}
+
+#[export]
+#[symbol("web_mouse_button")]
+pub fun web_mouse_button(button: i32, down: i32) {
+    var vk: i32 = 0;
+    if (button == 0) { vk = VK_LBUTTON; }
+    or (button == 2) { vk = VK_RBUTTON; }
+    if (vk != 0) {
+        if (down != 0) { held[vk] = 1; }
+        or             { held[vk] = 0; }
+    }
+}
+
+#[export]
+#[symbol("web_release_all")]
+pub fun web_release_all() {
+    var i: i32 = 0;
+    for (i < 256) {
+        held[i] = 0;
+        i       = i + 1;
+    }
+    mousepend = 0;
+}
+
+fun take_key() i32 {
+    if (keycount == 0) { ret 0; }
+    val k: i32 = keys[keyfirst];
+    keyfirst = (keyfirst + 1) % 32;
+    keycount = keycount - 1;
+    ret k;
+}
+
+fun key_held(k: i32) bool {
+    if (k <= 0 || k >= 256) { ret 0; }
+    ret held[k] != 0;
+}
+
+fun append(buf: *u8, at: i32, text: str) i32 {
+    var k: i32 = 0;
+    for (text[k] != 0 && at + k < 255) {
+        buf[at + k] = text[k];
+        k           = k + 1;
+    }
+    buf[at + k] = 0;
+    ret at + k;
+}
+
+fun append_number(buf: *u8, at: i32, value: i64) i32 {
+    var digits: [24]u8;
+    var n:      i32 = 0;
+    var v:      i64 = value;
+    var end:    i32 = at;
+    if (v < 0) {
+        buf[end] = '-';
+        end      = end + 1;
+        v        = -v;
+    }
+    for {
+        digits[n] = ('0' + (v % 10)::i32)::u8;
+        n         = n + 1;
+        v         = v / 10;
+        if (v == 0) { brk; }
+    }
+    for (n > 0) {
+        n        = n - 1;
+        buf[end] = digits[n];
+        end      = end + 1;
+    }
+    buf[end] = 0;
+    ret end;
+}
+
+fun get32(p: *u8, at: i32) u32 {
+    ret p[at]::u32 | (p[at + 1]::u32 << 8) | (p[at + 2]::u32 << 16) | (p[at + 3]::u32 << 24);
+}
+
+fun seat_kind(told: i32) i32 {
+    var kind: i32 = bot.KIND_NET;
+    if ((told & 0xff) == bot.KIND_SCRIPT) { kind = bot.KIND_SCRIPT; }
+    ret kind | (told & 0x7fffff00);
+}
+
+fun our_fingerprint(s: *game.Session) u32 {
+    if (!fingerprinted) {
+        fingerprint   = game.fingerprint(s);
+        fingerprinted = 1;
+    }
+    ret fingerprint;
+}
+
+fun watched_out(f: *front.Front, s: *game.Session, tics: i32) bool {
+    if (s.campaign) { ret f.mode == front.MODE_FINALE; }
+    ret s.g.leveltime >= tics || s.completed;
+}
+
+fun load_block(n: *net.Net) {
+    val mb: *defs.RpgStats = profile.block();
+    var i:  i32 = 0;
+    for (i < 48) {
+        n.blockmine[i] = (mb:~*u8)[i];
+        i              = i + 1;
+    }
+}
+
+fun waiting_text(n: *net.Net, buf: *u8) {
+    var at: i32 = 0;
+    if (n.refused != 0) {
+        at = append(buf, at, net.refusal(n));
+        at = append(buf, at, "\n\n(esc)");
+        ret;
+    }
+    if (n.relaymode && n.token != 0) {
+        at = append(buf, at, "room code  ");
+        at = append(buf, at, ?n.code[0]);
+        at = append(buf, at, "\n\n");
+        if (n.host) { at = append(buf, at, "give the others this code.\n\n"); }
+        var count: [12]u8 = [12]u8{'p', 'l', 'a', 'y', 'e', 'r', 's', ' ', '0', '/', '0', 0};
+        count[8]  = ('0' + n.joined)::u8;
+        count[10] = ('0' + n.players)::u8;
+        at = append(buf, at, ?count[0]);
+        if (n.startseen) {
+            at = append(buf, at, "\n\nthe bots are coming...");
+            ret;
+        }
+        if (n.fillin != 255 && n.fillin != 0) {
+            at = append(buf, at, "\n\nbots take the empty seats in ");
+            at = append_number(buf, at, n.fillin::i64);
+            at = append(buf, at, " s");
+        }
+        if (n.host) { at = append(buf, at, "\n\nenter: start now, with bots"); }
+        at = append(buf, at, "\n\n(esc to give up)");
+        ret;
+    }
+    at = append(buf, at, "reaching the server...\n\n(esc to give up)");
+}
+
+fun net_names(n: *net.Net, out: *u8) {
+    var i: i32 = 0;
+    for (i < 96) {
+        out[i] = 0;
+        i      = i + 1;
+    }
+    i = 0;
+    for (i < n.players && i < 4) {
+        if ((n.botmask & (1 << i)) != 0) {
+            append(?out[i * 24], 0, ?n.bots[i].name[0]);
+        }
+        or (i == n.me) {
+            append(?out[i * 24], 0, "you");
+        }
+        or {
+            val at: i32 = append(?out[i * 24], 0, "player ");
+            append_number(?out[i * 24], at, (i + 1)::i64);
+        }
+        i = i + 1;
+    }
+}
+
+fun seat_bots(s: *game.Session, n: *net.Net) {
+    var at: i32 = 0;
+    var i:  i32 = 0;
+    for (i < n.players) {
+        if ((n.botmask & (1 << i)) != 0) {
+            game.set_bot(s, i, seat_kind(n.bots[i].kind), ?n.bots[i].net[0], n.bots[i].seed);
+            if (at == 0) {
+                at = append(?botline[0], 0, "with you: ");
+            }
+            or {
+                at = append(?botline[0], at, ", ");
+            }
+            at = append(?botline[0], at, ?n.bots[i].name[0]);
+        }
+        i = i + 1;
+    }
+    if (at > 0) { s.g.players[n.me].message = ?botline[0]; }
+}
+
+fun teach(n: *net.Net, s: *game.Session) {
+    if (!s.sampled) { ret; }
+    s.sampled = 0;
+    var k: i32 = 0;
+    for (k < bot.SAMPLE) {
+        lessons[nlessons * bot.SAMPLE + k] = s.sample[k];
+        k                                  = k + 1;
+    }
+    nlessons = nlessons + 1;
+    if (nlessons < 24) { ret; }
+    var mode: i32 = 1;
+    if (s.g.deathmatch != 0) { mode = 2; }
+    net.send_training(n, mode, s.g.gamemap, s.g.gameskill, ?lessons[0], nlessons);
+    nlessons = 0;
+}
+
+fun start_menu_net(n: *net.Net, request: i32, f: *front.Front) str {
+    if (n == nil) { ret "there is not enough memory for a network game.\n\n(press a key)"; }
+    var blank: net.Net;
+    @n = blank;
+    var relay: net.Peer;
+    relay.known = 1;
+    relay.port  = net.PORT;
+    if (!net.open(n, 0, 0)) { ret "the network could not be opened.\n\n(press a key)"; }
+    n.wadhash = wadhash;
+    load_block(n);
+    if (request == front.NET_HOST) {
+        val dm:  bool = f.netdm || f.netquick;
+        var map: i32  = 1;
+        if (dm) {
+            map       = BOTMAPS[map_cycle % 7];
+            map_cycle = map_cycle + 1;
+        }
+        net.host(n, f.netplayers, f.netskill, map);
+        net.use_relay(n, ?relay);
+        n.public     = f.netpublic || f.netquick;
+        n.deathmatch = dm;
+        n.quick      = f.netquick;
+        n.ff         = f.netff;
+        if (instant_fill) {
+            net.ask_fill(n);
+        }
+    }
+    or {
+        net.use_relay(n, ?relay);
+        if (!net.join_code(n, ?f.code[0])) {
+            net.close(n);
+            ret "that is not a valid room code.\n\n(press a key)";
+        }
+    }
+    ret nil;
+}
+
+#[export]
+#[symbol("web_poll_action")]
+pub fun web_poll_action() i32 {
+    val act: i32 = pending_action;
+    pending_action = ACTION_NONE;
+    ret act;
+}
+
+# join a room code directly (from a ?room=CODE link or quick join dialog)
+#[export]
+#[symbol("web_join_room")]
+pub fun web_join_room(code_ptr: *u8) i32 {
+    if (!ready || code_ptr == nil) { ret 0; }
+    var k: i32 = 0;
+    for (k < 6) {
+        val c: u8 = relayproto.code_char(code_ptr[k]);
+        if (c == 0) { ret 0; }
+        ui.code[k] = c;
+        k          = k + 1;
+    }
+    ui.code[6] = 0;
+    ui.codelen = 6;
+    if (active_net != nil) {
+        net.close(active_net);
+        active_net = nil;
+    }
+    if (joining == -1) {
+        session.g.start_sound = join.hook;
+        joining               = 0;
+    }
+    instant_fill  = 0;
+    ui.watching   = 0;
+    ui.message    = nil;
+    ui.menuactive = 0;
+    if (ui.train == front.TRAIN_UNASKED) {
+        ui.train     = front.TRAIN_NO;
+        ui.trainsaid = ui.trainsaid + 1;
+    }
+    ui.netrequest = front.NET_JOIN;
+    ret 1;
+}
+
+# trigger a quick browser action from the HUD controls:
+# 1 = 4-player Co-op with the league bots, 2 = 4-player Deathmatch with the
+# league bots, 3 = Watch the Co-op Bots, 4 = Watch the Deathmatch Bots
+#[export]
+#[symbol("web_quick_action")]
+pub fun web_quick_action(act: i32) {
+    if (!ready) { ret; }
+    if (active_net != nil) {
+        net.close(active_net);
+        active_net = nil;
+        netstarted = 0;
+        stalled    = 0;
+        gametic    = 0;
+    }
+    if (joining == -1) {
+        session.g.start_sound = join.hook;
+        joining               = 0;
+    }
+    ui.message    = nil;
+    ui.menuactive = 0;
+    if (ui.train == front.TRAIN_UNASKED) {
+        ui.train     = front.TRAIN_NO;
+        ui.trainsaid = ui.trainsaid + 1;
+    }
+    if (act == 1) {
+        instant_fill  = 1;
+        ui.watching   = 0;
+        ui.netplayers = 4;
+        ui.netskill   = defs.SK_NIGHTMARE;
+        ui.netdm      = 0;
+        ui.netquick   = 0;
+        ui.netpublic  = 0;
+        ui.netrequest = front.NET_HOST;
+    }
+    or (act == 2) {
+        instant_fill  = 1;
+        ui.watching   = 0;
+        ui.netplayers = 4;
+        ui.netskill   = defs.SK_MEDIUM;
+        ui.netdm      = 1;
+        ui.netquick   = 1;
+        ui.netpublic  = 1;
+        ui.netrequest = front.NET_HOST;
+    }
+    or (act == 3) {
+        instant_fill  = 0;
+        ui.watchcoop  = 1;
+        ui.netrequest = front.NET_WATCH;
+    }
+    or (act == 4) {
+        instant_fill  = 0;
+        ui.watchcoop  = 0;
+        ui.netrequest = front.NET_WATCH;
+    }
+}
+
+#[export]
+#[symbol("web_want_pointer_lock")]
+pub fun web_want_pointer_lock() i32 {
+    if (ready && ui.mode == front.MODE_LEVEL && !ui.menuactive && ui.message == nil && !ui.watching) {
+        ret 1;
+    }
+    ret 0;
+}
+
+#[export]
+#[symbol("web_watch_dm_load")]
+pub fun web_watch_dm_load(len: i32) i32 {
+    if (!ready) { ret 0; }
+    if (len < relayproto.WATCHFILE) {
+        front.to_title(?ui);
+        front.notice(?ui, "the bot league has no match\nto watch just now.\n\n(press a key)");
+        ret 0;
+    }
+    val data: *u8 = ?transfer[0];
+    if (data[0] != 'M' || data[1] != 'D' || data[2] != 'W' || data[3] != '1' || data[4] != relayproto.RECIPE) {
+        front.to_title(?ui);
+        front.notice(?ui, "that match is from another version\nof the game.\n\n(press a key)");
+        ret 0;
+    }
+    if (get32(data, relayproto.WATCHPRINT) != our_fingerprint(session)) {
+        front.to_title(?ui);
+        front.notice(?ui, "that match was played by another\nversion of the bots.\n\n(press a key)");
+        ret ANOTHER_SIMULATION;
+    }
+    val map:  i32 = data[5]::i32;
+    val tics: i32 = get32(data, 8):~i32;
+    if (map < 1 || map > 9 || tics < 1 || tics > 35 * 600 || data[6] != 0) {
+        front.to_title(?ui);
+        front.notice(?ui, "that match could not be loaded.\n\n(press a key)");
+        ret 0;
+    }
+    if (!game.deathmatch_game(session, 4, 0, defs.SK_MEDIUM, map, 1, 1)) {
+        front.to_title(?ui);
+        ret 0;
+    }
+    var names: [96]u8;
+    var i:     i32 = 0;
+    for (i < 4) {
+        val at: i32 = 16 + i * relayproto.WATCHSEAT;
+        game.set_bot(session, i, seat_kind(get32(data, at):~i32), (?data[at + 44]):~*i8, get32(data, at + 4));
+        var k: i32 = 0;
+        for (k < 24) {
+            names[i * 24 + k] = data[at + 20 + k];
+            k                 = k + 1;
+        }
+        i = i + 1;
+    }
+    watchtics = tics;
+    front.start_watching(?ui, session, ?names[0]);
+    ret tics;
+}
+
+#[export]
+#[symbol("web_watch_coop_load")]
+pub fun web_watch_coop_load(nowlen: i32, ticklen: i32) i32 {
+    if (!ready) { ret 0; }
+    if (nowlen != NOW_BYTES) {
+        front.to_title(?ui);
+        front.notice(?ui, "the co-op bots have no campaign\nunder way just now.\n\n(press a key)");
+        ret 0;
+    }
+    val now:  *u8 = ?transfer[0];
+    val tick: *u8 = ?transfer[NOW_BYTES];
+    if (now[0] != 'M' || now[1] != 'D' || now[2] != 'N' || now[3] != '1' || now[4] != relayproto.RECIPE) {
+        front.to_title(?ui);
+        front.notice(?ui, "the co-op bots have no campaign\nunder way just now.\n\n(press a key)");
+        ret 0;
+    }
+    if (get32(now, 16) != our_fingerprint(session)) {
+        front.to_title(?ui);
+        front.notice(?ui, "the co-op bots are playing another\nversion of the game.\n\n(press a key)");
+        ret ANOTHER_SIMULATION;
+    }
+    val skill:    i32 = now[5]::i32;
+    val map:      i32 = now[6]::i32;
+    val cap:      i32 = get32(now, 8):~i32;
+    val campaign: u32 = get32(now, 12);
+    if (map < 1 || map > 9 || cap < 1) {
+        front.to_title(?ui);
+        ret 0;
+    }
+    if (map == 1) {
+        if (!game.campaign_game(session, 4, 0, skill, cap)) {
+            front.to_title(?ui);
+            ret 0;
+        }
+    }
+    or (!game.campaign_resume(session, 4, 0, skill, cap, map, ?now[NOW_HEAD + 4 * NOW_SEAT])) {
+        front.to_title(?ui);
+        ret 0;
+    }
+    var i: i32 = 0;
+    for (i < 4) {
+        val at: i32 = NOW_HEAD + i * NOW_SEAT;
+        game.set_bot(session, i, seat_kind(get32(now, at):~i32), (?now[at + 32]):~*i8, get32(now, at + 4));
+        var k: i32 = 0;
+        for (k < 24) {
+            joinnames[i * 24 + k] = now[at + 8 + k];
+            k                     = k + 1;
+        }
+        i = i + 1;
+    }
+    game.campaign_bots(session);
+    join.target = 0;
+    if (ticklen == 16 && tick[0] == 'M' && tick[1] == 'D' && tick[2] == 'P' && tick[3] == '1' && get32(tick, 4) == campaign && get32(tick, 8):~i32 == map) {
+        join.target = get32(tick, 12):~i32;
+    }
+    if (join.target > cap - 35) { join.target = cap - 35; }
+    join.map  = map;
+    join.tic  = 0;
+    join.hook = session.g.start_sound;
+    session.g.start_sound = nil;
+    joining = -1;
+    front.notice(?ui, "catching up with the co-op bots,\nhowever far in they are...\n\n(escape gives up)");
+    ret map;
+}
+
+# start a 2-4 player co-op or deathmatch game locally in the browser, seating
+# bots directly from the league file (coop.bin or league.bin) when offline
+#[export]
+#[symbol("web_start_bot_game")]
+pub fun web_start_bot_game(league_ptr: *u8, league_len: i32, seed_in: u32) i32 {
+    if (!ready) { ret 0; }
+    if (active_net != nil) {
+        net.close(active_net);
+        active_net = nil;
+        netstarted = 0;
+        stalled    = 0;
+        gametic    = 0;
+    }
+    var players: i32 = ui.netplayers;
+    if (players < 2) { players = 2; }
+    if (players > 4) { players = 4; }
+    val dm:  bool = ui.netdm || ui.netquick;
+    var map: i32  = 1;
+    if (dm) {
+        map       = BOTMAPS[map_cycle % 7];
+        map_cycle = map_cycle + 1;
+    }
+
+    var ldata: *u8  = nil;
+    var have:  bool = 0;
+    if (league_ptr != nil) {
+        if (lf.valid(league_ptr, league_len)) {
+            ldata = league_ptr;
+            have  = 1;
+        }
+        or (lf.upgrade(league_ptr, league_len, ?leaguetmp[0])) {
+            ldata = ?leaguetmp[0];
+            have  = 1;
+        }
+    }
+
+    var rng: u32 = seed_in | 1;
+    var chosen: [4]i32;
+    var s: i32 = 1;
+    for (s < players) {
+        if (!dm && have) {
+            chosen[s] = lf.COHORT[(s - 1 + map_cycle) & 3];
+        }
+        or {
+            var pick: i32 = 1;
+            var tries: i32 = 0;
+            for (tries < 50) {
+                rng  = rng * 1664525 + 1013904223;
+                pick = ((rng >> 16) % lf.MEMBERS::u32)::i32;
+                var dup: bool = 0;
+                var prev: i32 = 1;
+                for (prev < s) {
+                    if (chosen[prev] == pick) { dup = 1; }
+                    prev = prev + 1;
+                }
+                if (!dup) { brk; }
+                tries = tries + 1;
+            }
+            chosen[s] = pick;
+        }
+        s = s + 1;
+    }
+
+    var names: [96]u8;
+    var i:     i32 = 0;
+    for (i < 96) {
+        names[i] = 0;
+        i        = i + 1;
+    }
+    append(?names[0], 0, "you");
+    i = 1;
+    for (i < players) {
+        lf.name_of(chosen[i], ?names[i * 24]);
+        i = i + 1;
+    }
+
+    var blockmine: [48]u8;
+    val mb: *defs.RpgStats = profile.block();
+    i = 0;
+    for (i < 48) {
+        blockmine[i] = (mb:~*u8)[i];
+        i            = i + 1;
+    }
+    if (!front.start_coop(?ui, session, players, 0, ui.netskill, map, dm, ?names[0], ui.netff, ?blockmine[0])) {
+        front.to_title(?ui);
+        ret 0;
+    }
+    ui.netgame = 0;
+
+    var at: i32 = 0;
+    i = 1;
+    for (i < players) {
+        val who:  i32 = chosen[i];
+        var kind: i32 = bot.KIND_SCRIPT | (lf.quirk_of(who) << lf.QUIRK_SHIFT);
+        var netw: *i8 = nil;
+        if (have) {
+            val base:  i32 = lf.HEAD + who * lf.MEMBER_BYTES;
+            val mkind: i32 = get32(ldata, base + lf.AT_KIND):~i32;
+            val style: i32 = get32(ldata, base + lf.AT_STYLE):~i32;
+            if (mkind != lf.KIND_SCRIPT) {
+                kind = bot.KIND_NET | (lf.quirk_of(who) << lf.QUIRK_SHIFT);
+                if (style == lf.STYLE_BRAWLER) { kind = kind | lf.TRAIT_FISTS; }
+                netw = (?ldata[base + lf.AT_NET]):~*i8;
+            }
+        }
+        rng = rng * 1664525 + 1013904223;
+        game.set_bot(session, i, kind, netw, rng | 1);
+        if (at == 0) {
+            at = append(?botline[0], 0, "with you: ");
+        }
+        or {
+            at = append(?botline[0], at, ", ");
+        }
+        at = append(?botline[0], at, ?names[i * 24]);
+        i = i + 1;
+    }
+    if (at > 0) { session.g.players[0].message = ?botline[0]; }
+    ui.message = nil;
+    ret 1;
+}
+
+#[export]
+#[symbol("web_tic")]
+pub fun web_tic() i32 {
+    if (!ready) { ret 0; }
+    clock_us = clock_us + (1000000 / 35);
+
+    val key:     i32  = take_key();
+    val stopped: bool = active_net != nil && (!netstarted || stalled || active_net.desync || active_net.quit);
+    if (joining < 0 && key == front.KEY_ESCAPE) {
+        session.g.start_sound = join.hook;
+        joining               = 0;
+        front.to_title(?ui);
+        ui.message = nil;
+        ret 1;
+    }
+
+    if (key != 0 && !stopped && joining >= 0) {
+        val playing: bool = ui.mode == front.MODE_LEVEL && !ui.menuactive && ui.message == nil;
+        if (playing && ui.watching && key >= '1' && key <= '4') {
+            session.g.consoleplayer = key - '1';
+            if (ui.spy == session.g.consoleplayer) { front.spy_next(?ui, session); }
+        }
+        or (playing && ui.watching && (key == 'L' || key == 'l')) {
+            ui.watchcoop  = !ui.watchcoop;
+            ui.netrequest = front.NET_WATCH;
+        }
+        or (playing && key == front.KEY_F12 && front.may_spy(?ui, session)) {
+            front.spy_next(?ui, session);
+        }
+        or (playing && (key == 'Q' || key == 'q')) {
+            blinkq = 1;
+        }
+        or (playing && (key == 'X' || key == 'x')) {
+            stimq = 1;
+        }
+        or (playing && key >= '1' && key <= '7') {
+            weapon = key - '0';
+        }
+        or {
+            front.responder(?ui, session, key);
+        }
+    }
+
+    # a host waiting may start at once, with bots in the empty seats
+    if (active_net != nil && !netstarted && key == front.KEY_ENTER) {
+        net.ask_fill(active_net);
+        instant_fill = 1;
+        wait_tics    = 0;
+    }
+
+    # leave a network game with Esc while waiting/stopped, or with End Game
+    if (active_net != nil && ((stopped && key == front.KEY_ESCAPE) || (netstarted && ui.mode == front.MODE_PAGE))) {
+        net.close(active_net);
+        active_net    = nil;
+        netstarted    = 0;
+        stalled       = 0;
+        gametic       = 0;
+        progress_tics = 0;
+        wait_tics     = 0;
+        instant_fill  = 0;
+        front.to_title(?ui);
+        ui.message = nil;
+        ret 1;
+    }
+
+    if (ui.trainsaid != trainsaid) {
+        trainsaid = ui.trainsaid;
+        write_choice(ui.train);
+    }
+
+    if (ui.netrequest == front.NET_UPDATE) {
+        ui.netrequest = 0;
+        front.notice(?ui, "this browser copy is already\nthe newest version on the site.\n\n(press a key)");
+    }
+
+    if (ui.netrequest == front.NET_WATCH || (ui.watching && ui.mode != front.MODE_PAGE && joining == 0 && watched_out(?ui, session, watchtics))) {
+        ui.netrequest  = 0;
+        ui.mode        = front.MODE_FINALE;
+        ui.finalestage = 1;
+        ui.menuactive  = 0;
+        if (ui.watchcoop) {
+            pending_action = ACTION_WATCH_COOP;
+            front.notice(?ui, "joining the co-op bots where\nthey are...");
+        }
+        or {
+            pending_action = ACTION_WATCH_DM;
+            front.notice(?ui, "fetching a match from the bot league...\n\n(esc to give up)");
+        }
+    }
+
+    # the list of open games while on the Find an open game screen
+    if (front.listing(?ui) && active_net == nil) {
+        if (!lobby.opened) {
+            var where: net.Peer;
+            where.known  = 1;
+            where.port   = net.PORT;
+            ui.liststate = front.LIST_NOREACH;
+            if (net.lobby_open(?lobby, ?where, wadhash)) { ui.liststate = front.LIST_ASKING; }
+        }
+        net.lobby_poll(?lobby, clock_us);
+        if (lobby.answered) {
+            ui.liststate = front.LIST_KNOWN;
+            ui.nrooms    = lobby.count;
+            var g: i32 = 0;
+            for (g < lobby.count) {
+                var c: i32 = 0;
+                for (c < 7) {
+                    ui.rooms[g].code[c] = lobby.rooms[g].code[c];
+                    c                   = c + 1;
+                }
+                ui.rooms[g].players    = lobby.rooms[g].players;
+                ui.rooms[g].joined     = lobby.rooms[g].joined;
+                ui.rooms[g].skill      = lobby.rooms[g].skill;
+                ui.rooms[g].map        = lobby.rooms[g].map;
+                ui.rooms[g].deathmatch = lobby.rooms[g].deathmatch;
+                g                      = g + 1;
+            }
+        }
+        or (lobby.opened && lobby.asks >= 3) {
+            ui.liststate = front.LIST_NOREACH;
+        }
+    }
+    or (lobby.opened) {
+        net.lobby_close(?lobby);
+    }
+
+    # start hosting or joining an online game through the server
+    if (ui.netrequest == front.NET_HOST || ui.netrequest == front.NET_JOIN) {
+        val request: i32 = ui.netrequest;
+        ui.netrequest = 0;
+        if (active_net == nil && menunet == nil) {
+            val room: res[*net.Net, allocator.Error] = allocator.zallocate[net.Net](?alloc, 1);
+            if (sel room.ok) { menunet = room.ok; }
+        }
+        if (active_net == nil) {
+            val why: str = start_menu_net(menunet, request, ?ui);
+            if (why == nil) {
+                active_net    = menunet;
+                netstarted    = 0;
+                stalled       = 0;
+                gametic       = 0;
+                progress_tics = 0;
+                wait_tics     = 0;
+                ui.mode        = front.MODE_FINALE;
+                ui.finalestage = 1;
+                ui.menuactive  = 0;
+                waiting_text(active_net, ?waitbuf[0]);
+                front.notice(?ui, ?waitbuf[0]);
+            }
+            or {
+                instant_fill = 0;
+                front.notice(?ui, why);
+            }
+        }
+    }
+
+    if (joining == -1) {
+        var steps: i32 = 0;
+        for (join.tic < join.target && !session.completed && !session.broken && steps < 280) {
+            game.ticker_cmds(session, ?join.cmds[0]);
+            join.tic = join.tic + 1;
+            steps    = steps + 1;
+        }
+        if (join.tic < join.target && !session.completed && !session.broken) {
+            var ja: i32 = append(?joinmsg[0], 0, "catching up with the co-op bots...");
+            if (join.target > 0) {
+                ja = append(?joinmsg[0], ja, "\n");
+                ja = append_number(?joinmsg[0], ja, (join.tic * 100 / join.target)::i64);
+                ja = append(?joinmsg[0], ja, "% of the way there");
+            }
+            append(?joinmsg[0], ja, "\n\n(escape gives up)");
+            front.notice(?ui, ?joinmsg[0]);
+            ret 1;
+        }
+        session.g.start_sound = join.hook;
+        joining               = 0;
+        if (session.broken) {
+            front.to_title(?ui);
+            front.notice(?ui, "the co-op bots have no campaign\nunder way just now.\n\n(press a key)");
+        }
+        or {
+            front.start_watching(?ui, session, ?joinnames[0]);
+        }
+        ret 1;
+    }
+
+    var input: game.Input;
+    if (!ui.menuactive) {
+        input.mousex       = mousepend;
+        mousepend          = 0;
+        input.forward      = key_held(VK_UP) || key_held('W');
+        input.back         = key_held(VK_DOWN) || key_held('S');
+        input.left         = key_held(VK_LEFT);
+        input.right        = key_held(VK_RIGHT);
+        input.strafe_left  = key_held('A');
+        input.strafe_right = key_held('D');
+        input.run          = key_held(VK_SHIFT);
+        input.fire         = key_held(VK_CONTROL) || key_held('F') || (ui.mode == front.MODE_LEVEL && key_held(VK_LBUTTON));
+        input.activate     = key_held(VK_SPACE) || key_held('E') || (ui.mode == front.MODE_LEVEL && key_held(VK_RBUTTON));
+        input.weapon       = weapon;
+        weapon             = 0;
+        input.blink        = blinkq != 0;
+        input.stim         = stimq != 0;
+        blinkq             = 0;
+        stimq              = 0;
+    }
+    or {
+        mousepend = 0;
+    }
+    if (ui.nallocq > 0) {
+        input.alloc = ui.allocq[0];
+        var aq: i32 = 1;
+        for (aq < ui.nallocq) {
+            ui.allocq[aq - 1] = ui.allocq[aq];
+            aq                = aq + 1;
+        }
+        ui.nallocq = ui.nallocq - 1;
+    }
+
+    if (active_net == nil) {
+        front.ticker(?ui, session, ?bar, ?input);
+    }
+    or {
+        if (!netstarted) {
+            wait_tics = wait_tics + 1;
+            if (net.gather(active_net)) {
+                netstarted    = 1;
+                instant_fill  = 0;
+                progress_tics = 0;
+                var names: [96]u8;
+                net_names(active_net, ?names[0]);
+                if (!front.start_coop(?ui, session, active_net.players, active_net.me, active_net.skill, active_net.map, active_net.deathmatch, ?names[0], active_net.ff, ?active_net.blockmine[0])) {
+                    net.close(active_net);
+                    active_net = nil;
+                    front.to_title(?ui);
+                }
+                or {
+                    seat_bots(session, active_net);
+                    ui.message = nil;
+                }
+            }
+            or (instant_fill && active_net.token == 0 && wait_tics >= 70) {
+                # offline fallback when the server is unreachable and the player
+                # asked to start immediately with bots
+                val dm: bool = active_net.deathmatch;
+                net.close(active_net);
+                active_net   = nil;
+                instant_fill = 0;
+                if (dm) { pending_action = ACTION_PLAY_DM; }
+                or      { pending_action = ACTION_PLAY_COOP; }
+                front.notice(?ui, "seating the bots from the league...");
+            }
+            or {
+                waiting_text(active_net, ?waitbuf[0]);
+                front.notice(?ui, ?waitbuf[0]);
+            }
+        }
+        or {
+            progress_tics = progress_tics + 1;
+            net.receive(active_net);
+            if (net.wants_command(active_net, gametic)) {
+                var cmd: defs.Ticcmd;
+                game.build_ticcmd(session, ?input, ?cmd);
+                net.add_command(active_net, ?cmd);
+            }
+            net.send_commands(active_net, gametic - 1);
+            net.install(session, active_net);
+            for (!active_net.desync && !active_net.quit && !stalled && net.due(active_net, gametic) && net.ready(active_net, gametic)) {
+                var cmds: [4]defs.Ticcmd;
+                net.commands(active_net, gametic, ?cmds[0]);
+                front.net_ticker(?ui, session, ?bar, ?cmds[0]);
+                if (ui.train == front.TRAIN_YES && ui.mode == front.MODE_LEVEL) { teach(active_net, session); }
+                net.record(active_net, gametic, game.checksum(session));
+                gametic       = gametic + 1;
+                progress_tics = 0;
+            }
+            net.pace(active_net, gametic);
+            if (!stalled && !active_net.desync && !active_net.quit && progress_tics > 350) {
+                stalled = 1;
+                front.notice(?ui, "a player has stopped answering.\n\nthe game cannot go on without them. (esc)");
+            }
+            if (active_net.desync) {
+                front.notice(?ui, "the games have gone out of step.\nthis one has stopped. (esc)");
+            }
+            if (active_net.quit) {
+                front.notice(?ui, "another player has left the game.\n\n(esc)");
+            }
+        }
+    }
+
+    sound.update(?session.g);
+    profile.maybe(session);
+    ret 1;
+}
+
+#[export]
+#[symbol("web_draw")]
+pub fun web_draw() *u8 {
+    if (!ready) { ret ?rgba[0]; }
+    front.draw(?ui, session, renderer, ?bar);
+    val pal:    i32 = front.palette(?ui, ?bar) * 768;
+    val pixels: i32 = render.SCREENWIDTH * render.SCREENHEIGHT;
+    var i:      i32 = 0;
+    for (i < pixels) {
+        val c:   i32 = pal + renderer.screen[i]::i32 * 3;
+        val dst: i32 = i * 4;
+        rgba[dst]     = graphics.playpal[c];
+        rgba[dst + 1] = graphics.playpal[c + 1];
+        rgba[dst + 2] = graphics.playpal[c + 2];
+        rgba[dst + 3] = 255;
+        i             = i + 1;
+    }
+    ret ?rgba[0];
+}
+
+#[export]
+#[symbol("web_audio")]
+pub fun web_audio(frames: i32) *i16 {
+    var count: i32 = frames;
+    if (count < 0)    { count = 0; }
+    if (count > 4096) { count = 4096; }
+    if (!ready || count == 0) { ret ?pcm[0]; }
+
+    if (hasmusic) {
+        if (songserial != ui.songserial) {
+            songserial = ui.songserial;
+            music.stop(?song, opl.midi);
+            val found: opt[u32] = wad.find(?archive, ?ui.song[0]);
+            if (sel found.some) {
+                val looping: bool = ui.song[2] != 'I' || ui.song[3] != 'N' || ui.song[4] != 'T' || ui.song[5] != 'R';
+                music.load(?song, wad.bytes(?archive, found.some), wad.lump(?archive, found.some).size, looping);
+                musvolume = -1;
+            }
+        }
+        if (musvolume != ui.musicvolume) {
+            musvolume = ui.musicvolume;
+            music.set_volume(?song, musvolume * 127 / 15, opl.midi);
+        }
+    }
+
+    sound.mix(?pcm[0], count);
+
+    if (hasmusic) {
+        var done: i32 = 0;
+        for (done < count) {
+            if (muscarry <= 0) {
+                music.advance(?song, 1, opl.midi);
+                muscarry = muscarry + sound.RATE;
+            }
+            var step: i32 = (muscarry + music.TICRATE - 1) / music.TICRATE;
+            if (step < 1)            { step = 1; }
+            if (done + step > count) { step = count - done; }
+            opl.mix(?pcm[done * 2], step, sound.RATE);
+            muscarry = muscarry - step * music.TICRATE;
+            done     = done + step;
+        }
+    }
+
+    ret ?pcm[0];
+}
+
+#[export]
+#[symbol("web_flush_profile")]
+pub fun web_flush_profile() {
+    if (!ready) { ret; }
+    profile.flush(session, 1);
+    profile.checkpoint(session);
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    ret 0;
+}

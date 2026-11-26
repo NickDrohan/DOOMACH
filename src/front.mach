@@ -20,8 +20,10 @@ use rp: doom.relayproto;
 use doom.game;
 use doom.info;
 use doom.music;
+use doom.profile;
 use doom.rdata;
 use doom.render;
+use doom.rpg;
 use doom.save;
 use doom.sound;
 use doom.st;
@@ -48,17 +50,42 @@ val MENU_CODE:    i32 = 8;
 val MENU_LIST:    i32 = 9;
 val MENU_LOAD:    i32 = 10;
 val MENU_SAVE:    i32 = 11;
+val MENU_CHAR:    i32 = 12;
+val MENU_SPEND:   i32 = 13;
+val MENU_NAME:    i32 = 14;
 
 # the lines of the co-op menu
 val COOP_MODE:   i32 = 3;
 val COOP_PUBLIC: i32 = 4;
-val COOP_FIND:   i32 = 5;
-val COOP_CODE:   i32 = 6;
+val COOP_FF:     i32 = 5;
+val COOP_FIND:   i32 = 6;
+val COOP_CODE:   i32 = 7;
 # both bot leagues, each by name
-val COOP_WATCH:   i32 = 7;
-val COOP_WATCHDM: i32 = 8;
+val COOP_CHAR:    i32 = 8;
+val COOP_WATCH:   i32 = 9;
+val COOP_WATCHDM: i32 = 10;
 
 # what the list of open games is waiting on
+# what the spend screen calls the sixteen nodes, in rpg.mach's order
+val NODENAMES: [16]str = [16]str{
+    "MAX HEALTH +5",
+    "DAMAGE +1%",
+    "DAMAGE TAKEN -2%",
+    "SHOTGUN DAMAGE +2%",
+    "BLINK",
+    "STIM",
+    "KIT: SHOTGUN + 8 SHELLS",
+    "KIT: CHAINSAW",
+    "KIT: GREEN ARMOR",
+    "KIT: BACKPACK",
+    "KIT: CHAINGUN + 20 BULLETS",
+    "KIT: BERSERK",
+    "KIT: BLUE ARMOR",
+    "KIT: ROCKET LAUNCHER",
+    "KIT: PLASMA RIFLE",
+    "KIT: BFG 9000"
+};
+
 pub val LIST_ASKING:  i32 = 0;
 pub val LIST_KNOWN:   i32 = 1;
 pub val LIST_NOREACH: i32 = 2;
@@ -128,7 +155,7 @@ pub rec Front {
     # the menu
     menuactive: bool;
     menu:       i32;
-    itemon:     [12]i32;
+    itemon:     [16]i32;
     skulltics:  i32;
     whichskull: i32;
     episode:    i32;
@@ -188,6 +215,20 @@ pub rec Front {
     netpublic:   bool;
     netdm:       bool;
     netquick:    bool;
+    # co-op friendly fire, as the host chose it; the room carries it to all
+    netff:       bool;
+    # character purchases the menus queued for the coming tics (node + 1)
+    allocq:      [8]i32;
+    nallocq:     i32;
+    # the character page: the names on disk, which one select shows, and
+    # the name being typed for a new one
+    chars:       [16][24]u8;
+    nchars:      i32;
+    charsel:     i32;
+    charname:    [17]u8;
+    charnamlen:  i32;
+    # the menu the character page was opened from
+    menufrom:    i32;
     # a deathmatch is on: show every player's frags
     scores:      bool;
     # the public list, as the game loop last had it from the relay
@@ -414,7 +455,11 @@ pub fun to_title(f: *Front) {
 pub fun start_game(f: *Front, s: *game.Session, skill: i32, map: i32) {
     f.menuactive = 0;
     announce.reset(?f.ann);
+    # a character only ever knows Nightmare, and plays as its stat block
+    if (profile.loaded) { skill = defs.SK_NIGHTMARE; }
     if (game.new_game(s, skill, 1, map)) {
+        profile.id(?s.rpg_charid[0]);
+        if (profile.loaded) { rpg.set_block(?s.g, 0, profile.block()); }
         f.mode = MODE_LEVEL;
         level_song(f, s);
     }
@@ -433,8 +478,10 @@ fun start_message(f: *Front, text: str, yn: bool, ask: i32) {
 }
 
 fun items_in(menu: i32) i32 {
-    if (menu == MENU_MAIN)    { ret 7; }
-    if (menu == MENU_COOP)    { ret 9; }
+    if (menu == MENU_MAIN)    { ret 9; }
+    if (menu == MENU_COOP)    { ret 11; }
+    if (menu == MENU_CHAR)    { ret 3; }
+    if (menu == MENU_SPEND)   { ret 17; }
     if (menu == MENU_EPISODE) { ret 3; }
     if (menu == MENU_SKILL)   { ret 5; }
     if (menu == MENU_OPTIONS) { ret 5; }
@@ -449,6 +496,8 @@ fun parent_of(f: *Front, menu: i32) i32 {
     if (menu == MENU_SKILL && f.coopplayers != 0)                          { ret MENU_COOP; }
     if (menu == MENU_SKILL)                                                 { ret MENU_EPISODE; }
     if (menu == MENU_CODE || menu == MENU_LIST)                             { ret MENU_COOP; }
+    if (menu == MENU_CHAR)                                                  { ret f.menufrom; }
+    if (menu == MENU_SPEND || menu == MENU_NAME)                            { ret MENU_CHAR; }
     if (menu == MENU_SOUND)                                                 { ret MENU_OPTIONS; }
     if (menu == MENU_READ2)                                                 { ret MENU_READ1; }
     if (menu == MENU_LOAD || menu == MENU_SAVE)                                  { ret MENU_MAIN; }
@@ -457,12 +506,16 @@ fun parent_of(f: *Front, menu: i32) i32 {
 
 # whether a line of a menu can be chosen; the sound menu's sliders sit on
 # their own lines under their labels
-fun selectable(menu: i32, item: i32) bool {
+fun selectable(f: *Front, menu: i32, item: i32) bool {
+    # the last main row, END GAME, only counts while a game is being played
+    if (menu == MENU_MAIN && item == 8) { ret f.mode == MODE_LEVEL; }
     if (menu == MENU_SOUND) { ret item == 0 || item == 2; }
     ret 1;
 }
 
 fun open_menu(f: *Front, s: *game.Session) {
+    # the journal catches up while the menu is up
+    profile.flush(s, 1);
     if (f.menuactive) { ret; }
     f.menuactive = 1;
     f.menu       = MENU_MAIN;
@@ -575,6 +628,29 @@ fun choose(f: *Front, s: *game.Session) {
         or (item == 5) {
             f.menu = MENU_READ1;
         }
+        or (item == 7) {
+            # the character page: the names on disk, and who is chosen
+            f.nchars  = profile.list(s.a, ?f.chars[0][0]);
+            f.charsel = f.nchars;
+            var cn: [24]u8;
+            profile.name(?cn[0]);
+            var ck: i32 = 0;
+            for (ck < f.nchars) {
+                var same: i32 = 1;
+                var cm:   i32 = 0;
+                for (cm < 24 && cn[cm] != 0) {
+                    if (f.chars[ck][cm] != cn[cm]) { same = 0; }
+                    cm = cm + 1;
+                }
+                if (same != 0 && cn[0] != 0) { f.charsel = ck; }
+                ck = ck + 1;
+            }
+            f.menufrom = MENU_MAIN;
+            f.menu     = MENU_CHAR;
+        }
+        or (item == 8) {
+            start_message(f, "are you sure you want to end the game?\n\npress y or n.", 1, ASK_ENDGAME);
+        }
         or {
             start_message(f, "are you sure you want to\nquit this great game?\n\n(press y to quit)", 1, ASK_QUIT);
         }
@@ -607,21 +683,43 @@ fun choose(f: *Front, s: *game.Session) {
         or (item == COOP_PUBLIC) {
             f.netpublic = !f.netpublic;
         }
+        or (item == COOP_FF) {
+            f.netff = !f.netff;
+        }
         or (item == COOP_FIND) {
             f.nrooms            = 0;
             f.liststate         = LIST_ASKING;
             f.itemon[MENU_LIST] = 0;
             f.menu              = MENU_LIST;
         }
-        or (item == COOP_WATCH || item == COOP_WATCHDM) {
-            f.menuactive = 0;
-            f.watchcoop  = item == COOP_WATCH;
-            f.netrequest = NET_WATCH;
-        }
-        or {
+        or (item == COOP_CODE) {
             f.codelen = 0;
             f.code[0] = 0;
             f.menu    = MENU_CODE;
+        }
+        or (item == COOP_CHAR) {
+            f.nchars   = profile.list(s.a, ?f.chars[0][0]);
+            f.charsel  = f.nchars;
+            var cn2: [24]u8;
+            profile.name(?cn2[0]);
+            var ck2: i32 = 0;
+            for (ck2 < f.nchars) {
+                var same2: i32 = 1;
+                var cm2:   i32 = 0;
+                for (cm2 < 24 && cn2[cm2] != 0) {
+                    if (f.chars[ck2][cm2] != cn2[cm2]) { same2 = 0; }
+                    cm2 = cm2 + 1;
+                }
+                if (same2 != 0 && cn2[0] != 0) { f.charsel = ck2; }
+                ck2 = ck2 + 1;
+            }
+            f.menufrom = MENU_COOP;
+            f.menu     = MENU_CHAR;
+        }
+        or {
+            f.menuactive = 0;
+            f.watchcoop  = item == COOP_WATCH;
+            f.netrequest = NET_WATCH;
         }
     }
     or (f.menu == MENU_LIST) {
@@ -657,6 +755,46 @@ fun choose(f: *Front, s: *game.Session) {
         }
         f.menuactive = 0;
         f.netrequest = NET_JOIN;
+    }
+    or (f.menu == MENU_CHAR) {
+        if (item == 0) {
+            # step through the names on disk, then none
+            f.charsel = f.charsel + 1;
+            if (f.charsel > f.nchars) { f.charsel = 0; }
+            if (f.charsel < f.nchars) {
+                if (!profile.choose(s.a, ?f.chars[f.charsel][0])) { sfx(s, info.SFX_OOF); }
+            }
+            or {
+                profile.unload();
+            }
+        }
+        or (item == 1) {
+            f.charnamlen  = 0;
+            f.charname[0] = 0;
+            f.menu        = MENU_NAME;
+        }
+        or {
+            if (!profile.loaded) {
+                sfx(s, info.SFX_OOF);
+                ret;
+            }
+            f.menu = MENU_SPEND;
+        }
+    }
+    or (f.menu == MENU_SPEND) {
+        if (item == rpg.N_NODES) {
+            f.menu = MENU_CHAR;
+            ret;
+        }
+        # a point is spoken for when the command lands on a tic; queued
+        # ones count against what is left
+        if (!profile.loaded || !profile.can_buy(item) || profile.points() <= f.nallocq ||
+            f.nallocq >= 8 || alloc_queued(f, item)) {
+            sfx(s, info.SFX_OOF);
+            ret;
+        }
+        f.allocq[f.nallocq] = item + 1;
+        f.nallocq           = f.nallocq + 1;
     }
     or (f.menu == MENU_OPTIONS) {
         if (item == 0) {
@@ -695,6 +833,8 @@ fun choose(f: *Front, s: *game.Session) {
         f.menuactive = 0;
     }
     or (f.menu == MENU_LOAD) {
+        # a save refuses a character other than the one that wrote it
+        profile.id(?s.rpg_charid[0]);
         if (save.read_game(s, s.a, item)) {
             loaded(f, s);
         }
@@ -718,6 +858,8 @@ fun choose(f: *Front, s: *game.Session) {
 # a skill was chosen: a game alone, or, for a host, a co-op game for the
 # game loop to start
 fun begin(f: *Front, s: *game.Session, skill: i32) {
+    # a character only ever knows Nightmare
+    if (profile.loaded) { skill = defs.SK_NIGHTMARE; }
     if (f.coopplayers == 0) {
         start_game(f, s, skill, 1);
         ret;
@@ -750,6 +892,51 @@ fun type_code(f: *Front, s: *game.Session, key: i32) bool {
     f.code[f.codelen] = 0;
     sfx(s, info.SFX_STNMOV);
     ret 1;
+}
+
+# a key while a character is being named: capitals, digits, underscore,
+# backspace to take one back, and enter to make it
+fun type_name(f: *Front, s: *game.Session, key: i32) bool {
+    if (key == KEY_BACKSPACE && f.charnamlen > 0) {
+        f.charnamlen               = f.charnamlen - 1;
+        f.charname[f.charnamlen]   = 0;
+        sfx(s, info.SFX_STNMOV);
+        ret 1;
+    }
+    if (key == KEY_ENTER) {
+        if (!profile.name_ok(?f.charname[0])) {
+            sfx(s, info.SFX_OOF);
+            ret 1;
+        }
+        if (profile.create(?f.charname[0]) && profile.choose(s.a, ?f.charname[0])) {
+            f.menu = MENU_CHAR;
+            ret 1;
+        }
+        sfx(s, info.SFX_OOF);
+        ret 1;
+    }
+    var c: u8 = key::u8;
+    if (key >= 'a' && key <= 'z') { c = (key - 32)::u8; }
+    if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) { ret 0; }
+    if (f.charnamlen >= 16) {
+        sfx(s, info.SFX_OOF);
+        ret 1;
+    }
+    f.charname[f.charnamlen] = c;
+    f.charnamlen             = f.charnamlen + 1;
+    f.charname[f.charnamlen] = 0;
+    sfx(s, info.SFX_STNMOV);
+    ret 1;
+}
+
+# whether the node is already spoken for in the purchase queue
+fun alloc_queued(f: *Front, node: i32) bool {
+    var i: i32 = 0;
+    for (i < f.nallocq) {
+        if (f.allocq[i] == node + 1) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
 }
 
 # the answer to a yes-or-no message
@@ -824,18 +1011,19 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
         if (f.itemon[menu] >= n) { f.itemon[menu] = 0; }
     }
     if (menu == MENU_CODE && type_code(f, s, key)) { ret; }
+    if (menu == MENU_NAME && type_name(f, s, key)) { ret; }
 
     if (key == KEY_DOWN) {
         for {
             f.itemon[menu] = (f.itemon[menu] + 1) % n;
-            if (selectable(menu, f.itemon[menu])) { brk; }
+            if (selectable(f, menu, f.itemon[menu])) { brk; }
         }
         sfx(s, info.SFX_PSTOP);
     }
     or (key == KEY_UP) {
         for {
             f.itemon[menu] = (f.itemon[menu] + n - 1) % n;
-            if (selectable(menu, f.itemon[menu])) { brk; }
+            if (selectable(f, menu, f.itemon[menu])) { brk; }
         }
         sfx(s, info.SFX_PSTOP);
     }
@@ -861,6 +1049,72 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
         }
         sfx(s, info.SFX_SWTCHN);
     }
+}
+
+# write a str onto the buffer
+fun line_cat(out: *u8, a: str, b: str) {
+    var i: i32 = 0;
+    var k: i32 = 0;
+    for (a[k] != 0) { out[i] = a[k]; i = i + 1; k = k + 1; }
+    k = 0;
+    for (b[k] != 0) { out[i] = b[k]; i = i + 1; k = k + 1; }
+    out[i] = 0;
+}
+
+# "label <n>"
+fun line_num(out: *u8, label: str, v: i64) {
+    var i: i32 = 0;
+    var k: i32 = 0;
+    for (label[k] != 0) { out[i] = label[k]; i = i + 1; k = k + 1; }
+    var tmp: [24]u8;
+    var n:   i32  = 0;
+    var u:   i64  = v;
+    if (u < 0) { u = 0 - u; }
+    for {
+        tmp[n] = '0' + (u % 10)::u8;
+        u      = u / 10;
+        n      = n + 1;
+        if (u == 0) { brk; }
+    }
+    if (v < 0) { out[i] = '-'; i = i + 1; }
+    for (n > 0) {
+        n = n - 1;
+        out[i] = tmp[n];
+        i = i + 1;
+    }
+    out[i] = 0;
+}
+
+# "a <n> b <m>"
+fun line_num2(out: *u8, a: str, va: i64, b: str, vb: i64) {
+    var ab: [24]u8;
+    var bb: [24]u8;
+    line_num(?ab[0], "", va);
+    line_num(?bb[0], "", vb);
+    var tmp: [64]u8;
+    line_cat(?tmp[0], ?ab[0], b);
+    line_cat(out, a, ?tmp[0]);
+    var len: i32 = 0;
+    for (out[len] != 0) { len = len + 1; }
+    var k:   i32 = 0;
+    for (bb[k] != 0) { out[len] = bb[k]; len = len + 1; k = k + 1; }
+    out[len] = 0;
+}
+
+# how far the chosen row sits below the menu's top, in the skull's
+# frame: rows are LINEHEIGHT apart except where a page packs them tighter
+# ---
+# item: the row chosen, as itemon keeps it
+fun skullrow(menu: i32, item: i32) i32 {
+    if (menu == MENU_SPEND) {
+        # eight rows of twelve, a window that moves under the choice
+        if (item >= rpg.N_NODES) { ret 8 * 12 + 16 + 4; }
+        var off: i32 = item - 4;
+        if (off < 0) { off = 0; }
+        if (off > 8) { off = 8; }
+        ret (item - off) * 12 + 4;
+    }
+    ret item * LINEHEIGHT;
 }
 
 # the menu's pictures, and the skull beside the chosen line
@@ -890,6 +1144,8 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         video.draw_patch(screen, x, y + LINEHEIGHT * 4, video.patch(d, "M_SAVEG"));
         video.draw_patch(screen, x, y + LINEHEIGHT * 5, video.patch(d, "M_RDTHIS"));
         video.draw_patch(screen, x, y + LINEHEIGHT * 6, video.patch(d, "M_QUITG"));
+        video.write_text(d, screen, x + 2, y + LINEHEIGHT * 7 + 4, "CHARACTER", -1);
+        if (f.mode == MODE_LEVEL) { video.write_text(d, screen, x + 2, y + LINEHEIGHT * 8 + 4, "END GAME", -1); }
     }
     or (f.menu == MENU_COOP) {
         x = 72;
@@ -911,10 +1167,24 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         or {
             video.write_text(d, screen, x, y + LINEHEIGHT * 4 + 4, "LISTED PUBLICLY: NO", -1);
         }
-        video.write_text(d, screen, x, y + LINEHEIGHT * 5 + 4, "FIND AN OPEN GAME", -1);
-        video.write_text(d, screen, x, y + LINEHEIGHT * 6 + 4, "JOIN WITH A ROOM CODE", -1);
-        video.write_text(d, screen, x, y + LINEHEIGHT * 7 + 4, "WATCH THE CO-OP BOTS", -1);
-        video.write_text(d, screen, x, y + LINEHEIGHT * 8 + 4, "WATCH THE DEATHMATCH BOTS", -1);
+        if (f.netff) {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 5 + 4, "FRIENDLY FIRE: ON", -1);
+        }
+        or {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 5 + 4, "FRIENDLY FIRE: OFF", -1);
+        }
+        video.write_text(d, screen, x, y + LINEHEIGHT * 6 + 4, "FIND AN OPEN GAME", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 7 + 4, "JOIN WITH A ROOM CODE", -1);
+        var cwho: [24]u8;
+        profile.name(?cwho[0]);
+        if (cwho[0] == 0) { video.write_text(d, screen, x, y + LINEHEIGHT * 8 + 4, "CHARACTER: NO ONE", -1); }
+        or {
+            var cline: [40]u8;
+            line_cat(?cline[0], "CHARACTER: ", ?cwho[0]);
+            video.write_text(d, screen, x, y + LINEHEIGHT * 8 + 4, ?cline[0], -1);
+        }
+        video.write_text(d, screen, x, y + LINEHEIGHT * 9 + 4, "WATCH THE CO-OP BOTS", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 10 + 4, "WATCH THE DEATHMATCH BOTS", -1);
         var line: [20]u8 = [20]u8{'T', 'H', 'I', 'S', ' ', 'C', 'O', 'P', 'Y', ':', ' ', ' ', 0, 0, 0, 0, 0, 0, 0, 0};
         var k:    i32    = 0;
         for (k < 6 && f.build[k] != 0) {
@@ -973,6 +1243,72 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         centred(d, screen, 60, "ENTER THE ROOM CODE");
         centred(d, screen, 90, ?shown[0]);
         centred(d, screen, 130, "ENTER TO JOIN, BACKSPACE TO ERASE");
+        ret;
+    }
+    or (f.menu == MENU_CHAR) {
+        x = 56;
+        y = 96;
+        video.shade(d, screen, 16, 6, 288, 186, 26);
+        centred(d, screen, 13, "CHARACTER");
+        var who: [24]u8;
+        profile.name(?who[0]);
+        var line: [64]u8;
+        line_cat(?line[0], "PLAYING AS ", ?who[0]);
+        if (who[0] == 0) { line_cat(?line[0], "PLAYING AS ", "NO ONE"); }
+        centred(d, screen, 36, ?line[0]);
+        if (profile.loaded) {
+            var nums: [64]u8;
+            line_num2(?nums[0], "LEVEL ", rpg.level_of(profile.cur.slayer_xp)::i64, "  POINTS ", profile.points()::i64);
+            centred(d, screen, 54, ?nums[0]);
+            line_num(?nums[0], "SLAYER XP ", profile.cur.slayer_xp);
+            centred(d, screen, 70, ?nums[0]);
+        }
+        video.write_text(d, screen, x, y + 4, "SELECT", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT + 4, "NEW CHARACTER", -1);
+        video.write_text(d, screen, x, y + LINEHEIGHT * 2 + 4, "SPEND SKILL POINTS", -1);
+        centred(d, screen, 178, "ENTER CHANGES SELECTION, BACKSPACE GOES BACK");
+    }
+    or (f.menu == MENU_SPEND) {
+        x = 40;
+        y = 40;
+        video.shade(d, screen, 16, 6, 288, 186, 26);
+        centred(d, screen, 13, "SPEND SKILL POINTS");
+        var pn: [32]u8;
+        line_num(?pn[0], "POINTS LEFT: ", (profile.points() - f.nallocq)::i64);
+        centred(d, screen, 32, ?pn[0]);
+        val it:  i32 = f.itemon[MENU_SPEND];
+        var off: i32 = it - 4;
+        if (off < 0) { off = 0; }
+        if (off > 8) { off = 8; }
+        var row: i32 = 0;
+        for (row < 8) {
+            val node: i32 = off + row;
+            if (node >= rpg.N_NODES) { brk; }
+            var nl: [48]u8;
+            line_cat(?nl[0], NODENAMES[node], "  x");
+            var rk: [48]u8;
+            line_num(?rk[0], ?nl[0], profile.cur.nodes[node]::i64);
+            if (profile.cur.nodes[node] == 0) { line_cat(?rk[0], NODENAMES[node], ""); }
+            if (!profile.can_buy(node))       { video.write_text(d, screen, x, y + row * 12 + 4, ?rk[0], 8); }
+            or                                { video.write_text(d, screen, x, y + row * 12 + 4, ?rk[0], -1); }
+            row = row + 1;
+        }
+        video.write_text(d, screen, x, y + 8 * 12 + 16, "BACK", -1);
+        centred(d, screen, 178, "ENTER SPENDS A POINT");
+    }
+    or (f.menu == MENU_NAME) {
+        var shown: [24]u8;
+        var k:     i32 = 0;
+        for (k < 16) {
+            shown[k] = '_';
+            if (k < f.charnamlen) { shown[k] = f.charname[k]; }
+            k = k + 1;
+        }
+        shown[16] = 0;
+        video.shade(d, screen, 28, 48, 264, 100, 26);
+        centred(d, screen, 60, "NAME THE CHARACTER");
+        centred(d, screen, 90, ?shown[0]);
+        centred(d, screen, 130, "ENTER TO MAKE IT, BACKSPACE TO ERASE");
         ret;
     }
     or (f.menu == MENU_EPISODE) {
@@ -1052,10 +1388,10 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
 
     # the skull blinks beside the chosen line
     if (f.whichskull == 0) {
-        video.draw_patch(screen, x + SKULLXOFF, y - 5 + f.itemon[f.menu] * LINEHEIGHT, video.patch(d, "M_SKULL1"));
+        video.draw_patch(screen, x + SKULLXOFF, y - 5 + skullrow(f.menu, f.itemon[f.menu]), video.patch(d, "M_SKULL1"));
     }
     or {
-        video.draw_patch(screen, x + SKULLXOFF, y - 5 + f.itemon[f.menu] * LINEHEIGHT, video.patch(d, "M_SKULL2"));
+        video.draw_patch(screen, x + SKULLXOFF, y - 5 + skullrow(f.menu, f.itemon[f.menu]), video.patch(d, "M_SKULL2"));
     }
 }
 
@@ -1534,7 +1870,7 @@ pub fun ticker(f: *Front, s: *game.Session, bar: *st.State, input: *game.Input) 
 # items that come back and no monsters, and every player's frags on screen
 # ---
 # names: for a deathmatch, each player's name, 24 bytes a player
-pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i32, map: i32, deathmatch: bool, names: *u8) bool {
+pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i32, map: i32, deathmatch: bool, names: *u8, ff: bool, block: *u8) bool {
     f.menuactive = 0;
     f.scores     = 0;
     # a game to play, not one to watch: the number keys are weapons again.
@@ -1555,6 +1891,11 @@ pub fun start_coop(f: *Front, s: *game.Session, players: i32, me: i32, skill: i3
     or (!game.coop_game(s, players, me, skill, map)) {
         ret 0;
     }
+    # the game the wire agreed: the host's friendly-fire flag, my seat's
+    # stat block, and the character this save would belong to
+    s.g.friendlyfire = ff;
+    profile.id(?s.rpg_charid[0]);
+    if (block != nil) { rpg.set_block(?s.g, me, (block):~*defs.RpgStats); }
     f.netgame = 1;
     f.mode = MODE_LEVEL;
     level_song(f, s);
@@ -1728,6 +2069,13 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
                 if (f.mode == MODE_LEVEL) { draw_inset(f, s, screen); }
             }
             st.draw(?s.g, bar, screen);
+            # the character's name, top right, so the player knows they are
+            # playing one
+            if (profile.loaded) {
+                var nm: [24]u8;
+                profile.name(?nm[0]);
+                video.write_text(s.d, screen, 316 - video.text_width(s.d, ?nm[0]), 2, ?nm[0], -1);
+            }
         }
     }
     or (f.mode == MODE_PAGE) {

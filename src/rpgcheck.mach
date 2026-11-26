@@ -1,0 +1,159 @@
+# doom rpgcheck: the character system's standing orders, checked headless.
+#
+# Each check is a line of pass or FAIL and a nonzero exit counts them:
+# the earning gate admits only the four-seat online co-op on Nightmare it
+# is meant for; a kill and a hit move the right kinds of XP through the
+# event log into the session; the friendly-fire flag does both its ways;
+# the character on disk survives a save-and-load of checkpoint and
+# journal; and the curves stay the ones the table gives.
+
+use std.allocator;
+use fs: std.filesystem;
+use std.print;
+use std.types.bool.bool;
+use std.types.string.str;
+
+use doom.defs;
+use doom.game;
+use doom.info;
+use doom.profile;
+use doom.rpg;
+use doom.world;
+
+var failures: i32;
+
+fun expect(name: str, ok: bool) {
+    if (ok) {
+        print.printlnf("pass  {}", name);
+    }
+    or {
+        failures = failures + 1;
+        print.printlnf("FAIL  {}", name);
+    }
+}
+
+# a coop game with a character on seat 0, ready to earn
+fun seeded(s: *game.Session) {
+    var block: defs.RpgStats;
+    block.ver = 1;
+    block.nodes[rpg.NODE_MAXHP] = 2;
+    rpg.set_block(?s.g, 0, ?block);
+    s.rpgnet = 1;
+}
+
+pub fun run(s: *game.Session, a: *allocator.Allocator) i32 {
+    failures = 0;
+
+    # ---- the earning gate: exactly four humans in co-op on Nightmare
+
+    expect("nightmare co-op for four earns", game.coop_game(s, 4, 0, defs.SK_NIGHTMARE, 1));
+    seeded(s);
+    expect("the gate is open", rpg.earning(?s.g));
+
+    if (game.coop_game(s, 2, 0, defs.SK_NIGHTMARE, 1)) {
+        seeded(s);
+        expect("co-op for two earns nothing", !rpg.earning(?s.g));
+    }
+    if (game.coop_game(s, 4, 0, defs.SK_MEDIUM, 1)) {
+        seeded(s);
+        expect("below Nightmare earns nothing", !rpg.earning(?s.g));
+    }
+    if (game.campaign_game(s, 4, 0, defs.SK_NIGHTMARE, 1)) {
+        seeded(s);
+        expect("a bot-filled campaign earns too", rpg.earning(?s.g));
+    }
+    if (game.deathmatch_game(s, 4, 0, defs.SK_MEDIUM, 1, 1, 1)) {
+        seeded(s);
+        expect("deathmatch earns nothing", !rpg.earning(?s.g));
+    }
+    if (game.coop_game(s, 4, 0, defs.SK_NIGHTMARE, 1)) {
+        # no character on any seat: a death earns nothing anywhere
+        var cmds0: [4]defs.Ticcmd;
+        val st: *defs.Mobj = s.g.players[0].mo;
+        val mo: *defs.Mobj = world.spawn_mobj(?s.g, st.x, st.y, st.z, info.MT_TROOP);
+        mo.flags = mo.flags | defs.MF_COUNTKILL;
+        rpg.killed(?s.g, st, mo);
+        game.ticker_cmds(s, ?cmds0[0]);
+        expect("no character, no journal events", s.rpg_njq == 0 && s.rpg_xp[0] == 0);
+    }
+
+    # ---- a kill moves Slayer XP, a hit moves weapon XP
+
+    if (!game.coop_game(s, 4, 0, defs.SK_NIGHTMARE, 1)) {
+        print.eprintln("doom: the co-op map could not be loaded");
+        ret 1;
+    }
+    seeded(s);
+    var cmds: [4]defs.Ticcmd;
+    val p0:   *defs.Player = ?s.g.players[0];
+    val p0mo: *defs.Mobj   = p0.mo;
+    val imp:  *defs.Mobj   = world.spawn_mobj(?s.g, p0mo.x, p0mo.y, p0mo.z, info.MT_TROOP);
+    imp.flags = imp.flags | defs.MF_COUNTKILL;
+    rpg.hit(?s.g, p0, defs.WP_SHOTGUN, imp, 20);
+    rpg.killed(?s.g, p0mo, imp);
+    game.ticker_cmds(s, ?cmds[0]);
+    expect("a monster's death pays the party", s.rpg_xp[0] > 0);
+    expect("the hit pays the weapon track",  s.rpg_wxp[0][rpg.WX_SG] > 0);
+    expect("the journal queue heard of it",  s.rpg_njq > 0);
+
+    # a second seat earns the same Slayer XP — it is the party's kill
+    expect("every human's total is shared", s.rpg_xp[1] == s.rpg_xp[0]);
+
+    # a brand-new character, all zeros but marked ver, still earns
+    if (game.coop_game(s, 4, 0, defs.SK_NIGHTMARE, 1)) {
+        var fresh: defs.RpgStats;
+        fresh.ver = 1;
+        rpg.set_block(?s.g, 0, ?fresh);
+        var cmds9: [4]defs.Ticcmd;
+        val st9: *defs.Mobj = s.g.players[0].mo;
+        val mo9: *defs.Mobj = world.spawn_mobj(?s.g, st9.x, st9.y, st9.z, info.MT_TROOP);
+        mo9.flags = mo9.flags | defs.MF_COUNTKILL;
+        rpg.killed(?s.g, st9, mo9);
+        game.ticker_cmds(s, ?cmds9[0]);
+        expect("a fresh character earns too", s.rpg_xp[0] > 0);
+    }
+
+    # ---- friendly fire, both ways the flag can be
+
+    s.g.friendlyfire = 0;
+    expect("no friendly fire when it is off", world.teammates(?s.g, p0mo, s.g.players[1].mo));
+    s.g.friendlyfire = 1;
+    expect("vanilla when it is on", !world.teammates(?s.g, p0mo, s.g.players[1].mo));
+
+    # ---- the curves the table gives
+
+    expect("level one at no XP",            rpg.level_of(0) == 1);
+    expect("level cap at the top",          rpg.level_of(15484500) == 1000);
+    expect("level just under the cap",      rpg.level_of(15466504) == 998);
+    expect("no weapon level at no XP",      rpg.wlevel_of(0) == 1);
+
+    # ---- the character on disk: create, earn, checkpoint, replay
+
+    profile.init(a, "rpgcheck.profiles");
+    # a previous run may have left the files: clear them so create is free
+    fs.remove_file("rpgcheck.profiles/CHECK.chr");
+    fs.remove_file("rpgcheck.profiles/CHECK.chr.1");
+    fs.remove_file("rpgcheck.profiles/CHECK.chr.2");
+    fs.remove_file("rpgcheck.profiles/CHECK.jrn");
+    fs.remove_file("rpgcheck.profiles/current");
+    expect("the profile directory works",   profile.create("CHECK"));
+    val before: i64 = profile.cur.slayer_xp;
+    profile.flush(s, 1);
+    expect("the journal takes the events", profile.cur.slayer_xp > before);
+    profile.checkpoint(s);
+    val earned: i64 = profile.cur.slayer_xp;
+    profile.unload();
+    expect("the character loads back", profile.load(a, "CHECK"));
+    expect("checkpoint and journal replay", profile.cur.slayer_xp == earned);
+    val imp2: *defs.Mobj = world.spawn_mobj(?s.g, p0mo.x, p0mo.y, p0mo.z, info.MT_TROOP);
+    imp2.flags = imp2.flags | defs.MF_COUNTKILL;
+    rpg.killed(?s.g, p0mo, imp2);
+    game.ticker_cmds(s, ?cmds[0]);
+    profile.flush(s, 1);
+    val after_jrn: i64 = profile.cur.slayer_xp;
+    profile.unload();
+    expect("journal lines beyond the checkpoint replay on load", profile.load(a, "CHECK") && profile.cur.slayer_xp == after_jrn && after_jrn > earned);
+    profile.unload();
+
+    ret failures;
+}

@@ -75,6 +75,8 @@ pub rec Room {
     wadhash:  u64;
     public:   bool;
     deathmatch: bool;
+    # co-op friendly fire, as the host chose; told to joiners with the start
+    friendlyfire: bool;
     # how long it waits, if public, before bots take its empty seats, in
     # milliseconds; 0 for never
     wait:     i64;
@@ -280,7 +282,8 @@ fun send_start(r: *Relay, room: *Room, slot: i32) {
     o.data[at + 2] = room.map::u8;
     o.data[at + 3] = room.botmask::u8;
     o.data[at + 4] = 0;
-    if (room.deathmatch) { o.data[at + 4] = p.FLAG_DEATHMATCH; }
+    if (room.deathmatch)   { o.data[at + 4] = o.data[at + 4] | p.FLAG_DEATHMATCH; }
+    if (room.friendlyfire) { o.data[at + 4] = o.data[at + 4] | p.FLAG_FRIENDLYFIRE; }
     o.len          = at + 5;
 }
 
@@ -613,8 +616,9 @@ fun create(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     # an older game's create has no flags, and its room is private
     var flags: u8 = 0;
     if (len >= p.HEADER + 17) { flags = d[p.HEADER + 16]; }
-    room.public     = (flags & p.FLAG_PUBLIC) != 0;
-    room.deathmatch = (flags & p.FLAG_DEATHMATCH) != 0;
+    room.public       = (flags & p.FLAG_PUBLIC) != 0;
+    room.deathmatch   = (flags & p.FLAG_DEATHMATCH) != 0;
+    room.friendlyfire = (flags & p.FLAG_FRIENDLYFIRE) != 0;
     room.wait       = r.fillwait;
     if ((flags & p.FLAG_QUICK) != 0) { room.wait = QUICK_WAIT; }
     room.created = now;

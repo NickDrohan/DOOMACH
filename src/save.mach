@@ -34,7 +34,7 @@ use doom.rdata;
 use doom.world;
 
 val MAGIC:   u32 = 0x56415344;   # "DSAV"
-val VERSION: i32 = 1;
+val VERSION: i32 = 2;
 pub val SLOTS:   i32 = 6;
 val NAMESIZE: usize = 24;
 
@@ -229,6 +229,9 @@ fun put_mobj(g: *defs.Game, mo: *defs.Mobj) {
     put32(mo.threshold);
     put32(mo.lastlook);
     put_thing(?mo.spawnpoint);
+    put32(mo.spawnid);
+    put32(mo.rpgseat::i32);
+    put32(mo.rpgwp::i32);
     put_mobj_links(g, mo);
 }
 
@@ -257,6 +260,9 @@ fun get_mobj(g: *defs.Game, mo: *defs.Mobj) {
     mo.threshold    = get32();
     mo.lastlook     = get32();
     get_thing(?mo.spawnpoint);
+    mo.spawnid = get32();
+    mo.rpgseat = get32()::u8;
+    mo.rpgwp   = get32()::u8;
     wanttarget[nloaded] = get32();
     wanttracer[nloaded] = get32();
     wantplayer[nloaded] = get32();
@@ -285,6 +291,7 @@ fun put_player(g: *defs.Game, p: *defs.Player) {
     put32(p.deltaviewheight::i32);
     put32(p.bob::i32);
     put32(p.health);
+    put32(p.maxhealth);
     put32(p.armorpoints);
     put32(p.armortype);
     var i: i32 = 0;
@@ -338,6 +345,8 @@ fun get_player(g: *defs.Game, p: *defs.Player) {
     p.deltaviewheight  = get32()::Fixed;
     p.bob              = get32()::Fixed;
     p.health           = get32();
+    p.maxhealth        = get32();
+    if (p.maxhealth <= 0) { p.maxhealth = defs.MAXHEALTH; }
     p.armorpoints      = get32();
     p.armortype        = get32();
     var i: i32 = 0;
@@ -608,7 +617,8 @@ fun put_world(g: *defs.Game) {
     }
 }
 
-fun put_game(g: *defs.Game) {
+fun put_game(s: *game.Session) {
+    val g: *defs.Game = ?s.g;
     put32(g.gametic);
     put32(g.leveltime);
     put32(g.deathmatch);
@@ -643,6 +653,40 @@ fun put_game(g: *defs.Game) {
     i = 0;
     for (i < defs.MAXPLAYERS) {
         put_player(g, ?g.players[i]);
+        i = i + 1;
+    }
+
+    # the character system's part of the game, written field by field as
+    # everything else is: a debug file and a release file agree
+    put_bool(g.rpg_on);
+    put_bool(g.friendlyfire);
+    put32(g.rnd.rpg::i32);
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        put_rec((?g.rpg_stats[i]):~*u8, $size_of(defs.RpgStats));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        put32(g.rpg_rt[i].stimleft);
+        put32(g.rpg_rt[i].stimcd);
+        put32(g.rpg_rt[i].stimacc);
+        put32(g.rpg_rt[i].blinkcd);
+        i = i + 1;
+    }
+    put32(g.rpg_ndeaths);
+    if (g.rpg_deaths != nil) {
+        i = 0;
+        for (i < g.rpg_ndeaths) {
+            put8(g.rpg_deaths[i]::i32);
+            i = i + 1;
+        }
+    }
+
+    # which character the save belongs to
+    i = 0;
+    for (i < 16) {
+        put8(s.rpg_charid[i]::i32);
         i = i + 1;
     }
 }
@@ -700,7 +744,7 @@ pub fun write_game(s: *game.Session, slot: i32, name: str) bool {
     put32(g.gameskill);
     put32(g.gameepisode);
     put32(g.gamemap);
-    put_game(g);
+    put_game(s);
     put_world(g);
     put_thinkers(g);
     put_buttons(g);
@@ -923,7 +967,8 @@ fun get_world(g: *defs.Game) {
     }
 }
 
-fun get_game(g: *defs.Game) {
+fun get_game(s: *game.Session) {
+    val g: *defs.Game = ?s.g;
     g.gametic       = get32();
     g.leveltime     = get32();
     g.deathmatch    = get32();
@@ -966,6 +1011,49 @@ fun get_game(g: *defs.Game) {
         p.attacker = nil;
         p.message  = nil;
         i          = i + 1;
+    }
+
+    g.rpg_on       = get32() != 0;
+    g.friendlyfire = get32() != 0;
+    g.rnd.rpg      = get32()::u8;
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        get_rec((?g.rpg_stats[i]):~*u8, $size_of(defs.RpgStats));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < defs.MAXPLAYERS) {
+        g.rpg_rt[i].stimleft = get32();
+        g.rpg_rt[i].stimcd   = get32();
+        g.rpg_rt[i].stimacc  = get32();
+        g.rpg_rt[i].blinkcd  = get32();
+        i                    = i + 1;
+    }
+    var nd: i32 = get32();
+    i = 0;
+    for (i < nd) {
+        val v: u8 = get8()::u8;
+        if (g.rpg_deaths != nil && i < g.rpg_ndeaths) { g.rpg_deaths[i] = v; }
+        i = i + 1;
+    }
+
+    # a save belongs to the character it was written under
+    var fid: [16]u8;
+    var nz: i32 = 0;
+    var snz: i32 = 0;
+    i = 0;
+    for (i < 16) {
+        fid[i] = get8()::u8;
+        if (fid[i] != 0)         { nz  = 1; }
+        if (s.rpg_charid[i] != 0) { snz = 1; }
+        i = i + 1;
+    }
+    if (nz != 0 && snz != 0) {
+        i = 0;
+        for (i < 16) {
+            if (fid[i] != s.rpg_charid[i]) { bad = 1; ret; }
+            i = i + 1;
+        }
     }
 }
 
@@ -1057,7 +1145,7 @@ pub fun read_game(s: *game.Session, a: *allocator.Allocator, slot: i32) bool {
     if (!game.load_game(s, skill, episode, map)) { ret 0; }
     val g: *defs.Game = ?s.g;
     clear_things(g);
-    get_game(g);
+    get_game(s);
     get_world(g);
     get_thinkers(g);
     get_buttons(g);

@@ -20,7 +20,18 @@ platform layer and no C. On top of the port:
 Owner: Nick Drohan (`NickDrohan` on GitHub). Repo: <https://github.com/NickDrohan/DOOMACH>,
 GitHub `main` includes code release `acc2408`; the older `v0.3.0` tag is historical.
 Unqualified per-level experiments are preserved separately on the local WIP branch.
-Live: <https://mach-doom-relay.fly.dev/> (download, league page), relay on UDP 5029.
+Live: <https://doomach.fly.dev/> (download, league page), relay on UDP 5029.
+
+## 0.6.0: browser runtime, Mach 7.0, RPG progression, and doomach.fly.dev (2026-11-26)
+
+- **Target runtime is the browser (`wasi-wasm32`) at <https://doomach.fly.dev/>**:
+  - `src/web.mach` compiles the engine, OPL2 synthesizer, RPG character progression, bot leagues, and lockstep `net.Net` / `net.Lobby` multiplayer to WebAssembly under Mach 7.0 (`std` v10.1.1).
+  - `site/index.html` runs Doom full-screen (`100vw × 100dvh`) clamped to a maximal `4:3` fit without stretching (full height with pillarboxed width on desktop/landscape; full width with letterboxed height on mobile/portrait), with WASI virtual filesystem persistence in `localStorage`, pointer lock, WebAudio 11,025 Hz output, touch controls, and `?room=CODE` invite links.
+  - `src/relay.mach` bridges browser players over binary WebSocket (`/ws` on TCP 5030 / TLS 5029) and HTTPS keep-alive polling (`/net/<cid>/<hex>` proxied through `hedge` on 443) alongside UDP 5029, so browser players can host/join 2–4 player Co-op and Deathmatch games with friends or live neural-network league bots without leaving the browser.
+- **RPG progression and Slayer profile system** (`src/rpg.mach`, `src/profile.mach`, `src/rpgcheck.mach`):
+  - Persistent character checkpoints and append-only journals (`profiles/*.chr`, `*.jrn`), 14 passive nodes, 3 active skills (Blink, Stim, Repulse), weapon mastery perks, and protocol `VERSION = 3`.
+- **Migrated from `mach-doom-relay` to `doomach`**:
+  - Deployed to Fly app `doomach` (<https://doomach.fly.dev/>) with all live Deathmatch and Co-op league data (`/data/league/*`) migrated intact.
 
 ## 0.5.0: the second shape of net (2026-11-01)
 
@@ -151,7 +162,7 @@ release. Keep later route/controller changes separate until they qualify.
   The original ignored `out/windows-x86_64/release/bin/doom-desync.txt` predates this work
   (2026-10-14); it was inspected, not deleted or produced by these passing checks.
 - Code release `acc2408` is pushed to GitHub `main` and deployed as Fly machine version 36,
-  image `registry.fly.io/mach-doom-relay:acc2408`, on the existing `83d165ea4ded48` machine.
+  image `registry.fly.io/doomach:acc2408`, on the existing `83d165ea4ded48` machine.
   The image digest is `sha256:b94bdc719719a8425760e2e8461e53d8aaa9a170740cbe8487b211185abf8b89`.
   The public executable and its published hash match the staged game above. Relay, Hedge,
   and both arenas are running; Fly health checks pass.
@@ -278,7 +289,7 @@ Diagnosis tools worth knowing (all headless):
 
 ## The live system
 
-Fly.io app `mach-doom-relay` (owner's personal org), region `iad`, one shared-CPU machine with
+Fly.io app `doomach` (owner's personal org), region `iad`, one shared-CPU machine with
 256 MB, dedicated IPv4 137.66.49.243, a 1 GB volume at `/data`. You need the owner to grant
 Fly access (`flyctl auth`) to deploy or read logs; nothing in the repo holds a credential.
 
@@ -297,9 +308,9 @@ One machine runs four programs under `site/start.sh`:
 Settings are `ENV` in the `Dockerfile`. To begin a league again from the starting net, raise
 `LEAGUE_EPOCH` or `COOP_EPOCH` there and deploy.
 
-Before deploying: `flyctl logs -a mach-doom-relay --no-tail | grep "relay: rooms" | tail -1`
+Before deploying: `flyctl logs -a doomach --no-tail | grep "relay: rooms" | tail -1`
 should say `rooms 0`, since a deploy restarts the relay and ends any game in progress. After:
-check `https://mach-doom-relay.fly.dev/doom.exe.sha256` equals the hash of the exe you built.
+check `https://doomach.fly.dev/doom.exe.sha256` equals the hash of the exe you built.
 
 ## The leagues, as they now are
 
