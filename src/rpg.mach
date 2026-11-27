@@ -70,12 +70,28 @@ pub fun wx_index(weapon: i32) i32 {
     ret -1;
 }
 
+# the Slayer XP needed to advance from level l to l + 1
+pub fun level_step_xp(l: i32) i64 {
+    ret 250 + 150 * l::i64;
+}
+
+# the cumulative Slayer XP at the start of level target (0 at level 1)
+pub fun level_floor_xp(target: i32) i64 {
+    var l:   i32 = 1;
+    var sum: i64 = 0;
+    for (l < target && l < 1000) {
+        sum = sum + level_step_xp(l);
+        l   = l + 1;
+    }
+    ret sum;
+}
+
 # the level a Slayer XP total has reached: 1 at zero, capped at 1000
 pub fun level_of(xp: i64) i32 {
     var l:   i32 = 1;
     var sum: i64 = 0;
     for (l < 1000) {
-        val need: i64 = 13000 + 5 * l::i64;
+        val need: i64 = level_step_xp(l);
         if (xp - sum < need) { brk; }
         sum = sum + need;
         l   = l + 1;
@@ -83,12 +99,25 @@ pub fun level_of(xp: i64) i32 {
     ret l;
 }
 
+# percentage (0..100) of the way from the current level to the next
+pub fun level_pct(xp: i64) i32 {
+    val l: i32 = level_of(xp);
+    if (l >= 1000) { ret 100; }
+    val base: i64 = level_floor_xp(l);
+    val need: i64 = level_step_xp(l);
+    if (need <= 0) { ret 100; }
+    var pct: i32 = ((xp - base) * 100 / need)::i32;
+    if (pct < 0)   { pct = 0; }
+    if (pct > 100) { pct = 100; }
+    ret pct;
+}
+
 # the level a weapon XP total has reached: 1 at zero, uncapped
 pub fun wlevel_of(xp: i64) i32 {
     var m:   i32 = 1;
     var sum: i64 = 0;
     for {
-        val need: i64 = 3600 + 900 * m::i64 + 54 * m::i64 * m::i64;
+        val need: i64 = 300 + 200 * m::i64 + 25 * m::i64 * m::i64;
         if (xp - sum < need) { brk; }
         sum = sum + need;
         m   = m + 1;
@@ -133,6 +162,7 @@ pub fun humans(g: *Game) i32 {
         if (g.playeringame[i] && !g.isbot[i]) { n = n + 1; }
         i = i + 1;
     }
+    if (n < 1) { n = 1; }
     ret n;
 }
 
@@ -146,17 +176,18 @@ fun seat_of(g: *Game, p: *Player) i32 {
     ret -1;
 }
 
-# whether this game may be journaled: a four-seat co-op on Nightmare
+# whether this game may be journaled: Nightmare with monsters and no deathmatch
 pub fun earning(g: *Game) bool {
-    # co-op on Nightmare with all four seats playing; bots fill a seat but
-    # play a vanilla game and progress nothing, and the kill still pays
     if (g.deathmatch != 0 || g.nomonsters || g.gameskill != defs.SK_NIGHTMARE) { ret 0; }
-    var i: i32 = 0;
-    for (i < defs.MAXPLAYERS) {
-        if (!g.playeringame[i]) { ret 0; }
-        i = i + 1;
+    $if ($mach.build.sys != $mach.sys.wasi) {
+        var i: i32 = 0;
+        for (i < defs.MAXPLAYERS) {
+            if (!g.playeringame[i]) { ret 0; }
+            i = i + 1;
+        }
+        ret 1;
     }
-    ret 1;
+    ret g.playeringame[0];
 }
 
 # put one reward event on the tic's log; past the bound the count only grows
@@ -187,6 +218,8 @@ pub fun scale_out(g: *Game, player: *Player, weapon: i32, damage: i32) i32 {
     val b:   *RpgStats = ?g.rpg_stats[seat];
     var pct: i32       = b.nodes[NODE_DMG]::i32;
     if (weapon == defs.WP_SHOTGUN) { pct = pct + 2 * b.nodes[NODE_SGDMG]::i32; }
+    val wx: i32 = wx_index(weapon);
+    if (wx >= 0) { pct = pct + 2 * b.wlevel[wx]::i32; }
     ret scale_by(g, damage, pct);
 }
 
@@ -252,6 +285,51 @@ pub fun hit(g: *Game, player: *Player, weapon: i32, target: *Mobj, eff: i32) {
 # point on the node (the owning client already decided it could afford
 # it; a peer never second-guesses) and the two payloads fire Blink and
 # Stim when bought.
+fun grant_kit_node(g: *Game, player: *Player, node: i32) {
+    if (node == NODE_KIT_PK && !player.backpack) {
+        player.backpack = 1;
+        var i: i32 = 0;
+        for (i < defs.NUMAMMO) {
+            player.maxammo[i] = player.maxammo[i] * 2;
+            i                 = i + 1;
+        }
+    }
+    or (node == NODE_KIT_SG) {
+        player.weaponowned[defs.WP_SHOTGUN] = 1;
+        give_ammo(player, defs.AM_SHELL, 8);
+    }
+    or (node == NODE_KIT_SAW) {
+        player.weaponowned[defs.WP_CHAINSAW] = 1;
+    }
+    or (node == NODE_KIT_CG) {
+        player.weaponowned[defs.WP_CHAINGUN] = 1;
+        give_ammo(player, defs.AM_CLIP, 20);
+    }
+    or (node == NODE_KIT_RL) {
+        player.weaponowned[defs.WP_MISSILE] = 1;
+        give_ammo(player, defs.AM_MISL, 2);
+    }
+    or (node == NODE_KIT_GA && player.armortype < 2) {
+        player.armortype   = 1;
+        if (player.armorpoints < 100) { player.armorpoints = 100; }
+    }
+    or (node == NODE_KIT_BA) {
+        player.armortype   = 2;
+        player.armorpoints = 200;
+    }
+    or (node == NODE_KIT_BZ) {
+        player.powers[defs.PW_STRENGTH] = 1;
+    }
+    or (!g.shareware && node == NODE_KIT_PL) {
+        player.weaponowned[defs.WP_PLASMA] = 1;
+        give_ammo(player, defs.AM_CELL, 40);
+    }
+    or (!g.shareware && node == NODE_KIT_BFG) {
+        player.weaponowned[defs.WP_BFG] = 1;
+        give_ammo(player, defs.AM_CELL, 40);
+    }
+}
+
 pub fun command(g: *Game, player: *Player, payload: i32) {
     if (!g.rpg_on) { ret; }
     val seat: i32 = seat_of(g, player);
@@ -264,6 +342,13 @@ pub fun command(g: *Game, player: *Player, payload: i32) {
             player.maxhealth = player.maxhealth + 5;
             player.health    = player.health + 5;
             if (player.mo != nil) { player.mo.health = player.health; }
+        }
+        or (node >= NODE_KIT_SG && node <= NODE_KIT_BFG) {
+            grant_kit_node(g, player, node);
+        }
+        if (seat == g.consoleplayer) {
+            defs.sound(g, nil, info.SFX_ITEMUP);
+            player.message = "SKILL UPGRADE ACQUIRED!";
         }
         emit(g, defs.REV_ALLOC, seat::u8, defs.RPG_NONE, node::u8, 0);
         ret;
@@ -382,7 +467,13 @@ pub fun set_block(g: *Game, seat: i32, block: *RpgStats) {
 # between uses; ranks can shorten it later.
 fun blink(g: *Game, player: *Player, seat: i32) {
     if (g.rpg_stats[seat].nodes[NODE_BLINK] == 0) { ret; }
-    if (g.rpg_rt[seat].blinkcd != 0)              { ret; }
+    if (g.rpg_rt[seat].blinkcd != 0) {
+        if (seat == g.consoleplayer) {
+            defs.sound(g, nil, info.SFX_OOF);
+            player.message = "BLINK RECHARGING...";
+        }
+        ret;
+    }
     if (player.mo == nil || player.mo.health <= 0) { ret; }
 
     val an:   u32   = player.mo.angle >> t.ANGLETOFINESHIFT;
@@ -396,6 +487,9 @@ fun blink(g: *Game, player: *Player, seat: i32) {
         k = k + 1;
     }
     g.rpg_rt[seat].blinkcd = 8 * 35;
+    if (seat == g.consoleplayer) {
+        defs.sound(g, player.mo, info.SFX_TELEPT);
+    }
 }
 
 # -------------------------------------------------------------- Stim
@@ -404,32 +498,40 @@ fun blink(g: *Game, player: *Player, seat: i32) {
 # accumulator is read by move_psprites; a stimpack resets the cooldown.
 fun stim(g: *Game, player: *Player, seat: i32) {
     if (g.rpg_stats[seat].nodes[NODE_STIM] == 0) { ret; }
-    if (g.rpg_rt[seat].stimcd != 0)              { ret; }
+    if (g.rpg_rt[seat].stimcd != 0) {
+        if (seat == g.consoleplayer) {
+            defs.sound(g, nil, info.SFX_OOF);
+            player.message = "STIM RECHARGING...";
+        }
+        ret;
+    }
     g.rpg_rt[seat].stimleft = 6 * 35;
     g.rpg_rt[seat].stimcd   = 45 * 35;
     g.rpg_rt[seat].stimacc  = 0;
+    if (seat == g.consoleplayer) {
+        defs.sound(g, nil, info.SFX_GETPOW);
+        player.message = "STIM PACK ENGAGED! RAPID FIRE";
+    }
 }
 
 # ------------------------------------------------------------- tests
 
 test level_of__curve {
-    if (level_of(0) != 1)            { ret 1; }
-    if (level_of(13004) != 1)        { ret 2; }
-    if (level_of(13005) != 2)        { ret 3; }
-    if (level_of(15466504) != 998)   { ret 4; }
-    if (level_of(15466505) != 999)   { ret 5; }
-    if (level_of(15484499) != 999)   { ret 6; }
-    if (level_of(15484500) != 1000)  { ret 7; }
-    if (level_of(99999999999) != 1000) { ret 8; }
+    if (level_of(0) != 1)              { ret 1; }
+    if (level_of(399) != 1)            { ret 2; }
+    if (level_of(400) != 2)            { ret 3; }
+    if (level_of(949) != 2)            { ret 4; }
+    if (level_of(950) != 3)            { ret 5; }
+    if (level_of(99999999999) != 1000) { ret 6; }
     ret 0;
 }
 
 test wlevel_of__curve {
     if (wlevel_of(0) != 1)           { ret 1; }
-    if (wlevel_of(4553) != 1)        { ret 2; }
-    if (wlevel_of(4554) != 2)        { ret 3; }
-    if (wlevel_of(106289) != 10)     { ret 4; }
-    if (wlevel_of(106290) != 11)     { ret 5; }
+    if (wlevel_of(524) != 1)         { ret 2; }
+    if (wlevel_of(525) != 2)         { ret 3; }
+    if (wlevel_of(1324) != 2)        { ret 4; }
+    if (wlevel_of(1325) != 3)        { ret 5; }
     ret 0;
 }
 

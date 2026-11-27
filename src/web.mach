@@ -1390,6 +1390,7 @@ pub fun web_tic() i32 {
 
     sound.update(?session.g);
     profile.maybe(session);
+    if (session.completed) { profile.flush(session, 1); }
     ret 1;
 }
 

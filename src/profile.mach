@@ -605,17 +605,22 @@ pub fun points() i32 {
     ret p;
 }
 
+# whether a node is a one-time unlock (abilities and spawn kits)
+pub fun is_one_time(node: i32) bool {
+    ret node == rpg.NODE_BLINK || node == rpg.NODE_STIM ||
+        (node >= rpg.NODE_KIT_SG && node <= rpg.NODE_KIT_BFG);
+}
+
 # whether the node may be bought now: points, one-timers not yet owned,
 # blue armor only once green is
 pub fun can_buy(node: i32) bool {
     if (!loaded || node < 0 || node >= rpg.N_NODES) { ret 0; }
     if (points() <= 0) { ret 0; }
     if (node == rpg.NODE_KIT_BA && cur.nodes[rpg.NODE_KIT_GA] == 0) { ret 0; }
-    if (node == rpg.NODE_BLINK || node == rpg.NODE_STIM ||
-        (node >= rpg.NODE_KIT_SG && node <= rpg.NODE_KIT_BFG)) {
+    if (is_one_time(node)) {
         ret cur.nodes[node] == 0;
     }
-    ret 1;
+    ret cur.nodes[node] < 255;
 }
 
 # the character id a save records, so a save cannot pass between characters

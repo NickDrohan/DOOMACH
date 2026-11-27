@@ -86,6 +86,25 @@ val NODENAMES: [16]str = [16]str{
     "KIT: BFG 9000"
 };
 
+val NODEDESC: [16]str = [16]str{
+    "+5 MAX HEALTH AND HEAL +5 NOW",
+    "+1% DAMAGE WITH ALL WEAPONS",
+    "REDUCE ALL DAMAGE TAKEN BY 2%",
+    "+2% EXTRA DAMAGE WITH THE SHOTGUN",
+    "ABILITY (KEY Q): TELEPORT AHEAD, 8S CD",
+    "ABILITY (KEY X): 6S RAPID FIRE, 45S CD",
+    "SPAWN WITH SHOTGUN + 8 SHELLS",
+    "SPAWN WITH CHAINSAW",
+    "SPAWN WITH GREEN ARMOR (100 AP)",
+    "SPAWN WITH BACKPACK (2X MAX AMMO)",
+    "SPAWN WITH CHAINGUN + 20 BULLETS",
+    "SPAWN WITH BERSERK FISTS EVERY MAP",
+    "SPAWN WITH BLUE ARMOR (NEEDS GREEN)",
+    "SPAWN WITH ROCKET LAUNCHER + 2 ROCKETS",
+    "SPAWN WITH PLASMA RIFLE + 40 CELLS",
+    "SPAWN WITH BFG 9000 + 40 CELLS"
+};
+
 pub val LIST_ASKING:  i32 = 0;
 pub val LIST_KNOWN:   i32 = 1;
 pub val LIST_NOREACH: i32 = 2;
@@ -811,14 +830,17 @@ fun choose(f: *Front, s: *game.Session) {
             f.menu = MENU_CHAR;
             ret;
         }
+        if (!can_buy_node(f, s, item)) {
+            sfx(s, info.SFX_OOF);
+            ret;
+        }
         if (!f.netgame && f.mode != MODE_LEVEL) {
             if (!profile.spend(s, item)) { sfx(s, info.SFX_OOF); }
             ret;
         }
         # a point is spoken for when the command lands on a tic; queued
         # ones count against what is left
-        if (!profile.loaded || !profile.can_buy(item) || profile.points() <= f.nallocq ||
-            f.nallocq >= 8 || alloc_queued(f, item)) {
+        if (f.nallocq >= 8) {
             sfx(s, info.SFX_OOF);
             ret;
         }
@@ -961,14 +983,35 @@ fun type_name(f: *Front, s: *game.Session, key: i32) bool {
     ret 1;
 }
 
-# whether the node is already spoken for in the purchase queue
-fun alloc_queued(f: *Front, node: i32) bool {
+# how many times a node is queued in the pending purchase queue
+fun alloc_count(f: *Front, node: i32) i32 {
+    var n: i32 = 0;
     var i: i32 = 0;
     for (i < f.nallocq) {
-        if (f.allocq[i] == node + 1) { ret 1; }
+        if (f.allocq[i] == node + 1) { n = n + 1; }
         i = i + 1;
     }
-    ret 0;
+    ret n;
+}
+
+# whether the node is already spoken for in the purchase queue
+fun alloc_queued(f: *Front, node: i32) bool {
+    ret alloc_count(f, node) > 0;
+}
+
+fun node_rank(f: *Front, node: i32) i32 {
+    if (!profile.loaded || node < 0 || node >= rpg.N_NODES) { ret 0; }
+    ret profile.cur.nodes[node]::i32 + alloc_count(f, node);
+}
+
+fun can_buy_node(f: *Front, s: *game.Session, node: i32) bool {
+    if (!profile.loaded || node < 0 || node >= rpg.N_NODES) { ret 0; }
+    if (profile.points() - f.nallocq <= 0) { ret 0; }
+    if (s.g.shareware && (node == rpg.NODE_KIT_PL || node == rpg.NODE_KIT_BFG)) { ret 0; }
+    if (node == rpg.NODE_KIT_BA && node_rank(f, rpg.NODE_KIT_GA) == 0) { ret 0; }
+    val rank: i32 = node_rank(f, node);
+    if (profile.is_one_time(node)) { ret rank == 0; }
+    ret rank < 255;
 }
 
 # the answer to a yes-or-no message
@@ -1197,8 +1240,8 @@ pub fun tap(f: *Front, s: *game.Session, x: i32, y: i32) bool {
         ret 1;
     }
     or (menu == MENU_CHAR) {
-        if (y >= 92) {
-            val row: i32 = (y - 92) / LINEHEIGHT;
+        if (y >= 98) {
+            val row: i32 = (y - 98) / LINEHEIGHT;
             if (row >= 0 && row < 3) {
                 f.itemon[MENU_CHAR] = row;
                 choose(f, s);
@@ -1486,26 +1529,57 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
     }
     or (f.menu == MENU_CHAR) {
         x = 56;
-        y = 96;
+        y = 102;
         video.shade(d, screen, 16, 6, 288, 186, 26);
         centred(d, screen, 13, "CHARACTER");
         var who: [24]u8;
         profile.name(?who[0]);
         var line: [64]u8;
         line_cat(?line[0], "PLAYING AS ", ?who[0]);
-        if (who[0] == 0) { line_cat(?line[0], "PLAYING AS ", "NO ONE"); }
-        centred(d, screen, 36, ?line[0]);
+        if (who[0] == 0) { line_cat(?line[0], "PLAYING AS ", "NO ONE (VANILLA)"); }
+        centred(d, screen, 30, ?line[0]);
         if (profile.loaded) {
+            val lv:   i32 = rpg.level_of(profile.cur.slayer_xp);
+            val pts:  i32 = profile.points() - f.nallocq;
+            val next: i64 = rpg.level_floor_xp(lv + 1);
             var nums: [64]u8;
-            line_num2(?nums[0], "LEVEL ", rpg.level_of(profile.cur.slayer_xp)::i64, "  POINTS ", profile.points()::i64);
-            centred(d, screen, 54, ?nums[0]);
-            line_num(?nums[0], "SLAYER XP ", profile.cur.slayer_xp);
-            centred(d, screen, 70, ?nums[0]);
+            line_num2(?nums[0], "LEVEL ", lv::i64, "   SKILL POINTS ", pts::i64);
+            centred(d, screen, 44, ?nums[0]);
+            line_num2(?nums[0], "SLAYER XP ", profile.cur.slayer_xp, " / ", next);
+            centred(d, screen, 56, ?nums[0]);
+
+            val hp:  i64 = 100 + 5 * node_rank(f, rpg.NODE_MAXHP)::i64;
+            val dmg: i64 = node_rank(f, rpg.NODE_DMG)::i64;
+            val dr:  i64 = 2 * node_rank(f, rpg.NODE_DR)::i64;
+            var st1: [48]u8;
+            var st2: [64]u8;
+            line_num2(?st1[0], "HP ", hp, "  DMG +", dmg);
+            line_num(?st2[0], "%  DR -", dr);
+            line_cat(?nums[0], ?st1[0], ?st2[0]);
+            line_cat(?st1[0], ?nums[0], "%");
+            centred(d, screen, 69, ?st1[0]);
+
+            val sg_lv: i64 = rpg.wlevel_of(profile.cur.weapon_xp[rpg.WX_SG])::i64;
+            val cg_lv: i64 = rpg.wlevel_of(profile.cur.weapon_xp[rpg.WX_CG])::i64;
+            val rl_lv: i64 = rpg.wlevel_of(profile.cur.weapon_xp[rpg.WX_RL])::i64;
+            line_num2(?st1[0], "MASTERY  SG L", sg_lv, "  CG L", cg_lv);
+            line_num(?st2[0], "  RL L", rl_lv);
+            line_cat(?nums[0], ?st1[0], ?st2[0]);
+            centred(d, screen, 82, ?nums[0]);
         }
-        video.write_text(d, screen, x, y + 4, "SELECT", -1);
+        or {
+            centred(d, screen, 54, "CREATE OR SELECT A CHARACTER TO EARN");
+            centred(d, screen, 68, "SLAYER XP, WEAPON MASTERY & SKILLS");
+        }
+        video.write_text(d, screen, x, y + 4, "SELECT CHARACTER", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT + 4, "NEW CHARACTER", -1);
-        video.write_text(d, screen, x, y + LINEHEIGHT * 2 + 4, "SPEND SKILL POINTS", -1);
-        centred(d, screen, 178, "ENTER CHANGES SELECTION, BACKSPACE GOES BACK");
+        if (profile.loaded) {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 2 + 4, "SPEND SKILL POINTS", -1);
+        }
+        or {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 2 + 4, "SPEND SKILL POINTS", 8);
+        }
+        centred(d, screen, 178, "ENTER CHOOSES, BACKSPACE GOES BACK");
     }
     or (f.menu == MENU_SPEND) {
         x = 40;
@@ -1513,8 +1587,10 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         video.shade(d, screen, 16, 6, 288, 186, 26);
         centred(d, screen, 13, "SPEND SKILL POINTS");
         var pn: [32]u8;
-        line_num(?pn[0], "POINTS LEFT: ", (profile.points() - f.nallocq)::i64);
-        centred(d, screen, 32, ?pn[0]);
+        var avail: i32 = profile.points() - f.nallocq;
+        if (avail < 0) { avail = 0; }
+        line_num(?pn[0], "POINTS LEFT: ", avail::i64);
+        centred(d, screen, 28, ?pn[0]);
         val it:  i32 = f.itemon[MENU_SPEND];
         var off: i32 = it - 4;
         if (off < 0) { off = 0; }
@@ -1523,17 +1599,36 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         for (row < 8) {
             val node: i32 = off + row;
             if (node >= rpg.N_NODES) { brk; }
-            var nl: [48]u8;
-            line_cat(?nl[0], NODENAMES[node], "  x");
-            var rk: [48]u8;
-            line_num(?rk[0], ?nl[0], profile.cur.nodes[node]::i64);
-            if (profile.cur.nodes[node] == 0) { line_cat(?rk[0], NODENAMES[node], ""); }
-            if (!profile.can_buy(node))       { video.write_text(d, screen, x, y + row * 12 + 4, ?rk[0], 8); }
-            or                                { video.write_text(d, screen, x, y + row * 12 + 4, ?rk[0], -1); }
+            val rank: i32 = node_rank(f, node);
+            var rk:   [48]u8;
+            if (rank == 0) {
+                line_cat(?rk[0], NODENAMES[node], "");
+            }
+            or (profile.is_one_time(node)) {
+                line_cat(?rk[0], NODENAMES[node], " [OWNED]");
+            }
+            or {
+                var nl: [48]u8;
+                line_cat(?nl[0], NODENAMES[node], "  x");
+                line_num(?rk[0], ?nl[0], rank::i64);
+            }
+            if (!can_buy_node(f, s, node)) { video.write_text(d, screen, x, y + row * 12 + 4, ?rk[0], 8); }
+            or                             { video.write_text(d, screen, x, y + row * 12 + 4, ?rk[0], -1); }
             row = row + 1;
         }
         video.write_text(d, screen, x, y + 8 * 12 + 16, "BACK", -1);
-        centred(d, screen, 178, "ENTER SPENDS A POINT");
+        if (it >= 0 && it < rpg.N_NODES) {
+            if (s.g.shareware && (it == rpg.NODE_KIT_PL || it == rpg.NODE_KIT_BFG)) {
+                centred(d, screen, 166, "LOCKED: REGISTERED DOOM ONLY");
+            }
+            or (it == rpg.NODE_KIT_BA && node_rank(f, rpg.NODE_KIT_GA) == 0) {
+                centred(d, screen, 166, "REQUIRES KIT: GREEN ARMOR FIRST");
+            }
+            or {
+                centred(d, screen, 166, NODEDESC[it]);
+            }
+        }
+        centred(d, screen, 178, "ENTER SPENDS A POINT, BACKSPACE GOES BACK");
     }
     or (f.menu == MENU_NAME) {
         var shown: [24]u8;
@@ -2310,12 +2405,63 @@ pub fun draw(f: *Front, s: *game.Session, r: *render.Renderer, bar: *st.State) {
                 if (f.mode == MODE_LEVEL) { draw_inset(f, s, screen); }
             }
             st.draw(?s.g, bar, screen);
-            # the character's name, top right, so the player knows they are
-            # playing one
-            if (profile.loaded) {
-                var nm: [24]u8;
+            # the character's name, level, XP progress and abilities, top right
+            if (profile.loaded && !f.watching) {
+                var nm:  [24]u8;
+                var h1:  [64]u8;
+                var h2:  [64]u8;
+                var tmp: [48]u8;
                 profile.name(?nm[0]);
-                video.write_text(s.d, screen, 316 - video.text_width(s.d, ?nm[0]), 2, ?nm[0], -1);
+                val lv:  i32 = rpg.level_of(profile.cur.slayer_xp);
+                val pts: i32 = profile.points() - f.nallocq;
+                line_num(?tmp[0], " LV", lv::i64);
+                line_cat(?h1[0], ?nm[0], ?tmp[0]);
+                if (pts > 0) {
+                    var pstr: [24]u8;
+                    line_num(?pstr[0], " +", pts::i64);
+                    line_cat(?tmp[0], ?h1[0], ?pstr[0]);
+                    line_cat(?h1[0], ?tmp[0], "PT");
+                }
+                video.write_text(s.d, screen, 316 - video.text_width(s.d, ?h1[0]), 2, ?h1[0], -1);
+
+                val pct: i32 = rpg.level_pct(profile.cur.slayer_xp);
+                line_num(?tmp[0], "XP ", pct::i64);
+                line_cat(?h2[0], ?tmp[0], "%");
+                val seat: i32 = s.g.consoleplayer;
+                if (s.g.rpg_stats[seat].nodes[rpg.NODE_BLINK] != 0) {
+                    val bcd: i32 = (s.g.rpg_rt[seat].blinkcd + 34) / 35;
+                    if (bcd <= 0) {
+                        line_cat(?tmp[0], ?h2[0], " Q:RDY");
+                        line_cat(?h2[0], ?tmp[0], "");
+                    }
+                    or {
+                        var cd1: [16]u8;
+                        line_num(?cd1[0], " Q:", bcd::i64);
+                        line_cat(?tmp[0], ?h2[0], ?cd1[0]);
+                        line_cat(?h2[0], ?tmp[0], "S");
+                    }
+                }
+                if (s.g.rpg_stats[seat].nodes[rpg.NODE_STIM] != 0) {
+                    val sleft: i32 = (s.g.rpg_rt[seat].stimleft + 34) / 35;
+                    val scd:   i32 = (s.g.rpg_rt[seat].stimcd + 34) / 35;
+                    if (sleft > 0) {
+                        line_cat(?tmp[0], ?h2[0], " X:ON");
+                        line_cat(?h2[0], ?tmp[0], "");
+                    }
+                    or (scd <= 0) {
+                        line_cat(?tmp[0], ?h2[0], " X:RDY");
+                        line_cat(?h2[0], ?tmp[0], "");
+                    }
+                    or {
+                        var cd2: [16]u8;
+                        line_num(?cd2[0], " X:", scd::i64);
+                        line_cat(?tmp[0], ?h2[0], ?cd2[0]);
+                        line_cat(?h2[0], ?tmp[0], "S");
+                    }
+                }
+                if (!f.scores) {
+                    video.write_text(s.d, screen, 316 - video.text_width(s.d, ?h2[0]), 11, ?h2[0], -1);
+                }
             }
         }
     }

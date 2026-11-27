@@ -123,8 +123,8 @@ pub fun run(s: *game.Session, a: *allocator.Allocator) i32 {
     # ---- the curves the table gives
 
     expect("level one at no XP",            rpg.level_of(0) == 1);
-    expect("level cap at the top",          rpg.level_of(15484500) == 1000);
-    expect("level just under the cap",      rpg.level_of(15466504) == 998);
+    expect("level two at 400 XP",           rpg.level_of(400) == 2);
+    expect("level cap at the top",          rpg.level_of(999999999) == 1000);
     expect("no weapon level at no XP",      rpg.wlevel_of(0) == 1);
 
     # ---- the character on disk: create, earn, checkpoint, replay

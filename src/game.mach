@@ -1254,13 +1254,17 @@ fun rpg_drain(s: *Session) {
                     if (lv > s.rpg_lvl[p]) {
                         s.rpg_lvl[p] = lv;
                         # the console player's rise is journaled as a level event
-                        if (p == g.consoleplayer && s.rpg_njq < 64) {
-                            s.rpg_jq[s.rpg_njq].kind   = defs.REV_LEVEL;
-                            s.rpg_jq[s.rpg_njq].seat   = p::u8;
-                            s.rpg_jq[s.rpg_njq].weapon = defs.RPG_NONE;
-                            s.rpg_jq[s.rpg_njq].aux    = 0;
-                            s.rpg_jq[s.rpg_njq].xp     = lv;
-                            s.rpg_njq                  = s.rpg_njq + 1;
+                        if (p == g.consoleplayer) {
+                            defs.sound(g, nil, info.SFX_GETPOW);
+                            g.players[p].message = "LEVEL UP! SKILL POINT READY";
+                            if (s.rpg_njq < 64) {
+                                s.rpg_jq[s.rpg_njq].kind   = defs.REV_LEVEL;
+                                s.rpg_jq[s.rpg_njq].seat   = p::u8;
+                                s.rpg_jq[s.rpg_njq].weapon = defs.RPG_NONE;
+                                s.rpg_jq[s.rpg_njq].aux    = 0;
+                                s.rpg_jq[s.rpg_njq].xp     = lv;
+                                s.rpg_njq                  = s.rpg_njq + 1;
+                            }
                         }
                     }
                 }
