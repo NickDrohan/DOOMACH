@@ -13,7 +13,6 @@ use std.allocator.page;
 use fs: std.filesystem;
 use io_error: std.io.error;
 use std.memory;
-use std.runtime;
 use std.types.bool.bool;
 use std.types.error.err;
 use std.types.option.opt;
@@ -35,6 +34,7 @@ use doom.profile;
 use doom.rdata;
 use doom.relayproto;
 use doom.render;
+use doom.rpg;
 use doom.sound;
 use doom.st;
 use doom.wad;
@@ -110,8 +110,10 @@ var ready:      bool;
 var clock_us:   i64;
 var trainsaid:  i32;
 
-# 320x200 RGBA framebuffer for HTML5 canvas ImageData
-var rgba: [256000]u8;
+# 320x200 RGBA framebuffer for HTML5 canvas ImageData and cached u32 palette LUT
+var rgba:       [256000]u8;
+var pal_lut:    [256]u32;
+var pal_cached: i32 = -1;
 
 # interleaved 16-bit stereo PCM buffer (up to 4096 frames)
 var pcm: [8192]i16;
@@ -127,10 +129,15 @@ var keys:      [32]i32;
 var keyfirst:  i32;
 var keycount:  i32;
 var held:      [256]u8;
-var mousepend: i32;
-var weapon:    i32;
+var mousepend:  i32;
+var touch_fwd:  i32;
+var touch_side: i32;
+var weapon:     i32;
 var blinkq:    i32;
 var stimq:     i32;
+var tap_pend:  bool;
+var tap_x:     i32;
+var tap_y:     i32;
 
 # lockstep multiplayer state
 var menunet:       *net.Net;
@@ -143,7 +150,6 @@ var progress_tics: i32;
 var wait_tics:     i32;
 var instant_fill:  bool;
 var waitbuf:       [256]u8;
-var empty_code:    [7]u8;
 var lessons:       [912]u8;
 var nlessons:      i32;
 
@@ -271,16 +277,6 @@ fun first64(data: *u8, len: usize) u64 {
     ret h;
 }
 
-fun build_code(h: u64, out: *u8) {
-    val digits: str = "0123456789ABCDEF";
-    var k: i32 = 0;
-    for (k < 6) {
-        out[k] = digits[((h >> (60 - k * 4)::u64) & 15)::i32];
-        k      = k + 1;
-    }
-    out[6] = 0;
-}
-
 fun read_choice() i32 {
     val opened: res[fs.File, io_error.Error] = fs.open("/doom.cfg");
     if (sel opened.err) { ret front.TRAIN_UNASKED; }
@@ -353,14 +349,124 @@ pub fun web_net_push(src: *u8, len: i32) {
     net.push_incoming(src, len);
 }
 
+# populate the currently loaded character's name (up to 24 bytes) and 4 i32
+# stats ([0]=level, [1]=unspent points, [2]=slayer_xp, [3]=spent points)
 #[export]
-#[symbol("web_room_code_ptr")]
-pub fun web_room_code_ptr() *u8 {
-    if (active_net != nil && active_net.relaymode && active_net.token != 0) {
-        ret ?active_net.code[0];
+#[symbol("web_char_info")]
+pub fun web_char_info(name_out: *u8, stats_out: *i32) i32 {
+    if (name_out != nil) { profile.name(name_out); }
+    if (stats_out != nil) {
+        if (profile.loaded) {
+            stats_out[0] = rpg.level_of(profile.cur.slayer_xp);
+            stats_out[1] = profile.points() - ui.nallocq;
+            if (stats_out[1] < 0) { stats_out[1] = 0; }
+            stats_out[2] = profile.cur.slayer_xp::i32;
+            stats_out[3] = profile.cur.spent;
+        }
+        or {
+            stats_out[0] = 0;
+            stats_out[1] = 0;
+            stats_out[2] = 0;
+            stats_out[3] = 0;
+        }
     }
-    empty_code[0] = 0;
-    ret ?empty_code[0];
+    if (profile.loaded) { ret 1; }
+    ret 0;
+}
+
+# query current UI state for mobile/touch controls:
+# out[0]=mode, out[1]=menuactive, out[2]=menu, out[3]=message (0=none,1=notice,2=yn),
+# out[4]=watching
+# returns 1 when in interactive level gameplay, 0 when in menu/title/prompt
+#[export]
+#[symbol("web_ui_state")]
+pub fun web_ui_state(out: *i32) i32 {
+    if (out != nil) {
+        out[0] = ui.mode;
+        out[1] = ui.menuactive::i32;
+        out[2] = ui.menu;
+        var msg: i32 = 0;
+        if (ui.message != nil) {
+            msg = 1;
+            if (ui.messageyn) { msg = 2; }
+        }
+        out[3] = msg;
+        out[4] = ui.watching::i32;
+    }
+    if (ready && ui.mode == front.MODE_LEVEL && !ui.menuactive && ui.message == nil && !ui.watching) {
+        ret 1;
+    }
+    ret 0;
+}
+
+# queue a direct canvas tap/click at (x, y) in 320x200 screen coordinates
+#[export]
+#[symbol("web_canvas_tap")]
+pub fun web_canvas_tap(x: i32, y: i32) i32 {
+    if (!ready) { ret 0; }
+    if (ui.mode == front.MODE_LEVEL && !ui.menuactive && ui.message == nil && !ui.watching) {
+        ret 0;
+    }
+    tap_x    = x;
+    tap_y    = y;
+    tap_pend = 1;
+    ret 1;
+}
+
+# create and select a character directly from a mobile input modal
+#[export]
+#[symbol("web_create_char")]
+pub fun web_create_char(name_ptr: *u8) i32 {
+    if (!ready || name_ptr == nil) { ret 0; }
+    var clean: [24]u8;
+    var i:     i32 = 0;
+    for (i < 16 && name_ptr[i] != 0) {
+        var c: u8 = name_ptr[i];
+        if (c >= 'a' && c <= 'z') { c = c - 32; }
+        clean[i] = c;
+        i        = i + 1;
+    }
+    clean[i] = 0;
+    if (!profile.name_ok(?clean[0])) { ret 0; }
+    if (!profile.create(?clean[0])) {
+        if (!profile.choose(?alloc, ?clean[0])) { ret 0; }
+    }
+    or (!profile.choose(?alloc, ?clean[0])) {
+        ret 0;
+    }
+    front.open_char(?ui, session);
+    ret 1;
+}
+
+# cycle to the next (dir > 0) or previous (dir < 0) owned weapon slot (1..7)
+#[export]
+#[symbol("web_cycle_weapon")]
+pub fun web_cycle_weapon(dir: i32) i32 {
+    if (!ready || session == nil) { ret 0; }
+    val g: *defs.Game   = ?session.g;
+    val p: *defs.Player = ?g.players[g.consoleplayer];
+    var cur_wp: i32 = p.readyweapon;
+    if (p.pendingweapon != defs.WP_NOCHANGE) { cur_wp = p.pendingweapon; }
+    var slot: i32 = cur_wp + 1;
+    if (cur_wp == defs.WP_CHAINSAW) { slot = 1; }
+    if (slot < 1 || slot > 7) { slot = 2; }
+    var step: i32 = 1;
+    if (dir < 0) { step = -1; }
+    var tries: i32 = 0;
+    for (tries < 7) {
+        slot = ((slot - 1 + step + 7) % 7) + 1;
+        var owned: bool = slot == 1;
+        if (slot >= 2 && slot <= 7) {
+            owned = p.weaponowned[slot - 1];
+            if ((slot == 6 || slot == 7) && g.shareware) { owned = 0; }
+        }
+        if (owned) {
+            weapon = slot;
+            ret slot;
+        }
+        tries = tries + 1;
+    }
+    ret slot;
 }
 
 fun opl_init(w: *wad.Wad) bool {
@@ -402,7 +508,6 @@ pub fun web_init(wad_ptr: *u8, wad_len: i32) i32 {
     front.init(?ui);
     ui.train  = read_choice();
     trainsaid = ui.trainsaid;
-    build_code(wadhash, ?ui.build[0]);
     val second: res[*render.Renderer, render.RenderError] = render.make(?alloc, ?graphics, ?first);
     if (sel second.ok) { ui.inset = second.ok; }
 
@@ -446,6 +551,13 @@ pub fun web_mouse_move(dx: i32) {
 }
 
 #[export]
+#[symbol("web_touch_move")]
+pub fun web_touch_move(fwd: i32, side: i32) {
+    touch_fwd  = fwd;
+    touch_side = side;
+}
+
+#[export]
 #[symbol("web_mouse_button")]
 pub fun web_mouse_button(button: i32, down: i32) {
     var vk: i32 = 0;
@@ -465,7 +577,9 @@ pub fun web_release_all() {
         held[i] = 0;
         i       = i + 1;
     }
-    mousepend = 0;
+    mousepend  = 0;
+    touch_fwd  = 0;
+    touch_side = 0;
 }
 
 fun take_key() i32 {
@@ -716,62 +830,6 @@ pub fun web_join_room(code_ptr: *u8) i32 {
     ret 1;
 }
 
-# trigger a quick browser action from the HUD controls:
-# 1 = 4-player Co-op with the league bots, 2 = 4-player Deathmatch with the
-# league bots, 3 = Watch the Co-op Bots, 4 = Watch the Deathmatch Bots
-#[export]
-#[symbol("web_quick_action")]
-pub fun web_quick_action(act: i32) {
-    if (!ready) { ret; }
-    if (active_net != nil) {
-        net.close(active_net);
-        active_net = nil;
-        netstarted = 0;
-        stalled    = 0;
-        gametic    = 0;
-    }
-    if (joining == -1) {
-        session.g.start_sound = join.hook;
-        joining               = 0;
-    }
-    ui.message    = nil;
-    ui.menuactive = 0;
-    if (ui.train == front.TRAIN_UNASKED) {
-        ui.train     = front.TRAIN_NO;
-        ui.trainsaid = ui.trainsaid + 1;
-    }
-    if (act == 1) {
-        instant_fill  = 1;
-        ui.watching   = 0;
-        ui.netplayers = 4;
-        ui.netskill   = defs.SK_NIGHTMARE;
-        ui.netdm      = 0;
-        ui.netquick   = 0;
-        ui.netpublic  = 0;
-        ui.netrequest = front.NET_HOST;
-    }
-    or (act == 2) {
-        instant_fill  = 1;
-        ui.watching   = 0;
-        ui.netplayers = 4;
-        ui.netskill   = defs.SK_MEDIUM;
-        ui.netdm      = 1;
-        ui.netquick   = 1;
-        ui.netpublic  = 1;
-        ui.netrequest = front.NET_HOST;
-    }
-    or (act == 3) {
-        instant_fill  = 0;
-        ui.watchcoop  = 1;
-        ui.netrequest = front.NET_WATCH;
-    }
-    or (act == 4) {
-        instant_fill  = 0;
-        ui.watchcoop  = 0;
-        ui.netrequest = front.NET_WATCH;
-    }
-}
-
 #[export]
 #[symbol("web_want_pointer_lock")]
 pub fun web_want_pointer_lock() i32 {
@@ -907,10 +965,12 @@ pub fun web_start_bot_game(league_ptr: *u8, league_len: i32, seed_in: u32) i32 {
         stalled    = 0;
         gametic    = 0;
     }
+    ui.netrequest = 0;
     var players: i32 = ui.netplayers;
-    if (players < 2) { players = 2; }
+    if (players < 2) { players = 4; }
     if (players > 4) { players = 4; }
     val dm:  bool = ui.netdm || ui.netquick;
+    if (profile.loaded && !dm) { ui.netskill = defs.SK_NIGHTMARE; }
     var map: i32  = 1;
     if (dm) {
         map       = BOTMAPS[map_cycle % 7];
@@ -1021,8 +1081,25 @@ pub fun web_tic() i32 {
     if (!ready) { ret 0; }
     clock_us = clock_us + (1000000 / 35);
 
-    val key:     i32  = take_key();
+    var key:     i32  = take_key();
     val stopped: bool = active_net != nil && (!netstarted || stalled || active_net.desync || active_net.quit);
+    if (tap_pend) {
+        tap_pend = 0;
+        if (joining < 0) {
+            if (tap_y >= 140) { key = front.KEY_ESCAPE; }
+        }
+        or (stopped) {
+            if (!netstarted && active_net.refused == 0 && active_net.host && tap_y < 145) {
+                key = front.KEY_ENTER;
+            }
+            or {
+                key = front.KEY_ESCAPE;
+            }
+        }
+        or {
+            front.tap(?ui, session, tap_x, tap_y);
+        }
+    }
     if (joining < 0 && key == front.KEY_ESCAPE) {
         session.g.start_sound = join.hook;
         joining               = 0;
@@ -1083,11 +1160,6 @@ pub fun web_tic() i32 {
     if (ui.trainsaid != trainsaid) {
         trainsaid = ui.trainsaid;
         write_choice(ui.train);
-    }
-
-    if (ui.netrequest == front.NET_UPDATE) {
-        ui.netrequest = 0;
-        front.notice(?ui, "this browser copy is already\nthe newest version on the site.\n\n(press a key)");
     }
 
     if (ui.netrequest == front.NET_WATCH || (ui.watching && ui.mode != front.MODE_PAGE && joining == 0 && watched_out(?ui, session, watchtics))) {
@@ -1205,6 +1277,8 @@ pub fun web_tic() i32 {
     if (!ui.menuactive) {
         input.mousex       = mousepend;
         mousepend          = 0;
+        input.move_fwd     = touch_fwd;
+        input.move_side    = touch_side;
         input.forward      = key_held(VK_UP) || key_held('W');
         input.back         = key_held(VK_DOWN) || key_held('S');
         input.left         = key_held(VK_LEFT);
@@ -1224,17 +1298,17 @@ pub fun web_tic() i32 {
     or {
         mousepend = 0;
     }
-    if (ui.nallocq > 0) {
-        input.alloc = ui.allocq[0];
-        var aq: i32 = 1;
-        for (aq < ui.nallocq) {
-            ui.allocq[aq - 1] = ui.allocq[aq];
-            aq                = aq + 1;
-        }
-        ui.nallocq = ui.nallocq - 1;
-    }
 
     if (active_net == nil) {
+        if (ui.nallocq > 0 && ui.mode == front.MODE_LEVEL && !ui.menuactive && !ui.watching) {
+            input.alloc = ui.allocq[0];
+            var aq: i32 = 1;
+            for (aq < ui.nallocq) {
+                ui.allocq[aq - 1] = ui.allocq[aq];
+                aq                = aq + 1;
+            }
+            ui.nallocq = ui.nallocq - 1;
+        }
         front.ticker(?ui, session, ?bar, ?input);
     }
     or {
@@ -1276,6 +1350,15 @@ pub fun web_tic() i32 {
             progress_tics = progress_tics + 1;
             net.receive(active_net);
             if (net.wants_command(active_net, gametic)) {
+                if (ui.nallocq > 0) {
+                    input.alloc = ui.allocq[0];
+                    var aq2: i32 = 1;
+                    for (aq2 < ui.nallocq) {
+                        ui.allocq[aq2 - 1] = ui.allocq[aq2];
+                        aq2                = aq2 + 1;
+                    }
+                    ui.nallocq = ui.nallocq - 1;
+                }
                 var cmd: defs.Ticcmd;
                 game.build_ticcmd(session, ?input, ?cmd);
                 net.add_command(active_net, ?cmd);
@@ -1315,17 +1398,25 @@ pub fun web_tic() i32 {
 pub fun web_draw() *u8 {
     if (!ready) { ret ?rgba[0]; }
     front.draw(?ui, session, renderer, ?bar);
-    val pal:    i32 = front.palette(?ui, ?bar) * 768;
-    val pixels: i32 = render.SCREENWIDTH * render.SCREENHEIGHT;
-    var i:      i32 = 0;
+    val pal: i32  = front.palette(?ui, ?bar) * 768;
+    val lut: *u32 = ?pal_lut[0];
+    if (pal != pal_cached) {
+        pal_cached = pal;
+        val raw: *u8 = ?graphics.playpal[pal];
+        var c:   i32 = 0;
+        for (c < 256) {
+            val at: i32 = c * 3;
+            lut[c] = raw[at]::u32 | (raw[at + 1]::u32 << 8) | (raw[at + 2]::u32 << 16) | 0xff000000;
+            c      = c + 1;
+        }
+    }
+    val src:    *u8  = ?renderer.screen[0];
+    val dst:    *u32 = (?rgba[0]):~*u32;
+    val pixels: i32  = render.SCREENWIDTH * render.SCREENHEIGHT;
+    var i:      i32  = 0;
     for (i < pixels) {
-        val c:   i32 = pal + renderer.screen[i]::i32 * 3;
-        val dst: i32 = i * 4;
-        rgba[dst]     = graphics.playpal[c];
-        rgba[dst + 1] = graphics.playpal[c + 1];
-        rgba[dst + 2] = graphics.playpal[c + 2];
-        rgba[dst + 3] = 255;
-        i             = i + 1;
+        dst[i] = lut[src[i]::i32];
+        i      = i + 1;
     }
     ret ?rgba[0];
 }
@@ -1384,7 +1475,3 @@ pub fun web_flush_profile() {
     profile.checkpoint(session);
 }
 
-#[symbol("main")]
-fun main(argc: i64, argv: **u8) i64 {
-    ret 0;
-}

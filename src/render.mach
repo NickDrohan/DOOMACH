@@ -593,34 +593,50 @@ fun draw_column(r: *Renderer) {
     var count: i32 = r.dc_yh - r.dc_yl;
     if (count < 0) { ret; }
 
+    val source:   *u8   = r.dc_source;
+    val colormap: *u8   = r.dc_colormap;
+    val trans:    *u8   = r.dc_translation;
+    val screen:   *u8   = ?r.screen[0];
     var dest:     i32   = (r.dc_yl + r.viewwindowy) * SCREENWIDTH + r.viewwindowx + r.dc_x;
     val fracstep: Fixed = r.dc_iscale;
     var frac:     Fixed = r.dc_texturemid + (r.dc_yl - r.centery) * fracstep;
 
+    if (trans == nil) {
+        for (count >= 0) {
+            screen[dest] = colormap[source[(frac >> 16) & 127]];
+            dest         = dest + SCREENWIDTH;
+            frac         = frac + fracstep;
+            count        = count - 1;
+        }
+        ret;
+    }
     for (count >= 0) {
-        var texel: u8 = r.dc_source[(frac >> 16) & 127];
-        if (r.dc_translation != nil) { texel = r.dc_translation[texel]; }
-        r.screen[dest] = r.dc_colormap[texel];
-        dest           = dest + SCREENWIDTH;
-        frac           = frac + fracstep;
-        count          = count - 1;
+        screen[dest] = colormap[trans[source[(frac >> 16) & 127]]];
+        dest         = dest + SCREENWIDTH;
+        frac         = frac + fracstep;
+        count        = count - 1;
     }
 }
 
 # R_DrawSpan: one horizontal run of a flat, in perspective
 fun draw_span(r: *Renderer) {
-    var xfrac: Fixed = r.ds_xfrac;
-    var yfrac: Fixed = r.ds_yfrac;
-    var dest:  i32   = (r.ds_y + r.viewwindowy) * SCREENWIDTH + r.viewwindowx + r.ds_x1;
-    var count: i32   = r.ds_x2 - r.ds_x1;
+    val source:   *u8   = r.ds_source;
+    val colormap: *u8   = r.ds_colormap;
+    val screen:   *u8   = ?r.screen[0];
+    val xstep:    Fixed = r.ds_xstep;
+    val ystep:    Fixed = r.ds_ystep;
+    var xfrac:    Fixed = r.ds_xfrac;
+    var yfrac:    Fixed = r.ds_yfrac;
+    var dest:     i32   = (r.ds_y + r.viewwindowy) * SCREENWIDTH + r.viewwindowx + r.ds_x1;
+    var count:    i32   = r.ds_x2 - r.ds_x1;
 
     # runs at least once, as the original's do-while does
     for {
         val spot: i32 = ((yfrac >> 10) & (63 * 64)) + ((xfrac >> 16) & 63);
-        r.screen[dest] = r.ds_colormap[r.ds_source[spot]];
-        dest           = dest + 1;
-        xfrac          = xfrac + r.ds_xstep;
-        yfrac          = yfrac + r.ds_ystep;
+        screen[dest] = colormap[source[spot]];
+        dest         = dest + 1;
+        xfrac        = xfrac + xstep;
+        yfrac        = yfrac + ystep;
         if (count == 0) { brk; }
         count = count - 1;
     }

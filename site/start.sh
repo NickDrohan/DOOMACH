@@ -13,7 +13,7 @@
 # rewritten. Nothing it does can stop a game someone is playing.
 set -u
 mkdir -p /data/league
-chown nobody:nobody /data/league
+chown -R nobody:nobody /data/league
 as_nobody="setpriv --reuid=nobody --regid=nobody --clear-groups"
 
 # keep_arena <the file it writes to say it is alive> <its share of the

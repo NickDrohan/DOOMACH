@@ -62,6 +62,12 @@ pub rec Slot {
     addr:      Addr;
     nonce:     u32;
     lastseen:  i64;
+    # passive lockstep telemetry observed from MDM1 command headers
+    packets:   i32;
+    maketic:   i32;
+    acktic:    i32;
+    checktic:  i32;
+    checksum:  u32;
 }
 
 pub rec Room {
@@ -84,6 +90,18 @@ pub rec Room {
     slots:    [4]Slot;
     # once started: which seats bots took, a bit a seat
     botmask:  i32;
+    # passive room telemetry: packets forwarded, recent world checksums by
+    # checktic mod 16, and whether two seats ever reported different sums
+    forwarded:  i64;
+    ringtics:   [16]i32;
+    ringsums:   [16]u32;
+    ringseat:   [16]i32;
+    desync:     bool;
+    desynctic:  i32;
+    desynca:    i32;
+    desyncb:    i32;
+    suma:       u32;
+    sumb:       u32;
 }
 
 # a bot in a seat
@@ -141,6 +159,7 @@ pub val EV_LEFT:     u8 = 4;
 pub val EV_TIMEDOUT: u8 = 5;
 pub val EV_CLOSED:   u8 = 6;
 pub val EV_REFUSED:  u8 = 7;
+pub val EV_DESYNC:   u8 = 8;
 val EVENTS:          i32 = 32;
 
 pub rec Event {
@@ -623,12 +642,20 @@ fun create(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     if ((flags & p.FLAG_QUICK) != 0) { room.wait = QUICK_WAIT; }
     room.created = now;
 
+    var ri: i32 = 0;
+    for (ri < 16) {
+        room.ringtics[ri] = -1;
+        ri                = ri + 1;
+    }
+    room.desynctic = -1;
+
     val s: *Slot = ?room.slots[0];
     s.used     = 1;
     s.token    = new_token(r);
     s.addr     = @from;
     s.nonce    = nonce;
     s.lastseen = now;
+    s.checktic = -1;
     r.created  = r.created + 1;
     event(r, EV_OPENED, room, 0);
     welcome(r, room, 0);
@@ -694,6 +721,7 @@ fun join(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
     s.addr     = @from;
     s.nonce    = nonce;
     s.lastseen = now;
+    s.checktic = -1;
     event(r, EV_JOINED, room, i);
     welcome(r, room, i);
 }
@@ -863,6 +891,43 @@ pub fun handle(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
             r.dropped = r.dropped + 1;
             ret;
         }
+        # passively inspect MDM1 command headers for lockstep progress and checksum parity
+        s.packets = s.packets + 1;
+        if (len >= p.HEADER + 11 && d[p.HEADER] == 'M' && d[p.HEADER + 1] == 'D' && d[p.HEADER + 2] == 'M' && d[p.HEADER + 3] == '1' && d[p.HEADER + 4] == 1) {
+            val first: i32 = p.get32(d, p.HEADER + 6):~i32;
+            val cnt:   i32 = d[p.HEADER + 10]::i32;
+            val tail:  i32 = p.HEADER + 11 + cnt * 5;
+            if (cnt >= 0 && cnt <= 16 && len >= tail + 12) {
+                if (first + cnt > s.maketic) { s.maketic = first + cnt; }
+                val ack: i32 = p.get32(d, tail):~i32;
+                if (ack > s.acktic) { s.acktic = ack; }
+                val ctic: i32 = p.get32(d, tail + 4):~i32;
+                val csum: u32 = p.get32(d, tail + 8);
+                if (ctic >= 0) {
+                    if (ctic >= s.checktic) {
+                        s.checktic = ctic;
+                        s.checksum = csum;
+                    }
+                    val idx: i32 = ctic & 15;
+                    if (room.ringtics[idx] == ctic) {
+                        if (room.ringsums[idx] != csum && !room.desync) {
+                            room.desync    = 1;
+                            room.desynctic = ctic;
+                            room.desynca   = room.ringseat[idx];
+                            room.desyncb   = slot;
+                            room.suma      = room.ringsums[idx];
+                            room.sumb      = csum;
+                            event(r, EV_DESYNC, room, ctic);
+                        }
+                    }
+                    or (ctic > room.ringtics[idx]) {
+                        room.ringtics[idx] = ctic;
+                        room.ringsums[idx] = csum;
+                        room.ringseat[idx] = slot;
+                    }
+                }
+            }
+        }
         val o: *Out = queue(r, ?to.addr);
         if (o == nil) { ret; }
         val at: i32 = p.header(?o.data[0], p.DATA, slot, dest, to.token);
@@ -871,9 +936,10 @@ pub fun handle(r: *Relay, d: *u8, len: i32, from: *Addr, now: i64) {
             o.data[k] = d[k];
             k         = k + 1;
         }
-        o.len       = len;
-        r.forwarded = r.forwarded + 1;
-        k           = at;
+        o.len          = len;
+        room.forwarded = room.forwarded + 1;
+        r.forwarded    = r.forwarded + 1;
+        k              = at;
     }
     or (kind == p.LEAVE) {
         remove_slot(r, room, slot, EV_LEFT, now);
@@ -904,6 +970,7 @@ fun train(r: *Relay, room: *Room, d: *u8, len: i32) {
         r.dropped = r.dropped + 1;
         ret;
     }
+    room.map = map;
     val t: *Train = r.train;
     var i: i32    = 0;
     for (i < count) {
@@ -1395,5 +1462,95 @@ test relay__coop_seats_the_active_cohort_without_shy_bots {
         }
         i = i + 1;
     }
+    ret 0;
+}
+
+test relay__monitors_coop_progress_and_catches_desync {
+    var r: Relay;
+    fresh(?r);
+    var buf:  [128]u8;
+    var host: Addr = Addr{ip: 0x7f000001, port: 1};
+    var gst:  Addr = Addr{ip: 0x7e000002, port: 2};
+
+    handle(?r, ?buf[0], create_req(?buf[0], 2, 99, 1), ?host, 100);
+    val htoken: u64 = p.get64(?r.out[0].data[0], 8);
+    var code: [6]u8;
+    var k:    i32 = 0;
+    for (k < 6) {
+        code[k] = r.out[0].data[16 + k];
+        k       = k + 1;
+    }
+    handle(?r, ?buf[0], join_req(?buf[0], ?code[0], 99, 2), ?gst, 110);
+    val gtoken: u64 = p.get64(?r.out[r.nout - 1].data[0], 8);
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 0, 0, htoken), ?host, 120);
+    handle(?r, ?buf[0], request(?buf[0], p.STATUS, 1, 0, gtoken), ?gst, 130);
+    if (!r.rooms[0].started) { ret 1; }
+    r.nout    = 0;
+    r.nevents = 0;
+
+    # Host (seat 0) sends MDM1 command packet for tic 0..1 with checktic=0, checksum=0x11223344
+    var at: i32 = request(?buf[0], p.DATA, 0, 1, htoken);
+    buf[at]     = 'M';
+    buf[at + 1] = 'D';
+    buf[at + 2] = 'M';
+    buf[at + 3] = '1';
+    buf[at + 4] = 1;
+    buf[at + 5] = 0;
+    p.put32(?buf[0], at + 6, 0);
+    buf[at + 10] = 1;
+    p.put32(?buf[0], at + 16, 1);
+    p.put32(?buf[0], at + 20, 0);
+    p.put32(?buf[0], at + 24, 0x11223344);
+    handle(?r, ?buf[0], at + 28, ?host, 200);
+    if (r.rooms[0].slots[0].packets != 1 || r.rooms[0].slots[0].maketic != 1 || r.rooms[0].slots[0].acktic != 1) { ret 2; }
+    if (r.rooms[0].slots[0].checktic != 0 || r.rooms[0].slots[0].checksum != 0x11223344 || r.rooms[0].desync) { ret 3; }
+
+    # Guest (seat 1) agrees on checktic=0, checksum=0x11223344
+    at = request(?buf[0], p.DATA, 1, 0, gtoken);
+    buf[at]     = 'M';
+    buf[at + 1] = 'D';
+    buf[at + 2] = 'M';
+    buf[at + 3] = '1';
+    buf[at + 4] = 1;
+    buf[at + 5] = 1;
+    p.put32(?buf[0], at + 6, 0);
+    buf[at + 10] = 2;
+    p.put32(?buf[0], at + 21, 1);
+    p.put32(?buf[0], at + 25, 0);
+    p.put32(?buf[0], at + 29, 0x11223344);
+    handle(?r, ?buf[0], at + 33, ?gst, 210);
+    if (r.rooms[0].slots[1].maketic != 2 || r.rooms[0].desync || r.rooms[0].forwarded != 2) { ret 4; }
+
+    # Now Host reports checktic=1, checksum=0xaaaa0001 and Guest reports checktic=1, checksum=0xbbbb0002
+    at = request(?buf[0], p.DATA, 0, 1, htoken);
+    buf[at]     = 'M';
+    buf[at + 1] = 'D';
+    buf[at + 2] = 'M';
+    buf[at + 3] = '1';
+    buf[at + 4] = 1;
+    buf[at + 5] = 0;
+    p.put32(?buf[0], at + 6, 1);
+    buf[at + 10] = 1;
+    p.put32(?buf[0], at + 16, 2);
+    p.put32(?buf[0], at + 20, 1);
+    p.put32(?buf[0], at + 24, 0xaaaa0001);
+    handle(?r, ?buf[0], at + 28, ?host, 240);
+
+    at = request(?buf[0], p.DATA, 1, 0, gtoken);
+    buf[at]     = 'M';
+    buf[at + 1] = 'D';
+    buf[at + 2] = 'M';
+    buf[at + 3] = '1';
+    buf[at + 4] = 1;
+    buf[at + 5] = 1;
+    p.put32(?buf[0], at + 6, 2);
+    buf[at + 10] = 1;
+    p.put32(?buf[0], at + 16, 2);
+    p.put32(?buf[0], at + 20, 1);
+    p.put32(?buf[0], at + 24, 0xbbbb0002);
+    handle(?r, ?buf[0], at + 28, ?gst, 250);
+
+    if (!r.rooms[0].desync || r.rooms[0].desynctic != 1) { ret 5; }
+    if (r.nevents != 1 || r.events[0].what != EV_DESYNC || r.events[0].slot != 1) { ret 6; }
     ret 0;
 }

@@ -53,7 +53,7 @@ while [[ -e "$stage" ]]; do
     sequence=$((sequence + 1))
     stage="$here/out/deploy.next-$sequence"
 done
-mkdir -p "$stage/usr/local/bin" "$stage/srv/site"
+mkdir -p "$stage/usr/local/bin" "$stage/srv/site" "$stage/data/league"
 cp "$here/out/linux-x86_64/release/bin/relay" "$stage/usr/local/bin/relay"
 cp "$hedge/out/linux-x86_64/release/bin/hedge" "$stage/usr/local/bin/hedge"
 cp "$here/out/linux-x86_64/release/bin/arena" "$stage/usr/local/bin/arena"
@@ -62,19 +62,17 @@ cp "$here/site/start.sh" "$stage/usr/local/bin/start"
 cp "$here/data/DOOM1.WAD" "$here/fixtures/bot0.net" "$stage/srv/"
 cp "$here/site/hedge.toml" "$stage/srv/hedge.toml"
 cp "$here/site/league.html" "$stage/srv/site/"
-# for the game's own update: the program by itself, and its hash
-cp "$here/out/windows-x86_64/release/bin/doom.exe" "$stage/srv/site/doom.exe"
-sha256sum "$stage/srv/site/doom.exe" | cut -d' ' -f1 >"$stage/srv/site/doom.exe.sha256"
-# for the browser player: the WebAssembly build (wasi-wasm32) and shareware WAD
+# snapshot current trained bot league state into the image so no persistent volume is needed
+for lfile in league.bin board.json watch.bin coop.bin coop.json coopnow.bin coopnow.tic; do
+    curl -fsSL -o "$stage/data/league/$lfile" "https://doomach.fly.dev/league/$lfile" 2>/dev/null || rm -f "$stage/data/league/$lfile"
+done
+echo 2 >"$stage/data/league/epoch.dm"
+echo 2 >"$stage/data/league/epoch.coop"
+# for the browser player: the WebAssembly build (wasi-wasm32), index page, and shareware WAD
+cp "$here/site/index.html" "$stage/srv/site/index.html"
 cp "$here/out/wasi-wasm32/release/bin/doom.wasm" "$stage/srv/site/doom.wasm"
 cp "$here/data/DOOM1.WAD" "$stage/srv/site/DOOM1.WAD"
-cp "$here/site/shot.png" "$here/out/package/doom-in-mach.zip" "$here/out/package/source.zip" "$stage/srv/site/"
 
-zip="$here/out/package/doom-in-mach.zip"
-size="$(( $(wc -c <"$zip") / 1024 / 100 ))"
-size="$(( size / 10 )).$(( size % 10 )) MB"
-sum="$(sha256sum "$zip" | cut -d' ' -f1)"
-sed -e "s/{{SIZE}}/$size/" -e "s/{{SHA256}}/$sum/" "$here/site/index.html" >"$stage/srv/site/index.html"
 if [[ -e "$publish" ]]; then
     backup="$here/out/deploy.previous"
     sequence=0
@@ -86,7 +84,7 @@ if [[ -e "$publish" ]]; then
     echo "preserved previous staging in $backup"
 fi
 mv "$stage" "$publish"
-echo "staged $publish: download $size, sha256 $sum"
+echo "staged $publish"
 
 [[ "${1:-}" == "--stage" ]] && exit 0
 cd "$here"

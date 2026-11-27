@@ -223,34 +223,113 @@ fun key_scale(op: *Op, v: *Voice) i32 {
 # ---
 # modulation: added to the 10-bit phase
 fun operate(op: *Op, v: *Voice, modulation: i32) i32 {
-    # vibrato bends the f-number a little, up and down, about six times a
-    # second
-    var f: i32 = v.fnum;
+    val fnum:  i32 = v.fnum;
+    val block: i32 = v.block;
+    var f:     i32 = fnum;
     if (op.vib) {
         var r: i32 = (f >> 7) & 7;
-        if ((synth.vibpos & 3) == 0) {
+        val vp: i32 = synth.vibpos;
+        if ((vp & 3) == 0) {
             r = 0;
         }
-        or ((synth.vibpos & 1) != 0) {
+        or ((vp & 1) != 0) {
             r = r >> 1;
         }
         r = r >> 1;
-        if ((synth.vibpos & 4) != 0) { r = -r; }
+        if ((vp & 4) != 0) { r = -r; }
         f = f + r;
     }
-    # the chip halves twice: once for the f-number, once for the doubled
-    # multiplier
-    val inc: u32 = ((((f << v.block) >> 1) * t.MULT2[op.mult]) >> 1)::u32;
-    op.phase = (op.phase + inc) & 0x7ffff;
+    val inc:   u32 = ((((f << block) >> 1) * t.MULT2[op.mult]) >> 1)::u32;
+    val phase: u32 = (op.phase + inc) & 0x7ffff;
+    op.phase = phase;
 
-    envelope(op, v);
-    var att: i32 = op.env + (op.tl << 2) + key_scale(op, v);
+    var stage: i32 = op.stage;
+    var env:   i32 = op.env;
+    if (stage != EG_OFF) {
+        var rate: i32 = op.rr;
+        if (stage == EG_ATTACK) {
+            rate = op.ar;
+        }
+        or (stage == EG_DECAY) {
+            rate = op.dr;
+        }
+        or (stage == EG_SUSTAIN) {
+            if (op.egt) { rate = 0; }
+        }
+        if (rate != 0) {
+            var roff: i32 = (block << 1) | ((fnum >> 9) & 1);
+            if (!op.ksr) { roff = roff >> 2; }
+            var r: i32 = rate * 4 + roff;
+            if (r > 63) { r = 63; }
+            if (stage == EG_ATTACK && r >= 60) {
+                env   = 0;
+                stage = EG_DECAY;
+            }
+            or {
+                var count: i32 = op.count + ((4 + (r & 3)) << (r >> 2));
+                for (count >= 32768) {
+                    count = count - 32768;
+                    if (stage == EG_ATTACK) {
+                        env = env - (env >> 3) - 1;
+                        if (env <= 0) {
+                            env   = 0;
+                            stage = EG_DECAY;
+                            brk;
+                        }
+                    }
+                    or {
+                        env = env + 1;
+                        if (stage == EG_DECAY && env >= op.sl) {
+                            env   = op.sl;
+                            stage = EG_SUSTAIN;
+                            brk;
+                        }
+                        if (env >= ENV_MAX) {
+                            env   = ENV_MAX;
+                            stage = EG_OFF;
+                            brk;
+                        }
+                    }
+                }
+                op.count = count;
+            }
+            op.env   = env;
+            op.stage = stage;
+        }
+    }
+
+    var ksl: i32 = 0;
+    if (op.ksl != 0) {
+        ksl = (t.KSLROM[fnum >> 6] << 2) - ((8 - block) << 5);
+        if (ksl < 0) {
+            ksl = 0;
+        }
+        or (op.ksl == 1) {
+            ksl = ksl >> 1;
+        }
+        or (op.ksl == 2) {
+            ksl = ksl >> 2;
+        }
+    }
+    var att: i32 = env + (op.tl << 2) + ksl;
     if (op.am) { att = att + synth.tremolo; }
     if (att > ENV_MAX) { att = ENV_MAX; }
 
+    val ph:    i32  = ((phase >> 9)::i32 + modulation) & 0x3ff;
+    val kind:  i32  = op.wave;
+    val upper: bool = (ph & 0x200) != 0;
+    var out:   i32  = 0;
+    if (!(kind == 1 && upper) && !(kind == 3 && (ph & 0x100) != 0)) {
+        var idx: i32 = ph & 0xff;
+        if ((ph & 0x100) != 0) { idx = idx ^ 0xff; }
+        var lvl: i32 = t.LOGSIN[idx] + (att << 3);
+        if (lvl > 0x1fff) { lvl = 0x1fff; }
+        out = ((t.EXP[lvl & 0xff] | 0x400) << 1) >> (lvl >> 8);
+        if (kind == 0 && upper) { out = -out; }
+    }
     op.prev = op.out;
-    op.out  = wave(op.wave, (op.phase >> 9)::i32 + modulation, att);
-    ret op.out;
+    op.out  = out;
+    ret out;
 }
 
 # one sample of one voice
@@ -556,39 +635,53 @@ pub fun init(genmidi: *u8, len: u32) bool {
 # rate:   the mixing rate
 pub fun mix(out: *i16, frames: i32, rate: i32) {
     if (!synth.ready) { ret; }
-    var f: i32 = 0;
+    val hist:  *i32 = ?synth.history[0];
+    val fir:   *i32 = ?t.FIR[0];
+    var frac:  i32  = synth.frac;
+    var at:    i32  = synth.at;
+    var dcin:  i32  = synth.dcin;
+    var dcout: i32  = synth.dcout;
+    var f:     i32  = 0;
     for (f < frames) {
         # the chip samples that fall within this frame, into the history
-        synth.frac = synth.frac + t.RATE;
-        for (synth.frac >= rate) {
-            synth.frac                = synth.frac - rate;
-            synth.history[synth.at]   = chip_sample();
-            synth.at                  = (synth.at + 1) & 63;
+        frac = frac + t.RATE;
+        for (frac >= rate) {
+            frac     = frac - rate;
+            hist[at] = chip_sample();
+            at       = (at + 1) & 63;
         }
-        # the low-pass filter over the newest 63, so that the chip's high
-        # partials do not fold down into noise
-        var acc: i64 = 0;
-        var k:   i32 = 0;
-        for (k < 63) {
-            acc = acc + synth.history[(synth.at - 1 - k) & 63]::i64 * t.FIR[k]::i64;
+        # the low-pass filter over the newest 63, folded across its symmetric
+        # non-zero taps (taps 0, 1, 61, 62 are 0; tap k == tap 62 - k)
+        val head: i32 = at - 1;
+        val tail: i32 = at - 63;
+        var acc:  i64 = hist[(head - 31) & 63]::i64 * fir[31]::i64;
+        var k:    i32 = 2;
+        for (k < 31) {
+            val pair: i32 = hist[(head - k) & 63] + hist[(tail + k) & 63];
+            acc = acc + pair::i64 * fir[k]::i64;
             k   = k + 1;
         }
         val x: i32 = (acc >> 15)::i32;
         # a one-pole high-pass a few hertz up: the output capacitor
-        synth.dcout = x - synth.dcin + ((synth.dcout * 4064) >> 12);
-        synth.dcin  = x;
+        dcout = x - dcin + ((dcout * 4064) >> 12);
+        dcin  = x;
 
-        val v:    i32 = synth.dcout * 4 / 3;
-        var side: i32 = 0;
-        for (side < 2) {
-            var s: i32 = out[f * 2 + side]::i32 + v;
-            if (s > 32767)  { s = 32767; }
-            if (s < -32768) { s = -32768; }
-            out[f * 2 + side] = s::i16;
-            side              = side + 1;
-        }
+        val v:   i32 = dcout * 4 / 3;
+        val idx: i32 = f * 2;
+        var s0:  i32 = out[idx]::i32 + v;
+        if (s0 > 32767)  { s0 = 32767; }
+        if (s0 < -32768) { s0 = -32768; }
+        out[idx] = s0::i16;
+        var s1:  i32 = out[idx + 1]::i32 + v;
+        if (s1 > 32767)  { s1 = 32767; }
+        if (s1 < -32768) { s1 = -32768; }
+        out[idx + 1] = s1::i16;
         f = f + 1;
     }
+    synth.frac  = frac;
+    synth.at    = at;
+    synth.dcin  = dcin;
+    synth.dcout = dcout;
 }
 
 # ------------------------------------------------------------------- tests

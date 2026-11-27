@@ -128,7 +128,7 @@ link = ["kernel32", "ws2_32"]
 need = []
 
 [artifact.web]
-kind = "bin"
+kind = "module"
 entry = "web.mach"
 out = "{project.work}/bin/doom{artifact.suffix}"
 targets = ["wasi-wasm32"]

@@ -15,7 +15,7 @@ protocols = ["http/1.1"]
 
 [host.site]
 listener = "public"
-names = ["doomach.fly.dev", "mach-doom-relay.fly.dev", "localhost"]
+names = ["doomach.fly.dev", "localhost"]
 
 [service.files]
 kind = "static"

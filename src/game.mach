@@ -61,6 +61,9 @@ pub rec Input {
     # how far the mouse moved sideways since the last tic, in pixels,
     # positive to the right
     mousex: i32;
+    # smooth analog touch movement (-50..50 forward, -40..40 side)
+    move_fwd:  i32;
+    move_side: i32;
 }
 
 # turning per pixel of mouse movement, in the ticcmd's angle units (65536
@@ -871,6 +874,8 @@ pub fun build_ticcmd(s: *Session, input: *Input, cmd: *Ticcmd) {
     if (input.back)         { forward = forward - FORWARDMOVE[speed]; }
     if (input.strafe_right) { side = side + SIDEMOVE[speed]; }
     if (input.strafe_left)  { side = side - SIDEMOVE[speed]; }
+    forward = forward + input.move_fwd;
+    side    = side + input.move_side;
 
     # buttons
     var buttons: i32 = 0;

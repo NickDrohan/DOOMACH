@@ -115,45 +115,14 @@
     font: 600 0.95rem/1.2 inherit;
     cursor: pointer;
   }
-  /* Auto-hiding floating HUD bar */
-  #hud {
-    position: fixed;
-    top: max(10px, env(safe-area-inset-top));
-    right: max(10px, env(safe-area-inset-right));
-    left: max(10px, env(safe-area-inset-left));
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: 6px;
-    pointer-events: none;
-    z-index: 30;
-    opacity: 1;
-    transition: opacity 0.3s ease;
-  }
-  #hud.idle {
-    opacity: 0;
-  }
-  #hud:hover, #hud:focus-within {
-    opacity: 1 !important;
-  }
-  .hud-group {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 5px;
-    pointer-events: auto;
-  }
   .pill {
     appearance: none;
     border: 1px solid var(--hud-border);
     background: var(--hud-bg);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
     color: var(--hud-fg);
     border-radius: 6px;
-    padding: 5px 10px;
-    font: 600 0.78rem/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 6px 12px;
+    font: 600 0.82rem/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     cursor: pointer;
     text-decoration: none;
     white-space: nowrap;
@@ -167,24 +136,6 @@
     border-color: rgba(255, 110, 95, 0.45);
     color: #fff;
   }
-  .pill.room-pill {
-    display: none;
-    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-    letter-spacing: 0.04em;
-    background: rgba(30, 110, 52, 0.9);
-    border-color: rgba(110, 235, 145, 0.5);
-  }
-  .net-dot {
-    display: inline-block;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: #888;
-    margin-right: 5px;
-    vertical-align: middle;
-  }
-  .net-dot.live { background: #3ad46b; }
-  .net-dot.http { background: #f0b429; }
 
   /* Room code join modal */
   #joinModal {
@@ -237,94 +188,7 @@
     justify-content: flex-end;
   }
 
-  /* Touch controls for mobile / tablet */
-  #touchControls {
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: 25;
-    display: none;
-  }
-  body.touch-active #touchControls {
-    display: block;
-  }
-  .touch-pad {
-    position: absolute;
-    bottom: max(18px, env(safe-area-inset-bottom));
-    left: max(16px, env(safe-area-inset-left));
-    width: 144px;
-    height: 144px;
-    pointer-events: auto;
-  }
-  .dpad-btn {
-    position: absolute;
-    width: 46px;
-    height: 46px;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.22);
-    background: rgba(20, 18, 16, 0.58);
-    color: rgba(255, 255, 255, 0.88);
-    font: 700 0.85rem/1 system-ui, sans-serif;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .dpad-btn.active, .act-btn.active {
-    background: rgba(216, 54, 44, 0.78);
-    border-color: rgba(255, 160, 150, 0.85);
-  }
-  .dpad-up    { top: 0; left: 49px; }
-  .dpad-down  { bottom: 0; left: 49px; }
-  .dpad-left  { top: 49px; left: 0; }
-  .dpad-right { top: 49px; right: 0; }
-  .touch-actions {
-    position: absolute;
-    bottom: max(18px, env(safe-area-inset-bottom));
-    right: max(16px, env(safe-area-inset-right));
-    display: grid;
-    grid-template-columns: repeat(2, 62px);
-    gap: 8px;
-    pointer-events: auto;
-  }
-  .act-btn {
-    height: 50px;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.22);
-    background: rgba(20, 18, 16, 0.58);
-    color: rgba(255, 255, 255, 0.9);
-    font: 700 0.78rem/1.1 system-ui, sans-serif;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .act-btn.fire-btn {
-    background: rgba(179, 32, 26, 0.68);
-    border-color: rgba(255, 110, 95, 0.45);
-    height: 58px;
-    font-size: 0.9rem;
-  }
-  .touch-top-bar {
-    position: absolute;
-    bottom: calc(max(18px, env(safe-area-inset-bottom)) + 156px);
-    left: max(16px, env(safe-area-inset-left));
-    right: max(16px, env(safe-area-inset-right));
-    display: flex;
-    justify-content: space-between;
-    pointer-events: none;
-  }
-  .touch-mini-group {
-    display: flex;
-    gap: 6px;
-    pointer-events: auto;
-  }
-  .mini-btn {
-    padding: 7px 11px;
-    border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    background: rgba(20, 18, 16, 0.55);
-    color: rgba(255, 255, 255, 0.88);
-    font: 600 0.74rem/1 system-ui, sans-serif;
-  }
+
 </style>
 </head>
 <body>
@@ -338,22 +202,7 @@
     </div>
   </div>
 
-  <div id="hud">
-    <div class="hud-group">
-      <button class="pill accent" type="button" data-action="1" title="Start 4-player Nightmare Co-op with the trained neural-network bots">Co-op (Bots)</button>
-      <button class="pill" type="button" data-action="2" title="Start 4-player Deathmatch with the league bots">Deathmatch</button>
-      <button class="pill" type="button" id="joinBtn" title="Join a friend's room by 6-character code">Join Room</button>
-      <button class="pill room-pill" type="button" id="roomBtn" title="Click to copy invite link for friends"></button>
-      <button class="pill" type="button" data-action="3" title="Spectate the live 24/7 Co-op bot campaign">Watch Co-op</button>
-      <button class="pill" type="button" data-action="4" title="Spectate the latest Deathmatch bot league match">Watch DM</button>
-    </div>
-    <div class="hud-group">
-      <span class="pill" id="netBadge" title="Multiplayer lockstep connection"><span class="net-dot" id="netDot"></span><span id="netText">Online</span></span>
-      <a class="pill" href="league.html" target="_blank" rel="noopener">Standings</a>
-      <button class="pill" type="button" id="muteBtn">Sound: On</button>
-      <button class="pill" type="button" id="fsBtn">Fullscreen</button>
-    </div>
-  </div>
+
 
   <div id="joinModal" role="dialog" aria-modal="true">
     <div class="modal-card">
@@ -366,33 +215,18 @@
     </div>
   </div>
 
-  <div id="touchControls">
-    <div class="touch-top-bar">
-      <div class="touch-mini-group">
-        <button class="mini-btn" type="button" data-tapkey="27">Menu</button>
-        <button class="mini-btn" type="button" data-tapkey="9">Map</button>
-        <button class="mini-btn" type="button" data-tapkey="123">Spy</button>
+  <div id="nameModal" role="dialog" aria-modal="true" style="position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.72);z-index:50;padding:16px;">
+    <div class="modal-card">
+      <div class="modal-title">New Character Name</div>
+      <input class="modal-input" id="charInput" type="text" maxlength="16" placeholder="SLAYER" autocomplete="off" spellcheck="false" style="letter-spacing:0.1em;font-size:1.1rem;">
+      <div class="modal-actions">
+        <button class="pill" type="button" id="charCancelBtn">Cancel</button>
+        <button class="pill accent" type="button" id="charGoBtn">Create</button>
       </div>
-      <div class="touch-mini-group">
-        <button class="mini-btn" type="button" data-tapkey="81">Blink</button>
-        <button class="mini-btn" type="button" data-tapkey="88">Stim</button>
-        <button class="mini-btn" type="button" id="touchWeaponBtn">Weapon</button>
-        <button class="mini-btn" type="button" data-tapkey="13">Enter</button>
-      </div>
-    </div>
-    <div class="touch-pad">
-      <div class="dpad-btn dpad-up" data-holdkey="38">&uarr;</div>
-      <div class="dpad-btn dpad-down" data-holdkey="40">&darr;</div>
-      <div class="dpad-btn dpad-left" data-holdkey="65">&larr;</div>
-      <div class="dpad-btn dpad-right" data-holdkey="68">&rarr;</div>
-    </div>
-    <div class="touch-actions">
-      <div class="act-btn" data-holdkey="37">Turn &larr;</div>
-      <div class="act-btn" data-holdkey="39">Turn &rarr;</div>
-      <div class="act-btn" data-holdkey="32">Use</div>
-      <div class="act-btn fire-btn" data-holdkey="17">FIRE</div>
     </div>
   </div>
+
+
 
 <script>
 (() => {
@@ -403,18 +237,14 @@
   const barFill = document.getElementById('barFill');
   const loadStatus = document.getElementById('loadStatus');
   const retryBtn = document.getElementById('retryBtn');
-  const hud = document.getElementById('hud');
-  const muteBtn = document.getElementById('muteBtn');
-  const fsBtn = document.getElementById('fsBtn');
-  const joinBtn = document.getElementById('joinBtn');
-  const roomBtn = document.getElementById('roomBtn');
-  const netDot = document.getElementById('netDot');
-  const netText = document.getElementById('netText');
   const joinModal = document.getElementById('joinModal');
   const roomInput = document.getElementById('roomInput');
   const joinCancelBtn = document.getElementById('joinCancelBtn');
   const joinGoBtn = document.getElementById('joinGoBtn');
-  const touchWeaponBtn = document.getElementById('touchWeaponBtn');
+  const nameModal = document.getElementById('nameModal');
+  const charInput = document.getElementById('charInput');
+  const charCancelBtn = document.getElementById('charCancelBtn');
+  const charGoBtn = document.getElementById('charGoBtn');
 
   let ex = null;
   let mem = null;
@@ -425,35 +255,25 @@
   let leagueBufPtr = 0;
   let leagueBufCap = 0;
   const leagueCache = { coop: null, dm: null };
-  let currentRoomCode = '';
-  let weaponCycle = 2;
+  let inLevelPlay = false;
+  let uiMenuActive = false;
+  let uiMenu = 0;
+  let uiMsgState = 0;
+  let lastAutoModalMenu = -1;
+  let isTouchDevice = (
+    ('ontouchstart' in window) ||
+    (navigator.maxTouchPoints > 0) ||
+    Boolean(window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+  );
 
-  // Auto-hide HUD after 2.6 seconds of pointer inactivity during gameplay
-  let hudTimer = 0;
-  function showHud() {
-    hud.classList.remove('idle');
-    clearTimeout(hudTimer);
-    hudTimer = setTimeout(() => {
-      if (running && !joinModal.classList.contains('open')) {
-        hud.classList.add('idle');
-      }
-    }, 2600);
-  }
-  window.addEventListener('mousemove', (e) => {
-    if (document.pointerLockElement === canvas && e.movementY > -15) return;
-    showHud();
-  }, { passive: true });
-  window.addEventListener('touchstart', () => {
-    document.body.classList.add('touch-active');
-    showHud();
-    setupAudio();
-  }, { passive: true });
-  if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) {
-    document.body.classList.add('touch-active');
-  }
-
-  // WASI Preview 1 virtual filesystem persisted in localStorage for saves, profiles, and doom.cfg
+  // WASI Preview 1 virtual filesystem persisted in HTTP cookies (for character
+  // checkpoints profiles/<NAME>.chr, active character profiles/current, and
+  // doom.cfg) as well as localStorage (for journals, rotations, and save slots).
   const STORAGE_PREFIX = 'doomach_vfs:';
+  const CHR_COOKIE_PREFIX = 'doomach_chr_';
+  const CUR_COOKIE = 'doomach_cur';
+  const CFG_COOKIE = 'doomach_cfg';
+  const COOKIE_MAX_AGE = 315360000; // 10 years
   const vfs = new Map();
   const dirs = new Set(['', 'profiles']);
   const fds = new Map();
@@ -461,6 +281,55 @@
 
   function normPath(p) {
     return p.replace(/^\/+|\/+$/g, '').replace(/^\.\//, '');
+  }
+
+  function u8ToB64(data) {
+    let bin = '';
+    for (let i = 0; i < data.length; i++) bin += String.fromCharCode(data[i]);
+    return btoa(bin);
+  }
+
+  function b64ToU8(b64) {
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  }
+
+  function cookieNameForPath(path) {
+    if (path === 'profiles/current') return CUR_COOKIE;
+    if (path === 'doom.cfg') return CFG_COOKIE;
+    const m = /^profiles\/([A-Z0-9_]{1,16})\.chr$/.exec(path);
+    return m ? CHR_COOKIE_PREFIX + m[1] : null;
+  }
+
+  function pathForCookieName(name) {
+    if (name === CUR_COOKIE) return 'profiles/current';
+    if (name === CFG_COOKIE) return 'doom.cfg';
+    if (name.startsWith(CHR_COOKIE_PREFIX)) {
+      const charName = name.slice(CHR_COOKIE_PREFIX.length);
+      if (/^[A-Z0-9_]{1,16}$/.test(charName)) return 'profiles/' + charName + '.chr';
+    }
+    return null;
+  }
+
+  function writeCookie(cookieName, b64) {
+    try {
+      if (!cookieName) return;
+      if (b64 === null) {
+        document.cookie = cookieName + '=; path=/; max-age=0; SameSite=Lax';
+      } else {
+        document.cookie = cookieName + '=' + encodeURIComponent(b64) + '; path=/; max-age=' + COOKIE_MAX_AGE + '; SameSite=Lax';
+      }
+    } catch (_) {}
+  }
+
+  // Read the 64-bit journal sequence number from a 160-byte DCHR checkpoint
+  function chrSeq(u8) {
+    if (!u8 || u8.length < 160) return -1n;
+    const v = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    if (v.getUint32(0, true) !== 0x52484344) return -1n;
+    return v.getBigInt64(48, true);
   }
 
   function loadPersistedVfs() {
@@ -471,28 +340,58 @@
           const path = k.slice(STORAGE_PREFIX.length);
           const b64 = localStorage.getItem(k);
           if (b64 !== null) {
-            const bin = atob(b64);
-            const arr = new Uint8Array(bin.length);
-            for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
-            vfs.set(path, arr);
+            vfs.set(path, b64ToU8(b64));
             const slash = path.lastIndexOf('/');
             if (slash > 0) dirs.add(path.slice(0, slash));
           }
         }
       }
     } catch (_) {}
+
+    // Load character files and preferences from browser cookies
+    try {
+      const rawCookies = document.cookie ? document.cookie.split(';') : [];
+      for (let i = 0; i < rawCookies.length; i++) {
+        const part = rawCookies[i].trim();
+        const eq = part.indexOf('=');
+        if (eq <= 0) continue;
+        const cname = part.slice(0, eq).trim();
+        const path = pathForCookieName(cname);
+        if (!path) continue;
+        const val = decodeURIComponent(part.slice(eq + 1));
+        if (!val) continue;
+        const arr = b64ToU8(val);
+        const existing = vfs.get(path);
+        if (!existing || !path.endsWith('.chr') || chrSeq(arr) >= chrSeq(existing)) {
+          vfs.set(path, arr);
+          const slash = path.lastIndexOf('/');
+          if (slash > 0) dirs.add(path.slice(0, slash));
+          try { localStorage.setItem(STORAGE_PREFIX + path, val); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
+    // Ensure any character files present in VFS are also backed up into cookies
+    for (const [path, data] of vfs.entries()) {
+      const cname = cookieNameForPath(path);
+      if (cname && data && data.length > 0) {
+        writeCookie(cname, u8ToB64(data));
+      }
+    }
   }
 
   function persistFile(path) {
+    const data = vfs.get(path);
+    const cname = cookieNameForPath(path);
+    if (!data) {
+      try { localStorage.removeItem(STORAGE_PREFIX + path); } catch (_) {}
+      if (cname) writeCookie(cname, null);
+      return;
+    }
+    const b64 = u8ToB64(data);
+    if (cname) writeCookie(cname, b64);
     try {
-      const data = vfs.get(path);
-      if (!data) {
-        localStorage.removeItem(STORAGE_PREFIX + path);
-        return;
-      }
-      let bin = '';
-      for (let i = 0; i < data.length; i++) bin += String.fromCharCode(data[i]);
-      localStorage.setItem(STORAGE_PREFIX + path, btoa(bin));
+      localStorage.setItem(STORAGE_PREFIX + path, b64);
     } catch (_) {}
   }
 
@@ -743,6 +642,7 @@
   let wsConnected = false;
   let wsConnecting = false;
   let wsLastTry = 0;
+  let wsFailures = 0;
   let httpInFlight = false;
   let httpLastPoll = 0;
   let httpPendingHex = [];
@@ -765,13 +665,13 @@
   }
 
   function connectWebSocket() {
-    if (wsConnected || wsConnecting) return;
+    const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    if (wsConnected || wsConnecting || (!isLocal && wsFailures >= 2)) return;
     const now = performance.now();
     if (now - wsLastTry < 4000) return;
     wsLastTry = now;
     wsConnecting = true;
     try {
-      const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
       const wsUrl = isLocal
         ? 'ws://' + location.hostname + ':5030/ws'
         : (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':5029/ws';
@@ -781,8 +681,7 @@
         ws = sock;
         wsConnected = true;
         wsConnecting = false;
-        netDot.className = 'net-dot live';
-        netText.textContent = 'WS Live';
+        wsFailures = 0;
       };
       sock.onmessage = (ev) => {
         if (ev.data instanceof ArrayBuffer) {
@@ -791,15 +690,15 @@
       };
       sock.onclose = () => {
         if (ws === sock) ws = null;
+        if (!wsConnected) wsFailures++;
         wsConnected = false;
         wsConnecting = false;
-        netDot.className = 'net-dot http';
-        netText.textContent = 'HTTPS';
       };
       sock.onerror = () => {
         wsConnecting = false;
       };
     } catch (_) {
+      wsFailures++;
       wsConnecting = false;
     }
   }
@@ -815,8 +714,6 @@
     try {
       const res = await fetch('/net/' + clientIdHex + '/' + batch, { cache: 'no-store' });
       if (res.ok) {
-        netDot.className = 'net-dot http';
-        netText.textContent = 'HTTPS';
         const buf = new Uint8Array(await res.arrayBuffer());
         let off = 0;
         while (off + 2 <= buf.length) {
@@ -831,6 +728,9 @@
     } catch (_) {
     } finally {
       httpInFlight = false;
+      if (httpPendingHex.length > 0 && !wsConnected) {
+        flushHttpNet();
+      }
     }
   }
 
@@ -858,16 +758,30 @@
       flushHttpNet();
     }
 
-    // Check if the player is hosting/waiting in a room and show the room invite pill
-    const code = readCString(ex.web_room_code_ptr(), 7);
-    if (code !== currentRoomCode) {
-      currentRoomCode = code;
-      if (code.length === 6) {
-        roomBtn.style.display = 'inline-block';
-        roomBtn.textContent = 'Room ' + code + ' (Copy Link)';
-        showHud();
-      } else {
-        roomBtn.style.display = 'none';
+    // Update mobile UI state (menu vs level gameplay, virtual keyboard modals)
+    if (ex.web_ui_state) {
+      const playingNow = ex.web_ui_state(tPtr) === 1;
+      const uis = new Int32Array(mem.buffer, tPtr, 5);
+      const menuAct = uis[1] !== 0, menuId = uis[2], msgSt = uis[3];
+      if (playingNow !== inLevelPlay || menuAct !== uiMenuActive || menuId !== uiMenu || msgSt !== uiMsgState) {
+        inLevelPlay = playingNow;
+        uiMenuActive = menuAct;
+        uiMenu = menuId;
+        uiMsgState = msgSt;
+        if (isTouchDevice && menuAct && msgSt === 0) {
+          if (menuId === 14 && lastAutoModalMenu !== 14) {
+            lastAutoModalMenu = 14;
+            openNameModal();
+          } else if (menuId === 8 && lastAutoModalMenu !== 8) {
+            lastAutoModalMenu = 8;
+            joinModal.classList.add('open');
+            roomInput.value = '';
+            setTimeout(() => roomInput.focus(), 30);
+          }
+        }
+        if (!menuAct || (menuId !== 14 && menuId !== 8)) {
+          lastAutoModalMenu = -1;
+        }
       }
     }
   }
@@ -1015,10 +929,9 @@
     return ex.web_join_room(tPtr) === 1;
   }
 
-  async function boot(initialAction = 0) {
+  async function boot() {
     if (running) {
       canvas.focus();
-      if (initialAction > 0) ex.web_quick_action(initialAction);
       return;
     }
     if (booting) return;
@@ -1058,15 +971,12 @@
       loader.classList.add('hidden');
       canvas.focus();
       running = true;
-      showHud();
 
       // Check for ?room=CODE or #CODE invite link in the URL
       const params = new URLSearchParams(location.search);
       const urlRoom = params.get('room') || (location.hash ? location.hash.slice(1) : '');
       if (urlRoom && urlRoom.trim().length === 6) {
         joinRoomByCode(urlRoom);
-      } else if (initialAction > 0) {
-        ex.web_quick_action(initialAction);
       }
 
       const TIC_MS = 1000 / 35;
@@ -1075,6 +985,7 @@
       function frame(now) {
         let steps = 0;
         while (now >= nextTic && steps < 4) {
+          stepTouchPads(now);
           ex.web_tic();
           pumpNet();
           const act = ex.web_poll_action();
@@ -1100,27 +1011,12 @@
 
   retryBtn.addEventListener('click', () => {
     setupAudio();
-    boot(0);
-  });
-
-  document.querySelectorAll('[data-action]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      setupAudio();
-      const act = Number(btn.getAttribute('data-action')) || 0;
-      boot(act);
-    });
-  });
-
-  joinBtn.addEventListener('click', () => {
-    setupAudio();
-    if (document.pointerLockElement === canvas) document.exitPointerLock();
-    joinModal.classList.add('open');
-    roomInput.value = '';
-    setTimeout(() => roomInput.focus(), 20);
+    boot();
   });
 
   joinCancelBtn.addEventListener('click', () => {
     joinModal.classList.remove('open');
+    if (ex && uiMenuActive && uiMenu === 8) tapKey(0x08);
     canvas.focus();
   });
 
@@ -1142,43 +1038,69 @@
     } else if (e.key === 'Escape') {
       e.preventDefault();
       joinModal.classList.remove('open');
+      if (ex && uiMenuActive && uiMenu === 8) tapKey(0x08);
       canvas.focus();
     }
   });
 
-  roomBtn.addEventListener('click', async () => {
-    if (!currentRoomCode) return;
-    const url = location.origin + location.pathname + '?room=' + currentRoomCode;
-    try {
-      await navigator.clipboard.writeText(url);
-      roomBtn.textContent = 'Copied ' + currentRoomCode + '!';
-      setTimeout(() => {
-        if (currentRoomCode) roomBtn.textContent = 'Room ' + currentRoomCode + ' (Copy Link)';
-      }, 1800);
-    } catch (_) {
-      prompt('Share this link or room code with your friends:', url);
+  function openNameModal() {
+    if (document.pointerLockElement === canvas) document.exitPointerLock();
+    nameModal.style.display = 'flex';
+    charInput.value = '';
+    setTimeout(() => charInput.focus(), 30);
+  }
+
+  function closeNameModal() {
+    nameModal.style.display = 'none';
+    canvas.focus();
+  }
+
+  function submitNameModal() {
+    const clean = (charInput.value || '').trim().toUpperCase().replace(/[^A-Z0-9_]/g, '');
+    if (clean.length >= 1 && clean.length <= 16 && ex && ex.web_create_char) {
+      const tPtr = ex.web_transfer_ptr();
+      const u8 = new Uint8Array(mem.buffer, tPtr, 24);
+      for (let i = 0; i < clean.length; i++) u8[i] = clean.charCodeAt(i);
+      u8[clean.length] = 0;
+      ex.web_create_char(tPtr);
+      closeNameModal();
+    }
+  }
+
+  charCancelBtn.addEventListener('click', () => {
+    closeNameModal();
+    if (ex && uiMenuActive && uiMenu === 14) tapKey(0x08);
+  });
+  charGoBtn.addEventListener('click', submitNameModal);
+  charInput.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      submitNameModal();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeNameModal();
     }
   });
 
-  muteBtn.addEventListener('click', () => {
-    muted = !muted;
-    muteBtn.textContent = muted ? 'Sound: Muted' : 'Sound: On';
-    if (!muted) setupAudio();
-    canvas.focus();
-  });
+  function tapKey(code) {
+    if (!ex) return;
+    ex.web_key_down(code, 0);
+    setTimeout(() => {
+      if (ex) ex.web_key_up(code);
+    }, 55);
+  }
 
-  fsBtn.addEventListener('click', () => {
-    setupAudio();
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen?.();
-    } else {
-      document.exitFullscreen?.();
-    }
-    canvas.focus();
-  });
+  function canvasCoords(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    const x = Math.max(0, Math.min(319, Math.floor(((clientX - r.left) / r.width) * 320)));
+    const y = Math.max(0, Math.min(199, Math.floor(((clientY - r.top) / r.height) * 200)));
+    return { x, y };
+  }
 
   window.addEventListener('keydown', (e) => {
-    if (joinModal.classList.contains('open')) return;
+    if (joinModal.classList.contains('open') || nameModal.style.display === 'flex') return;
     setupAudio();
     if (!running || !ex) return;
     const k = mapKey(e);
@@ -1192,7 +1114,7 @@
   });
 
   window.addEventListener('keyup', (e) => {
-    if (joinModal.classList.contains('open')) return;
+    if (joinModal.classList.contains('open') || nameModal.style.display === 'flex') return;
     if (!running || !ex) return;
     const k = mapKey(e);
     if (k !== 0) {
@@ -1205,12 +1127,32 @@
     if (ex) ex.web_release_all();
   });
 
+  let pointerLockEnteredAt = 0;
+  document.addEventListener('pointerlockchange', () => {
+    if (document.pointerLockElement === canvas) {
+      pointerLockEnteredAt = performance.now();
+    }
+  });
+
   canvas.addEventListener('mousedown', (e) => {
+    if (isTouchDevice) return;
     canvas.focus();
     setupAudio();
     if (!running || !ex) return;
-    if (document.pointerLockElement !== canvas && ex.web_want_pointer_lock() === 1) {
-      canvas.requestPointerLock?.();
+    if (document.pointerLockElement !== canvas) {
+      if (ex.web_want_pointer_lock() === 1) {
+        try {
+          const p = canvas.requestPointerLock({ unadjustedMovement: true });
+          if (p && typeof p.catch === 'function') {
+            p.catch(() => canvas.requestPointerLock?.());
+          }
+        } catch (_) {
+          canvas.requestPointerLock?.();
+        }
+      } else if (e.button === 0 && ex.web_canvas_tap) {
+        const pt = canvasCoords(e.clientX, e.clientY);
+        if (pt) ex.web_canvas_tap(pt.x, pt.y);
+      }
       return;
     }
     if (document.pointerLockElement === canvas) {
@@ -1220,7 +1162,7 @@
   });
 
   window.addEventListener('mouseup', (e) => {
-    if (!running || !ex) return;
+    if (isTouchDevice || !running || !ex) return;
     ex.web_mouse_button(e.button, 0);
   });
 
@@ -1229,89 +1171,379 @@
   document.addEventListener('mousemove', (e) => {
     if (!running || !ex) return;
     if (document.pointerLockElement === canvas) {
-      ex.web_mouse_move(e.movementX | 0);
+      if (performance.now() - pointerLockEnteredAt < 45) return;
+      const dx = e.movementX | 0;
+      if (Math.abs(dx) > 220) return;
+      ex.web_mouse_move(dx);
     }
   });
 
-  // Touch controls: hold buttons, tap buttons, and drag-to-turn on the canvas
-  document.querySelectorAll('[data-holdkey]').forEach((el) => {
-    const code = Number(el.getAttribute('data-holdkey'));
-    const press = (e) => {
-      e.preventDefault();
-      setupAudio();
-      el.classList.add('active');
-      if (ex) ex.web_key_down(code, 0);
-    };
-    const release = (e) => {
-      e.preventDefault();
-      el.classList.remove('active');
-      if (ex) ex.web_key_up(code);
-    };
-    el.addEventListener('touchstart', press, { passive: false });
-    el.addEventListener('touchend', release, { passive: false });
-    el.addEventListener('touchcancel', release, { passive: false });
-  });
+  // Invisible dual-analog joysticks + gesture controls:
+  // - Left half of screen:  Move stick, centered wherever the user first presses and holds
+  // - Right half of screen: Look stick, centered wherever the user first presses and holds
+  // - Both sticks work simultaneously for dual-thumb play:
+  //   * Bottom 80% of stick throw (0 <= u < 0.8): linear lerp curve from 0 up to 1.0 (max speed)
+  //   * Top 20% of stick throw (u >= 0.8): 1.0 (max speed all the way)
+  //   * Fixed origin per hold: the stick center locks where the thumb first presses and holds
+  //     and never shifts while held, so returning the thumb to its starting spot always stops cleanly.
+  // - 1-finger tap:         shoot (in gameplay) or select menu row
+  // - Simultaneous 2-finger tap: open door / use switch (in gameplay) or go back / cancel (in menus)
+  // - Swipe left / right:   change weapon (in gameplay) or back / select (in menus)
+  // - Simultaneous 3-finger tap: open / close main menu (Esc)
+  const activeTouches = new Map();
+  let movePadTouchId = null;
+  let lookPadTouchId = null;
+  let multiChordFingers = 0;
+  let multiChordStart = 0;
+  let multiChordMaxMove = 0;
+  let multiChordValid = false;
 
-  document.querySelectorAll('[data-tapkey]').forEach((el) => {
-    const code = Number(el.getAttribute('data-tapkey'));
-    el.addEventListener('touchstart', (e) => {
-      e.preventDefault();
-      setupAudio();
-      if (ex) {
-        ex.web_key_down(code, 0);
-        setTimeout(() => ex.web_key_up(code), 60);
-      }
-    }, { passive: false });
-  });
+  const STICK_DEAD = 8;
+  const STICK_RADIUS = 64;
+  const MAX_MOVE_FWD = 50;   // FORWARDMOVE[1]
+  const MAX_MOVE_SIDE = 40;  // SIDEMOVE[1]
+  const MAX_LOOK_TURN = 64;  // 64 * MOUSETURN(10) = 640 = ANGLETURN[0] (Doom max normal turn speed)
+  let turnCarry = 0;
 
-  touchWeaponBtn.addEventListener('touchstart', (e) => {
-    e.preventDefault();
-    setupAudio();
+  function stickCurve(deflection) {
+    if (deflection <= STICK_DEAD) return 0;
+    const u = Math.min(1, (deflection - STICK_DEAD) / (STICK_RADIUS - STICK_DEAD));
+    if (u >= 0.8) return 1;
+    return u / 0.8; // 0..1 linear lerp across the bottom 80%
+  }
+
+  function clearInvisiblePads() {
+    movePadTouchId = null;
+    lookPadTouchId = null;
+    turnCarry = 0;
+    if (ex && ex.web_touch_move) ex.web_touch_move(0, 0);
+  }
+
+  function pulseKey(code, durationMs = 85) {
     if (!ex) return;
-    const code = 48 + weaponCycle;
-    weaponCycle = (weaponCycle % 7) + 1;
     ex.web_key_down(code, 0);
-    setTimeout(() => ex.web_key_up(code), 60);
+    setTimeout(() => {
+      if (ex) ex.web_key_up(code);
+    }, durationMs);
+  }
+
+  function stepMenuDrag(t) {
+    const stepY = t.curY - t.stepY;
+    const stepX = t.curX - t.stepX;
+    if (Math.abs(stepY) >= 26) {
+      t.stepY = t.curY;
+      tapKey(stepY > 0 ? 0x28 : 0x26);
+    } else if (Math.abs(stepX) >= 28 && uiMenu === 4) {
+      t.stepX = t.curX;
+      tapKey(stepX > 0 ? 0x27 : 0x25);
+    }
+  }
+
+  // Settle the stick center where the thumb first presses and holds, and detect fast
+  // horizontal weapon-switch flicks so swiping a weapon never jumps the camera.
+  function updateStickHoldState(rec, now) {
+    const age = now - rec.startTime;
+    const rawDx = rec.curX - rec.startX;
+    const rawDy = rec.curY - rec.startY;
+
+    if (!rec.anchored) {
+      // If the finger immediately launches horizontally at high velocity without holding first,
+      // treat it as a weapon-switch swipe candidate so it doesn't spin the camera.
+      if (age < 75 && Math.abs(rawDx) >= 26 && Math.abs(rawDx) > Math.abs(rawDy) * 1.6) {
+        rec.swipeCandidate = true;
+        rec.anchored = true;
+      } else if (age >= 50) {
+        if (rec.maxMove <= 10) {
+          rec.originX = rec.curX;
+          rec.originY = rec.curY;
+        }
+        rec.anchored = true;
+      } else if (rec.maxMove > 14) {
+        rec.anchored = true;
+      }
+    }
+
+    // If a swipe candidate stays held on the screen past 250ms, the user is holding the stick,
+    // so re-anchor the stick center right where their thumb is holding.
+    if (rec.swipeCandidate && age >= 250) {
+      rec.swipeCandidate = false;
+      rec.originX = rec.curX;
+      rec.originY = rec.curY;
+    }
+  }
+
+  // Called once per 35 Hz game tic to feed both virtual analog sticks into doom.wasm simultaneously
+  function stepTouchPads(now) {
+    if (!ex) return;
+    if (!inLevelPlay || multiChordValid) {
+      turnCarry = 0;
+      if (ex.web_touch_move) ex.web_touch_move(0, 0);
+      return;
+    }
+
+    // 1. Left virtual analog stick (Move: bottom 80% lerps 0..max, top 20% = max all the way)
+    let fwd = 0;
+    let side = 0;
+    const moveRec = movePadTouchId !== null ? activeTouches.get(movePadTouchId) : null;
+    if (moveRec) {
+      updateStickHoldState(moveRec, now);
+      if (moveRec.anchored && !moveRec.swipeCandidate) {
+        const dx = moveRec.curX - moveRec.originX;
+        const dy = moveRec.curY - moveRec.originY;
+        const dist = Math.hypot(dx, dy);
+        if (dist > STICK_DEAD) {
+          const mag = stickCurve(dist);
+          fwd = Math.round((-dy / dist) * mag * MAX_MOVE_FWD);
+          side = Math.round((dx / dist) * mag * MAX_MOVE_SIDE);
+        }
+      }
+    }
+    if (ex.web_touch_move) {
+      ex.web_touch_move(fwd, side);
+    }
+
+    // 2. Right virtual analog stick (Look: bottom 80% lerps 0..max rotation speed, top 20% = max all the way)
+    let lookRate = 0;
+    const lookRec = lookPadTouchId !== null ? activeTouches.get(lookPadTouchId) : null;
+    if (lookRec) {
+      updateStickHoldState(lookRec, now);
+      if (lookRec.anchored && !lookRec.swipeCandidate) {
+        const dx = lookRec.curX - lookRec.originX;
+        const absDx = Math.abs(dx);
+        if (absDx > STICK_DEAD) {
+          const mag = stickCurve(absDx);
+          lookRate = Math.sign(dx) * mag * MAX_LOOK_TURN;
+        }
+      }
+    } else {
+      turnCarry = 0;
+    }
+
+    const totalTurn = lookRate + turnCarry;
+    const intTurn = Math.trunc(totalTurn);
+    turnCarry = totalTurn - intTurn;
+    if (intTurn !== 0 && ex.web_mouse_move) {
+      ex.web_mouse_move(intTurn);
+    }
+  }
+
+  function isUiOverlayTarget(target) {
+    return Boolean(target && target.closest && target.closest('#joinModal, #nameModal, .retry-btn'));
+  }
+
+  window.addEventListener('touchstart', (e) => {
+    isTouchDevice = true;
+    setupAudio();
+    if (isUiOverlayTarget(e.target)) {
+      return;
+    }
+    e.preventDefault();
+    const now = performance.now();
+    const wasEmpty = activeTouches.size === 0;
+    const midX = window.innerWidth * 0.5;
+
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      const ct = e.changedTouches[i];
+      const side = ct.clientX < midX ? 'left' : 'right';
+      const rec = {
+        id: ct.identifier,
+        side,
+        startX: ct.clientX,
+        startY: ct.clientY,
+        originX: ct.clientX,
+        originY: ct.clientY,
+        curX: ct.clientX,
+        curY: ct.clientY,
+        lastX: ct.clientX,
+        lastY: ct.clientY,
+        stepX: ct.clientX,
+        stepY: ct.clientY,
+        startTime: now,
+        lastMoveTime: now,
+        maxMove: 0,
+        anchored: false,
+        swipeCandidate: false
+      };
+      activeTouches.set(ct.identifier, rec);
+      if (side === 'left' && movePadTouchId === null) {
+        movePadTouchId = ct.identifier;
+      } else if (side === 'right' && lookPadTouchId === null) {
+        lookPadTouchId = ct.identifier;
+        turnCarry = 0;
+      }
+    }
+
+    // Detect simultaneous multi-finger tap chords (2-finger tap = open door, 3-finger tap = menu)
+    // without interfering with dual-thumb joystick play (where one thumb is already holding a stick)
+    if (wasEmpty) {
+      multiChordStart = now;
+      multiChordFingers = activeTouches.size;
+      multiChordMaxMove = 0;
+      multiChordValid = activeTouches.size >= 2;
+    } else if (now - multiChordStart < 95) {
+      let allNearRest = true;
+      for (const r of activeTouches.values()) {
+        if (r.maxMove > 18) allNearRest = false;
+      }
+      if (allNearRest) {
+        multiChordFingers = Math.max(multiChordFingers, activeTouches.size);
+        multiChordValid = multiChordFingers >= 2;
+      }
+    }
   }, { passive: false });
 
-  let lookTouchId = null;
-  let lookLastX = 0;
-  canvas.addEventListener('touchstart', (e) => {
-    setupAudio();
-    if (lookTouchId === null && e.changedTouches.length > 0) {
-      const t = e.changedTouches[0];
-      lookTouchId = t.identifier;
-      lookLastX = t.clientX;
-    }
-  }, { passive: true });
-
-  canvas.addEventListener('touchmove', (e) => {
-    if (!ex || lookTouchId === null) return;
+  window.addEventListener('touchmove', (e) => {
+    if (activeTouches.size === 0) return;
+    e.preventDefault();
+    const now = performance.now();
     for (let i = 0; i < e.changedTouches.length; i++) {
-      const t = e.changedTouches[i];
-      if (t.identifier === lookTouchId) {
-        const dx = Math.round((t.clientX - lookLastX) * 2.2);
-        lookLastX = t.clientX;
-        if (dx !== 0) ex.web_mouse_move(dx);
-        break;
+      const ct = e.changedTouches[i];
+      const rec = activeTouches.get(ct.identifier);
+      if (!rec) continue;
+      const stepDist = Math.hypot(ct.clientX - rec.curX, ct.clientY - rec.curY);
+      if (stepDist >= 1.2) {
+        rec.lastMoveTime = now;
+      }
+      rec.lastX = rec.curX;
+      rec.lastY = rec.curY;
+      rec.curX = ct.clientX;
+      rec.curY = ct.clientY;
+      const mv = Math.hypot(rec.curX - rec.startX, rec.curY - rec.startY);
+      if (mv > rec.maxMove) rec.maxMove = mv;
+      if (mv > multiChordMaxMove) multiChordMaxMove = mv;
+      if (multiChordValid && multiChordMaxMove > 26) {
+        multiChordValid = false;
+      }
+
+      if (!inLevelPlay) {
+        stepMenuDrag(rec);
+      } else {
+        updateStickHoldState(rec, now);
       }
     }
-  }, { passive: true });
+  }, { passive: false });
 
-  const endLookTouch = (e) => {
-    if (lookTouchId === null) return;
+  function handleTouchEnd(e, isCancel) {
+    if (activeTouches.size === 0) return;
+    e.preventDefault();
+    const now = performance.now();
+    const endedTouches = [];
+
     for (let i = 0; i < e.changedTouches.length; i++) {
-      if (e.changedTouches[i].identifier === lookTouchId) {
-        lookTouchId = null;
-        break;
+      const ct = e.changedTouches[i];
+      const rec = activeTouches.get(ct.identifier);
+      if (rec) {
+        rec.curX = ct.clientX;
+        rec.curY = ct.clientY;
+        const mv = Math.hypot(rec.curX - rec.startX, rec.curY - rec.startY);
+        if (mv > rec.maxMove) rec.maxMove = mv;
+        if (mv > multiChordMaxMove) multiChordMaxMove = mv;
+        endedTouches.push(rec);
+        activeTouches.delete(ct.identifier);
+      }
+      if (ct.identifier === movePadTouchId) {
+        movePadTouchId = null;
+        if (ex && ex.web_touch_move) {
+          ex.web_touch_move(0, 0);
+        }
+      }
+      if (ct.identifier === lookPadTouchId) {
+        lookPadTouchId = null;
+        turnCarry = 0;
       }
     }
+
+    if (isCancel || !ex) {
+      if (activeTouches.size === 0) {
+        multiChordValid = false;
+        clearInvisiblePads();
+      }
+      return;
+    }
+
+    // 1. Simultaneous 2-finger or 3-finger chord tap when all fingers in the chord lift
+    if (multiChordValid && activeTouches.size === 0) {
+      const chordDt = now - multiChordStart;
+      multiChordValid = false;
+      if (multiChordFingers >= 3 && chordDt < 360 && multiChordMaxMove < 34) {
+        tapKey(0x1b); // 3-finger tap: toggle main menu (Esc)
+        return;
+      }
+      if (multiChordFingers === 2 && chordDt < 340 && multiChordMaxMove < 28) {
+        if (inLevelPlay) {
+          pulseKey(0x20, 90); // 2-finger tap: open door / use switch (Space)
+        } else if (uiMsgState === 2) {
+          tapKey(78); // 'N' on Y/N prompt
+        } else {
+          tapKey(0x08); // Backspace in menu
+        }
+        return;
+      }
+    }
+    if (activeTouches.size === 0) {
+      multiChordValid = false;
+    }
+
+    // 2. Individual finger release gestures (works even while the other thumb is holding a stick!)
+    for (let i = 0; i < endedTouches.length; i++) {
+      const ended = endedTouches[i];
+      const dx = ended.curX - ended.startX;
+      const dy = ended.curY - ended.startY;
+      const singleDt = now - ended.startTime;
+
+      // Fast horizontal swipe left / right -> change weapon (in gameplay) or back / select (in menu)
+      if (singleDt < 240 && Math.abs(dx) >= 44 && Math.abs(dx) > Math.abs(dy) * 1.6) {
+        if (inLevelPlay) {
+          if (ex.web_cycle_weapon) {
+            ex.web_cycle_weapon(dx > 0 ? 1 : -1);
+          } else {
+            const code = 48 + weaponCycle;
+            weaponCycle = (weaponCycle % 7) + 1;
+            tapKey(code);
+          }
+        } else {
+          tapKey(dx > 0 ? 0x0d : 0x08);
+        }
+        continue;
+      }
+
+      // 1-finger tap -> shoot (in gameplay) or select menu row / confirm prompt (in menus)
+      if (singleDt < 240 && ended.maxMove < 16) {
+        if (inLevelPlay) {
+          pulseKey(0x11, 90); // VK_CONTROL (Fire / Shoot)
+        } else if (uiMenuActive && uiMenu === 14) {
+          openNameModal();
+        } else if (uiMenuActive && uiMenu === 8) {
+          joinModal.classList.add('open');
+          roomInput.value = '';
+          setTimeout(() => roomInput.focus(), 30);
+        } else {
+          const r = canvas.getBoundingClientRect();
+          const insideCanvas = (
+            ended.curX >= r.left && ended.curX <= r.right &&
+            ended.curY >= r.top && ended.curY <= r.bottom
+          );
+          const pt = insideCanvas ? canvasCoords(ended.curX, ended.curY) : null;
+          if (pt && ex.web_canvas_tap) {
+            ex.web_canvas_tap(pt.x, pt.y);
+          } else {
+            tapKey(0x0d);
+          }
+        }
+      }
+    }
+  }
+
+  window.addEventListener('touchend', (e) => handleTouchEnd(e, false), { passive: false });
+  window.addEventListener('touchcancel', (e) => handleTouchEnd(e, true), { passive: false });
+
+  const flushProfileToCookie = () => {
+    if (ex && ex.web_flush_profile) ex.web_flush_profile();
   };
-  canvas.addEventListener('touchend', endLookTouch, { passive: true });
-  canvas.addEventListener('touchcancel', endLookTouch, { passive: true });
-
-  window.addEventListener('pagehide', () => {
-    if (ex) ex.web_flush_profile();
+  window.addEventListener('pagehide', flushProfileToCookie);
+  window.addEventListener('beforeunload', flushProfileToCookie);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushProfileToCookie();
   });
 
   // Auto-boot immediately into the 4:3 browser runtime

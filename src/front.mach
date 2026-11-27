@@ -478,6 +478,10 @@ fun start_message(f: *Front, text: str, yn: bool, ask: i32) {
 }
 
 fun items_in(menu: i32) i32 {
+    $if ($mach.build.sys == $mach.sys.wasi) {
+        if (menu == MENU_MAIN)    { ret 8; }
+        if (menu == MENU_OPTIONS) { ret 4; }
+    }
     if (menu == MENU_MAIN)    { ret 9; }
     if (menu == MENU_COOP)    { ret 11; }
     if (menu == MENU_CHAR)    { ret 3; }
@@ -508,9 +512,38 @@ fun parent_of(f: *Front, menu: i32) i32 {
 # their own lines under their labels
 fun selectable(f: *Front, menu: i32, item: i32) bool {
     # the last main row, END GAME, only counts while a game is being played
-    if (menu == MENU_MAIN && item == 8) { ret f.mode == MODE_LEVEL; }
+    if (menu == MENU_MAIN && item == items_in(MENU_MAIN) - 1) { ret f.mode == MODE_LEVEL; }
     if (menu == MENU_SOUND) { ret item == 0 || item == 2; }
     ret 1;
+}
+
+fun sync_chars(f: *Front, s: *game.Session) {
+    f.nchars  = profile.list(s.a, ?f.chars[0][0]);
+    f.charsel = f.nchars;
+    var cn: [24]u8;
+    profile.name(?cn[0]);
+    var ck: i32 = 0;
+    for (ck < f.nchars) {
+        var same: i32 = 1;
+        var cm:   i32 = 0;
+        for (cm < 24 && cn[cm] != 0) {
+            if (f.chars[ck][cm] != cn[cm]) { same = 0; }
+            cm = cm + 1;
+        }
+        if (same != 0 && cn[0] != 0) { f.charsel = ck; }
+        ck = ck + 1;
+    }
+}
+
+pub fun open_char(f: *Front, s: *game.Session) {
+    profile.flush(s, 1);
+    sync_chars(f, s);
+    f.menufrom          = MENU_MAIN;
+    f.menu              = MENU_CHAR;
+    f.itemon[MENU_CHAR] = 0;
+    if (!profile.loaded && f.nchars == 0) { f.itemon[MENU_CHAR] = 1; }
+    f.menuactive        = 1;
+    sfx(s, info.SFX_SWTCHN);
 }
 
 fun open_menu(f: *Front, s: *game.Session) {
@@ -628,31 +661,31 @@ fun choose(f: *Front, s: *game.Session) {
         or (item == 5) {
             f.menu = MENU_READ1;
         }
-        or (item == 7) {
-            # the character page: the names on disk, and who is chosen
-            f.nchars  = profile.list(s.a, ?f.chars[0][0]);
-            f.charsel = f.nchars;
-            var cn: [24]u8;
-            profile.name(?cn[0]);
-            var ck: i32 = 0;
-            for (ck < f.nchars) {
-                var same: i32 = 1;
-                var cm:   i32 = 0;
-                for (cm < 24 && cn[cm] != 0) {
-                    if (f.chars[ck][cm] != cn[cm]) { same = 0; }
-                    cm = cm + 1;
-                }
-                if (same != 0 && cn[0] != 0) { f.charsel = ck; }
-                ck = ck + 1;
-            }
-            f.menufrom = MENU_MAIN;
-            f.menu     = MENU_CHAR;
-        }
-        or (item == 8) {
-            start_message(f, "are you sure you want to end the game?\n\npress y or n.", 1, ASK_ENDGAME);
-        }
         or {
-            start_message(f, "are you sure you want to\nquit this great game?\n\n(press y to quit)", 1, ASK_QUIT);
+            $if ($mach.build.sys == $mach.sys.wasi) {
+                if (item == 6) {
+                    sync_chars(f, s);
+                    f.menufrom = MENU_MAIN;
+                    f.menu     = MENU_CHAR;
+                }
+                or {
+                    start_message(f, "are you sure you want to end the game?\n\npress y or n.", 1, ASK_ENDGAME);
+                }
+            }
+            $if ($mach.build.sys != $mach.sys.wasi) {
+                if (item == 7) {
+                    # the character page: the names on disk, and who is chosen
+                    sync_chars(f, s);
+                    f.menufrom = MENU_MAIN;
+                    f.menu     = MENU_CHAR;
+                }
+                or (item == 8) {
+                    start_message(f, "are you sure you want to end the game?\n\npress y or n.", 1, ASK_ENDGAME);
+                }
+                or {
+                    start_message(f, "are you sure you want to\nquit this great game?\n\n(press y to quit)", 1, ASK_QUIT);
+                }
+            }
         }
     }
     or (f.menu == MENU_EPISODE) {
@@ -698,21 +731,7 @@ fun choose(f: *Front, s: *game.Session) {
             f.menu    = MENU_CODE;
         }
         or (item == COOP_CHAR) {
-            f.nchars   = profile.list(s.a, ?f.chars[0][0]);
-            f.charsel  = f.nchars;
-            var cn2: [24]u8;
-            profile.name(?cn2[0]);
-            var ck2: i32 = 0;
-            for (ck2 < f.nchars) {
-                var same2: i32 = 1;
-                var cm2:   i32 = 0;
-                for (cm2 < 24 && cn2[cm2] != 0) {
-                    if (f.chars[ck2][cm2] != cn2[cm2]) { same2 = 0; }
-                    cm2 = cm2 + 1;
-                }
-                if (same2 != 0 && cn2[0] != 0) { f.charsel = ck2; }
-                ck2 = ck2 + 1;
-            }
+            sync_chars(f, s);
             f.menufrom = MENU_COOP;
             f.menu     = MENU_CHAR;
         }
@@ -758,6 +777,12 @@ fun choose(f: *Front, s: *game.Session) {
     }
     or (f.menu == MENU_CHAR) {
         if (item == 0) {
+            if (f.nchars == 0) {
+                f.charnamlen  = 0;
+                f.charname[0] = 0;
+                f.menu        = MENU_NAME;
+                ret;
+            }
             # step through the names on disk, then none
             f.charsel = f.charsel + 1;
             if (f.charsel > f.nchars) { f.charsel = 0; }
@@ -765,7 +790,7 @@ fun choose(f: *Front, s: *game.Session) {
                 if (!profile.choose(s.a, ?f.chars[f.charsel][0])) { sfx(s, info.SFX_OOF); }
             }
             or {
-                profile.unload();
+                profile.clear_choice();
             }
         }
         or (item == 1) {
@@ -784,6 +809,10 @@ fun choose(f: *Front, s: *game.Session) {
     or (f.menu == MENU_SPEND) {
         if (item == rpg.N_NODES) {
             f.menu = MENU_CHAR;
+            ret;
+        }
+        if (!f.netgame && f.mode != MODE_LEVEL) {
+            if (!profile.spend(s, item)) { sfx(s, info.SFX_OOF); }
             ret;
         }
         # a point is spoken for when the command lands on a tic; queued
@@ -821,9 +850,11 @@ fun choose(f: *Front, s: *game.Session) {
             f.trainsaid = f.trainsaid + 1;
         }
         or {
-            # fetch the newest version of the program and start it
-            f.menuactive = 0;
-            f.netrequest = NET_UPDATE;
+            $if ($mach.build.sys != $mach.sys.wasi) {
+                # fetch the newest version of the program and start it
+                f.menuactive = 0;
+                f.netrequest = NET_UPDATE;
+            }
         }
     }
     or (f.menu == MENU_READ1) {
@@ -909,6 +940,7 @@ fun type_name(f: *Front, s: *game.Session, key: i32) bool {
             ret 1;
         }
         if (profile.create(?f.charname[0]) && profile.choose(s.a, ?f.charname[0])) {
+            sync_chars(f, s);
             f.menu = MENU_CHAR;
             ret 1;
         }
@@ -973,10 +1005,10 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
     # a message takes the key first
     if (f.message != nil) {
         if (f.messageyn) {
-            if (key == 'Y') {
+            if (key == 'Y' || key == 'y' || key == KEY_ENTER) {
                 answer(f, s, 1);
             }
-            or (key == 'N' || key == KEY_ESCAPE) {
+            or (key == 'N' || key == 'n' || key == KEY_ESCAPE || key == KEY_BACKSPACE) {
                 answer(f, s, 0);
             }
             ret;
@@ -1049,6 +1081,195 @@ pub fun responder(f: *Front, s: *game.Session, key: i32) {
         }
         sfx(s, info.SFX_SWTCHN);
     }
+}
+
+# handle a direct touch or mouse click at (x, y) in 320x200 screen coordinates
+# while on the title screen, intermission, message prompt, or in-game menu
+pub fun tap(f: *Front, s: *game.Session, x: i32, y: i32) bool {
+    if (f.message != nil) {
+        if (f.messageyn) {
+            if (y >= 145 || x < 72) {
+                answer(f, s, 0);
+                sfx(s, info.SFX_SWTCHX);
+            }
+            or {
+                answer(f, s, 1);
+                sfx(s, info.SFX_PISTOL);
+            }
+            ret 1;
+        }
+        f.message = nil;
+        sfx(s, info.SFX_SWTCHX);
+        ret 1;
+    }
+
+    if (!f.menuactive) {
+        if (f.mode == MODE_PAGE || f.mode == MODE_DEMO) {
+            open_menu(f, s);
+            ret 1;
+        }
+        if (f.mode == MODE_WI && !f.netgame) {
+            f.acceleratestage = 1;
+            ret 1;
+        }
+        if (f.mode == MODE_FINALE && f.finalestage == 1 && !f.netgame) {
+            start_title(f);
+            ret 1;
+        }
+        ret 0;
+    }
+
+    val menu: i32 = f.menu;
+    if (menu == MENU_READ1 || menu == MENU_READ2) {
+        choose(f, s);
+        sfx(s, info.SFX_PISTOL);
+        ret 1;
+    }
+
+    # tapping the top-left corner or bottom margin goes back one menu level
+    if ((x < 48 && y < 32) || y >= 184) {
+        responder(f, s, KEY_BACKSPACE);
+        ret 1;
+    }
+
+    if (menu == MENU_MAIN) {
+        if (y >= 60) {
+            val row: i32 = (y - 60) / LINEHEIGHT;
+            if (row >= 0 && row < items_in(MENU_MAIN) && selectable(f, MENU_MAIN, row)) {
+                f.itemon[MENU_MAIN] = row;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    or (menu == MENU_EPISODE) {
+        if (y >= 59) {
+            val row: i32 = (y - 59) / LINEHEIGHT;
+            if (row >= 0 && row < 3) {
+                f.itemon[MENU_EPISODE] = row;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    or (menu == MENU_SKILL) {
+        if (y >= 59) {
+            val row: i32 = (y - 59) / LINEHEIGHT;
+            if (row >= 0 && row < 5) {
+                f.itemon[MENU_SKILL] = row;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    or (menu == MENU_COOP) {
+        if (y >= 26) {
+            val row: i32 = (y - 26) / LINEHEIGHT;
+            if (row >= 0 && row < 11) {
+                f.itemon[MENU_COOP] = row;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    or (menu == MENU_LIST) {
+        if (f.liststate == LIST_NOREACH) {
+            responder(f, s, KEY_BACKSPACE);
+            ret 1;
+        }
+        if (y >= 48) {
+            val row: i32 = (y - 48) / LINEHEIGHT;
+            if (row >= 0 && row <= f.nrooms) {
+                f.itemon[MENU_LIST] = row;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    or (menu == MENU_CHAR) {
+        if (y >= 92) {
+            val row: i32 = (y - 92) / LINEHEIGHT;
+            if (row >= 0 && row < 3) {
+                f.itemon[MENU_CHAR] = row;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    or (menu == MENU_SPEND) {
+        if (y >= 144 && y < 184) {
+            f.itemon[MENU_SPEND] = rpg.N_NODES;
+            choose(f, s);
+            sfx(s, info.SFX_PISTOL);
+            ret 1;
+        }
+        if (y >= 40 && y < 136) {
+            val it:  i32 = f.itemon[MENU_SPEND];
+            var off: i32 = it - 4;
+            if (off < 0) { off = 0; }
+            if (off > 8) { off = 8; }
+            val node: i32 = off + (y - 40) / 12;
+            if (node >= 0 && node < rpg.N_NODES) {
+                f.itemon[MENU_SPEND] = node;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    or (menu == MENU_OPTIONS) {
+        if (y >= 33) {
+            val row: i32 = (y - 33) / LINEHEIGHT;
+            if (row >= 0 && row < items_in(MENU_OPTIONS)) {
+                f.itemon[MENU_OPTIONS] = row;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    or (menu == MENU_SOUND) {
+        if (y >= 56 && y < 96) {
+            f.itemon[MENU_SOUND] = 0;
+            slide(f, 0, x >= 152);
+            sfx(s, info.SFX_STNMOV);
+            ret 1;
+        }
+        if (y >= 96 && y < 140) {
+            f.itemon[MENU_SOUND] = 2;
+            slide(f, 2, x >= 152);
+            sfx(s, info.SFX_STNMOV);
+            ret 1;
+        }
+        ret 1;
+    }
+    or (menu == MENU_LOAD || menu == MENU_SAVE) {
+        if (y >= 50) {
+            val row: i32 = (y - 50) / LINEHEIGHT;
+            if (row >= 0 && row < 6) {
+                f.itemon[menu] = row;
+                choose(f, s);
+                sfx(s, info.SFX_PISTOL);
+                ret 1;
+            }
+        }
+        ret 1;
+    }
+    ret 1;
 }
 
 # write a str onto the buffer
@@ -1143,9 +1364,15 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         video.draw_patch(screen, x, y + LINEHEIGHT * 3, video.patch(d, "M_LOADG"));
         video.draw_patch(screen, x, y + LINEHEIGHT * 4, video.patch(d, "M_SAVEG"));
         video.draw_patch(screen, x, y + LINEHEIGHT * 5, video.patch(d, "M_RDTHIS"));
-        video.draw_patch(screen, x, y + LINEHEIGHT * 6, video.patch(d, "M_QUITG"));
-        video.write_text(d, screen, x + 2, y + LINEHEIGHT * 7 + 4, "CHARACTER", -1);
-        if (f.mode == MODE_LEVEL) { video.write_text(d, screen, x + 2, y + LINEHEIGHT * 8 + 4, "END GAME", -1); }
+        $if ($mach.build.sys == $mach.sys.wasi) {
+            video.write_text(d, screen, x + 2, y + LINEHEIGHT * 6 + 4, "CHARACTER", -1);
+            if (f.mode == MODE_LEVEL) { video.write_text(d, screen, x + 2, y + LINEHEIGHT * 7 + 4, "END GAME", -1); }
+        }
+        $if ($mach.build.sys != $mach.sys.wasi) {
+            video.draw_patch(screen, x, y + LINEHEIGHT * 6, video.patch(d, "M_QUITG"));
+            video.write_text(d, screen, x + 2, y + LINEHEIGHT * 7 + 4, "CHARACTER", -1);
+            if (f.mode == MODE_LEVEL) { video.write_text(d, screen, x + 2, y + LINEHEIGHT * 8 + 4, "END GAME", -1); }
+        }
     }
     or (f.menu == MENU_COOP) {
         x = 72;
@@ -1185,13 +1412,15 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         }
         video.write_text(d, screen, x, y + LINEHEIGHT * 9 + 4, "WATCH THE CO-OP BOTS", -1);
         video.write_text(d, screen, x, y + LINEHEIGHT * 10 + 4, "WATCH THE DEATHMATCH BOTS", -1);
-        var line: [20]u8 = [20]u8{'T', 'H', 'I', 'S', ' ', 'C', 'O', 'P', 'Y', ':', ' ', ' ', 0, 0, 0, 0, 0, 0, 0, 0};
-        var k:    i32    = 0;
-        for (k < 6 && f.build[k] != 0) {
-            line[12 + k] = f.build[k];
-            k            = k + 1;
+        $if ($mach.build.sys != $mach.sys.wasi) {
+            var line: [20]u8 = [20]u8{'T', 'H', 'I', 'S', ' ', 'C', 'O', 'P', 'Y', ':', ' ', ' ', 0, 0, 0, 0, 0, 0, 0, 0};
+            var k:    i32    = 0;
+            for (k < 6 && f.build[k] != 0) {
+                line[12 + k] = f.build[k];
+                k            = k + 1;
+            }
+            if (k > 0) { centred(d, screen, 178, ?line[0]); }
         }
-        if (k > 0) { centred(d, screen, 178, ?line[0]); }
     }
     or (f.menu == MENU_LIST) {
         x = 56;
@@ -1199,7 +1428,12 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         video.shade(d, screen, 16, 22, 288, 168, 26);
         centred(d, screen, 30, "OPEN GAMES");
         if (f.liststate == LIST_NOREACH) {
-            centred(d, screen, 90, "THE RELAY COULD NOT BE REACHED.");
+            $if ($mach.build.sys == $mach.sys.wasi) {
+                centred(d, screen, 90, "THE SERVER COULD NOT BE REACHED.");
+            }
+            $if ($mach.build.sys != $mach.sys.wasi) {
+                centred(d, screen, 90, "THE RELAY COULD NOT BE REACHED.");
+            }
             centred(d, screen, 160, "BACKSPACE TO GO BACK");
             ret;
         }
@@ -1223,7 +1457,12 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         # always there, last
         video.write_text(d, screen, x, y + row * LINEHEIGHT + 4, "DEATHMATCH WITH THE BOTS", -1);
         if (f.liststate == LIST_ASKING) {
-            centred(d, screen, 176, "ASKING THE RELAY FOR OTHERS...");
+            $if ($mach.build.sys == $mach.sys.wasi) {
+                centred(d, screen, 176, "LOOKING FOR OPEN GAMES...");
+            }
+            $if ($mach.build.sys != $mach.sys.wasi) {
+                centred(d, screen, 176, "ASKING THE RELAY FOR OTHERS...");
+            }
         }
         or {
             centred(d, screen, 176, "ENTER TO JOIN");
@@ -1349,7 +1588,9 @@ fun draw_menu(f: *Front, s: *game.Session, screen: *u8) {
         or {
             video.write_text(d, screen, x, y + LINEHEIGHT * 3 + 4, "BOTS LEARN FROM MY PLAY: NO", -1);
         }
-        video.write_text(d, screen, x, y + LINEHEIGHT * 4 + 4, "UPDATE THE GAME", -1);
+        $if ($mach.build.sys != $mach.sys.wasi) {
+            video.write_text(d, screen, x, y + LINEHEIGHT * 4 + 4, "UPDATE THE GAME", -1);
+        }
     }
     or (f.menu == MENU_SOUND) {
         x = 80;

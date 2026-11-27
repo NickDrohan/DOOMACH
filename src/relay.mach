@@ -343,6 +343,9 @@ fun tell(r: *core.Relay) {
         if (e.what == core.EV_REFUSED) {
             print.printlnf("relay: refused: {}", refusal_name(e.slot));
         }
+        or (e.what == core.EV_DESYNC) {
+            print.printlnf("relay: room {} DESYNC at tic {}", ?code[0], e.slot);
+        }
         or (e.what == core.EV_JOINED || e.what == core.EV_LEFT || e.what == core.EV_TIMEDOUT) {
             print.printlnf("relay: room {} player {} {}", ?code[0], e.slot + 1, event_name(e.what));
         }
@@ -443,6 +446,54 @@ fun read_watch(r: *core.Relay, path: str) {
 fun report(r: *core.Relay) {
     print.printlnf("relay: rooms {} created {} started {} closed {} forwarded {} refused {} dropped {}",
         core.open_rooms(r), r.created, r.started, r.closed, r.forwarded, r.refused, r.dropped);
+}
+
+fun report_rooms(r: *core.Relay, now: i64) {
+    var i: i32 = 0;
+    for (i < r.maxrooms) {
+        val room: *core.Room = ?r.rooms[i];
+        i = i + 1;
+        if (!room.used) { cnt; }
+        var code: [7]u8;
+        var k:    i32 = 0;
+        for (k < 6) {
+            code[k] = room.code[k];
+            k       = k + 1;
+        }
+        code[6] = 0;
+        var here:   i32 = 0;
+        var nbots:  i32 = 0;
+        var maxtic: i32 = -1;
+        var mintic: i32 = 0x7fffffff;
+        var maxage: i64 = 0;
+        var s:      i32 = 0;
+        for (s < room.players) {
+            if ((room.botmask & (1 << s)) != 0) {
+                nbots = nbots + 1;
+            }
+            or (room.slots[s].used) {
+                here = here + 1;
+                val age: i64 = now - room.slots[s].lastseen;
+                if (age > maxage) { maxage = age; }
+                val ct: i32 = room.slots[s].checktic;
+                if (ct > maxtic) { maxtic = ct; }
+                if (ct >= 0 && ct < mintic) { mintic = ct; }
+            }
+            s = s + 1;
+        }
+        if (!room.started) {
+            print.printlnf("relay: room {} lobby: {}/{} joined map E1M{} skill {} max-age {}ms",
+                ?code[0], here, room.players, room.map, room.skill, maxage);
+        }
+        or {
+            var lag: i32 = 0;
+            if (maxtic >= 0 && mintic != 0x7fffffff && maxtic >= mintic) { lag = maxtic - mintic; }
+            var sync: str = "ok";
+            if (room.desync) { sync = "DESYNC"; }
+            print.printlnf("relay: room {} playing {}s: {}/{} humans ({} bots) map E1M{} tic {} lag {}t max-age {}ms sync {} pkts {}",
+                ?code[0], (now - room.began) / 1000, here, room.players, nbots, room.map, maxtic, lag, maxage, sync, room.forwarded);
+        }
+    }
 }
 
 fun lower_ascii(c: u8) u8 {
@@ -561,6 +612,172 @@ fun append_dec(dst: *u8, at: i32, val_in: i32) i32 {
         pos      = pos + 1;
     }
     ret pos;
+}
+
+fun append_signed(dst: *u8, at: i32, val_in: i32) i32 {
+    if (val_in < 0) {
+        dst[at] = '-';
+        ret append_dec(dst, at + 1, 0 - val_in);
+    }
+    ret append_dec(dst, at, val_in);
+}
+
+fun append_bool(dst: *u8, at: i32, b: bool) i32 {
+    if (b) { ret append_str(dst, at, "true"); }
+    ret append_str(dst, at, "false");
+}
+
+fun handle_http_status(slot: i32, r: *core.Relay, now: i64) bool {
+    val c: *TcpClient = ?tcp_clients[slot];
+    var body: [7600]u8;
+    var bpos: i32 = 0;
+    bpos = append_str(?body[0], bpos, "{\"open_rooms\":");
+    bpos = append_dec(?body[0], bpos, core.open_rooms(r));
+    bpos = append_str(?body[0], bpos, ",\"created\":");
+    bpos = append_dec(?body[0], bpos, r.created::i32);
+    bpos = append_str(?body[0], bpos, ",\"started\":");
+    bpos = append_dec(?body[0], bpos, r.started::i32);
+    bpos = append_str(?body[0], bpos, ",\"closed\":");
+    bpos = append_dec(?body[0], bpos, r.closed::i32);
+    bpos = append_str(?body[0], bpos, ",\"forwarded\":");
+    bpos = append_dec(?body[0], bpos, r.forwarded::i32);
+    bpos = append_str(?body[0], bpos, ",\"refused\":");
+    bpos = append_dec(?body[0], bpos, r.refused::i32);
+    bpos = append_str(?body[0], bpos, ",\"dropped\":");
+    bpos = append_dec(?body[0], bpos, r.dropped::i32);
+    bpos = append_str(?body[0], bpos, ",\"rooms\":[");
+
+    var first_room: bool = 1;
+    var i:          i32  = 0;
+    for (i < r.maxrooms && bpos < 6800) {
+        val room: *core.Room = ?r.rooms[i];
+        i = i + 1;
+        if (!room.used) { cnt; }
+        if (!first_room) { bpos = append_str(?body[0], bpos, ","); }
+        first_room = 0;
+
+        var code: [7]u8;
+        var k:    i32 = 0;
+        for (k < 6) {
+            code[k] = room.code[k];
+            k       = k + 1;
+        }
+        code[6] = 0;
+
+        var here:   i32 = 0;
+        var nbots:  i32 = 0;
+        var maxtic: i32 = -1;
+        var mintic: i32 = 0x7fffffff;
+        var s:      i32 = 0;
+        for (s < room.players) {
+            if ((room.botmask & (1 << s)) != 0) {
+                nbots = nbots + 1;
+            }
+            or (room.slots[s].used) {
+                here = here + 1;
+                val ct: i32 = room.slots[s].checktic;
+                if (ct > maxtic) { maxtic = ct; }
+                if (ct >= 0 && ct < mintic) { mintic = ct; }
+            }
+            s = s + 1;
+        }
+        var lag: i32 = 0;
+        if (maxtic >= 0 && mintic != 0x7fffffff && maxtic >= mintic) { lag = maxtic - mintic; }
+        var played: i32 = 0;
+        if (room.started && now > room.began) { played = ((now - room.began) / 1000)::i32; }
+
+        bpos = append_str(?body[0], bpos, "{\"code\":\"");
+        bpos = append_str(?body[0], bpos, ?code[0]);
+        bpos = append_str(?body[0], bpos, "\",\"mode\":\"");
+        if (room.deathmatch) { bpos = append_str(?body[0], bpos, "dm"); }
+        or                   { bpos = append_str(?body[0], bpos, "coop"); }
+        bpos = append_str(?body[0], bpos, "\",\"started\":");
+        bpos = append_bool(?body[0], bpos, room.started);
+        bpos = append_str(?body[0], bpos, ",\"public\":");
+        bpos = append_bool(?body[0], bpos, room.public);
+        bpos = append_str(?body[0], bpos, ",\"map\":");
+        bpos = append_dec(?body[0], bpos, room.map);
+        bpos = append_str(?body[0], bpos, ",\"skill\":");
+        bpos = append_dec(?body[0], bpos, room.skill);
+        bpos = append_str(?body[0], bpos, ",\"players\":");
+        bpos = append_dec(?body[0], bpos, room.players);
+        bpos = append_str(?body[0], bpos, ",\"joined\":");
+        bpos = append_dec(?body[0], bpos, here);
+        bpos = append_str(?body[0], bpos, ",\"bots\":");
+        bpos = append_dec(?body[0], bpos, nbots);
+        bpos = append_str(?body[0], bpos, ",\"played_s\":");
+        bpos = append_dec(?body[0], bpos, played);
+        bpos = append_str(?body[0], bpos, ",\"tic\":");
+        bpos = append_signed(?body[0], bpos, maxtic);
+        bpos = append_str(?body[0], bpos, ",\"lag_tics\":");
+        bpos = append_dec(?body[0], bpos, lag);
+        bpos = append_str(?body[0], bpos, ",\"desync\":");
+        bpos = append_bool(?body[0], bpos, room.desync);
+        bpos = append_str(?body[0], bpos, ",\"desync_tic\":");
+        bpos = append_signed(?body[0], bpos, room.desynctic);
+        bpos = append_str(?body[0], bpos, ",\"forwarded\":");
+        bpos = append_dec(?body[0], bpos, room.forwarded::i32);
+        bpos = append_str(?body[0], bpos, ",\"seats\":[");
+
+        var first_seat: bool = 1;
+        s = 0;
+        for (s < room.players) {
+            if ((room.botmask & (1 << s)) != 0) {
+                if (!first_seat) { bpos = append_str(?body[0], bpos, ","); }
+                first_seat = 0;
+                bpos = append_str(?body[0], bpos, "{\"seat\":");
+                bpos = append_dec(?body[0], bpos, s + 1);
+                bpos = append_str(?body[0], bpos, ",\"transport\":\"bot\",\"validated\":true,\"age_ms\":0,\"tic\":");
+                bpos = append_signed(?body[0], bpos, maxtic);
+                bpos = append_str(?body[0], bpos, ",\"make_tic\":");
+                bpos = append_signed(?body[0], bpos, maxtic);
+                bpos = append_str(?body[0], bpos, ",\"ack_tic\":");
+                bpos = append_signed(?body[0], bpos, maxtic);
+                bpos = append_str(?body[0], bpos, ",\"packets\":0}");
+            }
+            or (room.slots[s].used) {
+                if (!first_seat) { bpos = append_str(?body[0], bpos, ","); }
+                first_seat = 0;
+                val sl: *core.Slot = ?room.slots[s];
+                var tr: str = "udp";
+                if ((sl.addr.ip & 0xffffff00) == 0x7f000000) { tr = "ws"; }
+                or ((sl.addr.ip & 0xff000000) == 0x7e000000) { tr = "https"; }
+                var age: i32 = 0;
+                if (now > sl.lastseen) { age = (now - sl.lastseen)::i32; }
+                bpos = append_str(?body[0], bpos, "{\"seat\":");
+                bpos = append_dec(?body[0], bpos, s + 1);
+                bpos = append_str(?body[0], bpos, ",\"transport\":\"");
+                bpos = append_str(?body[0], bpos, tr);
+                bpos = append_str(?body[0], bpos, "\",\"validated\":");
+                bpos = append_bool(?body[0], bpos, sl.validated);
+                bpos = append_str(?body[0], bpos, ",\"age_ms\":");
+                bpos = append_dec(?body[0], bpos, age);
+                bpos = append_str(?body[0], bpos, ",\"tic\":");
+                bpos = append_signed(?body[0], bpos, sl.checktic);
+                bpos = append_str(?body[0], bpos, ",\"make_tic\":");
+                bpos = append_dec(?body[0], bpos, sl.maketic);
+                bpos = append_str(?body[0], bpos, ",\"ack_tic\":");
+                bpos = append_dec(?body[0], bpos, sl.acktic);
+                bpos = append_str(?body[0], bpos, ",\"packets\":");
+                bpos = append_dec(?body[0], bpos, sl.packets);
+                bpos = append_str(?body[0], bpos, "}");
+            }
+            s = s + 1;
+        }
+        bpos = append_str(?body[0], bpos, "]}");
+    }
+    bpos = append_str(?body[0], bpos, "]}\n");
+
+    var resp: [8000]u8;
+    var pos:  i32 = append_str(?resp[0], 0, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ");
+    pos = append_dec(?resp[0], pos, bpos);
+    pos = append_str(?resp[0], pos, "\r\n\r\n");
+    var k: i32 = 0;
+    for (k < bpos) {
+        resp[pos + k] = body[k];
+        k             = k + 1;
+    }
+    ret write_all(?c.stream, ?resp[0], pos + bpos);
 }
 
 fun handle_http_net(slot: i32, hlen: i32, sock: *udp.Socket, r: *core.Relay, m: *Impair, now: i64) bool {
@@ -695,13 +912,21 @@ fun step_tcp_client(slot: i32, sock: *udp.Socket, r: *core.Relay, m: *Impair, no
                 shift_rbuf(c, hlen);
                 brk;
             }
-            if (hlen >= 17 && c.rbuf[0] == 'G' && c.rbuf[1] == 'E' && c.rbuf[2] == 'T' && c.rbuf[3] == ' ' && c.rbuf[4] == '/' && c.rbuf[5] == 'n' && c.rbuf[6] == 'e' && c.rbuf[7] == 't' && c.rbuf[8] == '/') {
-                if (!handle_http_net(slot, hlen, sock, r, m, now)) {
-                    close_tcp_client(slot);
-                    ret;
+            if (hlen >= 15 && c.rbuf[0] == 'G' && c.rbuf[1] == 'E' && c.rbuf[2] == 'T' && c.rbuf[3] == ' ' && c.rbuf[4] == '/' && c.rbuf[5] == 'n' && c.rbuf[6] == 'e' && c.rbuf[7] == 't' && c.rbuf[8] == '/') {
+                if (c.rbuf[9] == 's' && c.rbuf[10] == 't' && c.rbuf[11] == 'a' && c.rbuf[12] == 't' && c.rbuf[13] == 'u' && c.rbuf[14] == 's') {
+                    if (!handle_http_status(slot, r, now)) {
+                        close_tcp_client(slot);
+                        ret;
+                    }
+                    shift_rbuf(c, hlen);
+                    cnt;
                 }
-                shift_rbuf(c, hlen);
-                cnt;
+                if (hlen >= 17 && handle_http_net(slot, hlen, sock, r, m, now)) {
+                    shift_rbuf(c, hlen);
+                    cnt;
+                }
+                close_tcp_client(slot);
+                ret;
             }
             close_tcp_client(slot);
             ret;
@@ -955,11 +1180,12 @@ fun main(argc: i64, argv: **u8) i64 {
     if (m.delay > 0 || m.jitter > 0) { print.printlnf("relay: delayed: {} ms plus up to {} ms", m.delay, m.jitter); }
 
     var buf:        [1500]u8;
-    var lasttick:   i64 = millis();
-    var lastlog:    i64 = lasttick;
-    var lastread:   i64 = 0;
-    var lastleague: i64 = -60000;
-    var lastrooms:  i32 = 0;
+    var lasttick:    i64 = millis();
+    var lastlog:     i64 = lasttick;
+    var lastroomlog: i64 = lasttick;
+    var lastread:    i64 = 0;
+    var lastleague:  i64 = -60000;
+    var lastrooms:   i32 = 0;
     var curtimeout: u64 = timeout;
     for {
         var from: ip.Endpoint;
@@ -1006,12 +1232,19 @@ fun main(argc: i64, argv: **u8) i64 {
         release(?sock, ?m, now);
         tell(?r);
 
-        # a line when the number of rooms changes, and once a minute
+        # a line when the number of rooms changes, and once a minute; plus a
+        # per-room health snapshot every 15 seconds while a room is open
         val rooms: i32 = core.open_rooms(?r);
         if (rooms != lastrooms || now - lastlog >= 60000) {
             report(?r);
-            lastrooms = rooms;
-            lastlog   = now;
+            if (rooms > 0) { report_rooms(?r, now); }
+            lastrooms   = rooms;
+            lastlog     = now;
+            lastroomlog = now;
+        }
+        or (rooms > 0 && now - lastroomlog >= 15000) {
+            report_rooms(?r, now);
+            lastroomlog = now;
         }
     }
     ret 0;

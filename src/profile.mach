@@ -207,6 +207,9 @@ fun jwrite() {
     os.sync_fd(raw_handle);
     os.close(raw_handle);
     cur.jbuflen = 0;
+    $if ($mach.build.sys == $mach.sys.wasi) {
+        checkpoint(nil);
+    }
 }
 
 # pull this machine's journal queue into the character and its file. The
@@ -241,6 +244,7 @@ pub fun flush(s: *game.Session, force: bool) {
     }
     s.rpg_njq = 0;
     if (dirlen == 0) { ret; }
+    if (g.gametic::i64 < cur.lastwrite) { cur.lastwrite = 0; }
     if (force || cur.jbuflen > 2048 || g.gametic::i64 - cur.lastwrite >= 35) {
         cur.lastwrite = g.gametic::i64;
         jwrite();
@@ -320,6 +324,7 @@ pub fun checkpoint(s: *game.Session) {
 pub fun maybe(s: *game.Session) {
     if (!loaded) { ret; }
     flush(s, 0);
+    if (s.g.gametic::i64 < cur.lastchk) { cur.lastchk = 0; }
     if (s.g.gametic::i64 - cur.lastchk >= 5 * 60 * 35) { checkpoint(s); }
 }
 
@@ -538,6 +543,29 @@ pub fun choose(a: *allocator.Allocator, name: *u8) bool {
 
 pub fun unload() {
     loaded = 0;
+}
+
+pub fun clear_choice() {
+    loaded = 0;
+    if (dirlen == 0) { ret; }
+    var path: [576]u8;
+    var i:    i32 = 0;
+    for (i < dirlen) { path[i] = dir[i]; i = i + 1; }
+    path[i] = SEP; i = i + 1;
+    var k: i32 = 0;
+    val cf: str = "current";
+    for (cf[k] != 0) { path[i] = cf[k]; i = i + 1; k = k + 1; }
+    path[i] = 0;
+    fs.remove_file(?path[0]);
+}
+
+pub fun spend(s: *game.Session, node: i32) bool {
+    if (!can_buy(node)) { ret 0; }
+    if (cur.nodes[node] < 255) { cur.nodes[node] = cur.nodes[node] + 1; }
+    cur.spent = cur.spent + 1;
+    jline(?s.g, 'a', node, 1);
+    jwrite();
+    ret 1;
 }
 
 # -------------------------------------------------- the simulation view

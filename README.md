@@ -8,7 +8,7 @@ with online lockstep co-op, deathmatch, and the live neural-network bot leagues 
 the browser (or download `doom-in-mach.zip`, unzip, and double-click `doom.exe`).
 
 ```bash
-./bootstrap.sh                         # compiler 7.0.0, std, shareware WAD, id's source
+./bootstrap.sh                         # compiler 7.2.0, std, shareware WAD, id's source
 scripts/mach build . --profile release
 out=out/windows-x86_64/release/bin/doom.exe
 
@@ -357,7 +357,7 @@ cannot see that bug, so a unit test now pins the behaviour instead.
 
 ## Toolchain
 
-`toolchain.env` pins **Mach 7.0.0** (with the `wasi-wasm32` WebAssembly target, SPIR-V backend,
+`toolchain.env` pins **Mach 7.2.0** (with the `wasi-wasm32` WebAssembly target, SPIR-V backend,
 and 256-bit vectors). `bootstrap.sh` fetches that compiler into `tools/`, checked against the
 hash its release publishes, and `scripts/mach` runs it. The standard library is `tag/v10.1.1`,
 pinned in `mach.toml`.
